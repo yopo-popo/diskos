@@ -17,6 +17,7 @@
 #include "sdio.h"
 #include "anim.h"
 #include "fonts_intl.h"   /* Cyrillic/Greek/Latin-ext fallback (issue #3) */
+#include "fonts_hebrew.h"   /* Hebrew font fallback */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -1700,22 +1701,30 @@ const char *ui_current_backdrop_src(void)
 /* Montserrat covers Latin + Latin-Extended only; it has no Cyrillic/Greek (issue #3:
  * "Ленинград" rendered as boxes) and no CJK ("北京"). Build a per-size fallback chain:
  *   Montserrat(size) -> font_intl(size) [Cyrillic/Greek/Latin-ext, Noto, uncompressed]
- *                    -> Source Han 16 [CJK] -> LVGL placeholder.
+ *                    -> font_hebrew(size) -> Source Han 16 [CJK] -> LVGL placeholder.
  * The intl fonts are generated at matched ascent/descent (base_line 4/5/6 == Montserrat's)
  * so fallback glyphs sit on the same baseline; LVGL uses the PRIMARY font's line-height, and
  * each intl line-height (20/23/28) fits within Montserrat's (20/24/28) so nothing clips.
  * We keep mutable copies because .fallback must be set on non-const fonts. */
 static lv_font_t s_cjk; /* existing subset plus the small music-metadata supplement */
 static lv_font_t s_font20, s_font18, s_font16, s_font14;      /* Montserrat, chain heads */
-static lv_font_t s_intl20, s_intl18, s_intl16, s_intl14;      /* intl link (fallback -> Source Han) */
+static lv_font_t s_intl20, s_intl18, s_intl16, s_intl14;      /* intl link (fallback -> Hebrew) */
+static lv_font_t s_hebrew20, s_hebrew18, s_hebrew16, s_hebrew14;      /* hebrew link (fallback -> Source Han) */
 static void ui_fonts_init(void)
 {
     if(s_font20.get_glyph_dsc) return;   /* once */
     s_cjk = lv_font_source_han_16_cjk; s_cjk.fallback = &font_cjk_extra_16;
-    s_intl20 = font_intl_20; s_intl20.fallback = &s_cjk;
-    s_intl18 = font_intl_18; s_intl18.fallback = &s_cjk;
-    s_intl16 = font_intl_16; s_intl16.fallback = &s_cjk;
-    s_intl14 = font_intl_14; s_intl14.fallback = &s_cjk;
+
+    s_hebrew20 = font_hebrew_20; s_hebrew20.fallback = &s_cjk;
+    s_hebrew18 = font_hebrew_18; s_hebrew18.fallback = &s_cjk;
+    s_hebrew16 = font_hebrew_16; s_hebrew16.fallback = &s_cjk;
+    s_hebrew14 = font_hebrew_14; s_hebrew14.fallback = &s_cjk;
+
+    s_intl20 = font_intl_20; s_intl20.fallback = &s_hebrew20;
+    s_intl18 = font_intl_18; s_intl18.fallback = &s_hebrew18;
+    s_intl16 = font_intl_16; s_intl16.fallback = &s_hebrew16;
+    s_intl14 = font_intl_14; s_intl14.fallback = &s_hebrew14;
+
     s_font20 = *theme_font_base(20); s_font20.fallback = &s_intl20;
     s_font18 = *theme_font_base(18); s_font18.fallback = &s_intl18;
     s_font16 = *theme_font_base(16); s_font16.fallback = &s_intl16;
