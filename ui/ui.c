@@ -17,6 +17,7 @@
 #include "sdio.h"
 #include "anim.h"
 #include "fonts_intl.h"   /* Cyrillic/Greek/Latin-ext fallback (issue #3) */
+#include "fonts_hebrew.h"   /* Hebrew font fallback */
 #include "fontft.h"
 int screen_figure_number(int which);
 
@@ -1982,13 +1983,13 @@ const char *ui_current_backdrop_src(void)
 /* Montserrat covers Latin + Latin-Extended only; it has no Cyrillic/Greek (issue #3:
  * "Cyrillic metadata" rendered as boxes) and no CJK ("CJK metadata"). Build a per-size fallback chain:
  *   Montserrat(size) -> font_intl(size) [Cyrillic/Greek/Latin-ext, Noto, uncompressed]
- *                    -> stock TTC [CJK, matched size] -> Source Han 16 -> supplement.
+ *                    -> font_hebrew(size) -> stock TTC [CJK, matched size] -> Source Han 16 -> supplement.
  * The intl fonts are generated at matched ascent/descent (base_line 4/5/6 == Montserrat's)
  * so fallback glyphs sit on the same baseline; LVGL uses the PRIMARY font's line-height, and
  * each intl line-height (20/23/28) fits within Montserrat's (20/24/28) so nothing clips.
  * We keep mutable copies because .fallback must be set on non-const fonts. */
 static lv_font_t s_cjk; /* existing subset plus the small music-metadata supplement */
-static lv_font_t s_ft[41], s_font[41], s_intl[41];
+static lv_font_t s_ft[41], s_font[41], s_intl[41], s_hebrew[41];
 static const lv_font_t *ui_intl_font(int px)
 {
     switch(px) {
@@ -1996,6 +1997,17 @@ static const lv_font_t *ui_intl_font(int px)
     case 16: return &font_intl_16;
     case 18: return &font_intl_18;
     case 20: return &font_intl_20;
+    default: return NULL;
+    }
+}
+
+static const lv_font_t *ui_hebrew_font(int px)
+{
+    switch(px) {
+    case 14: return &font_hebrew_14;
+    case 16: return &font_hebrew_16;
+    case 18: return &font_hebrew_18;
+    case 20: return &font_hebrew_20;
     default: return NULL;
     }
 }
@@ -2020,9 +2032,11 @@ const lv_font_t *ui_font_cjk(int size)
     const lv_font_t *base = theme_font_base(size);
     if(!s_font[size].get_glyph_dsc) {
         const lv_font_t *intl = ui_intl_font(size);
+        const lv_font_t *hebrew = ui_hebrew_font(size);
         const lv_font_t *ft = fontft_font(size);
         const lv_font_t *next = &s_cjk;
         if(ft) { s_ft[size] = *ft; s_ft[size].fallback = next; next = &s_ft[size]; }
+        if(hebrew) { s_hebrew[size] = *hebrew; s_hebrew[size].fallback = next; next = &s_hebrew[size]; }
         if(intl) { s_intl[size] = *intl; s_intl[size].fallback = next; next = &s_intl[size]; }
         s_font[size] = *base;
         s_font[size].fallback = next;
