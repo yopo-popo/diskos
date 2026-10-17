@@ -2,10 +2,8 @@
 /* Copyright (C) 2026 diskOS contributors */
 #ifndef SCANNER_H
 #define SCANNER_H
-/* diskOS music scanner - walks the SD, reads ID3 tags, rebuilds song.db's SONG table.
+/* diskOS music scanner - walks the SD, reads the tags, rebuilds song.db's SONG table and diskOS's library.db.
  * All calls are safe from the LVGL/main thread; the scan itself runs on a worker thread. */
-enum { OLD_TAGS_AUTO, OLD_TAGS_WESTERN, OLD_TAGS_CYRILLIC };
-void scanner_set_old_tags(int mode);          /* main-thread config mirror; next scan snapshots it */
 void scanner_abort(void);                     /* stop a running walk (SD access revoked) */
 int  scanner_cancel(void);                    /* user cancel: 1 = accepted (stops within ~1 s, DB rolled back), 0 = refused (not scanning / already committing) */
 enum { SCAN_OUT_NONE, SCAN_OUT_COMMITTED, SCAN_OUT_CANCELLED, SCAN_OUT_FAILED, SCAN_OUT_NO_SD };

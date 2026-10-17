@@ -79,8 +79,8 @@
 
 - [Display settings](docs/TOUR.md#settings-display) let you change theme, type size, and artwork behavior.
 - [Quick Settings](docs/TOUR.md#quick-settings) lets you choose the controls in the pull-down drawer.
-- [System settings](docs/TOUR.md#settings-system) include Debug Mode for temporary SSH access and Old tags
-  (Auto by default / Western / Cyrillic); use Rescan Library after changing legacy tag or CUE-sheet decoding.
+- [System settings](docs/TOUR.md#settings-system) include Debug Mode for temporary SSH access and Rescan Library.
+  Each scan writes `diskos-scan-report.txt` to the card, listing tags that aren't Unicode so you can fix them.
 - [Updates and startup](docs/TOUR.md#updates-startup-and-power) explain keyed app updates and boot behavior.
 - [Stock UI choices](docs/TOUR.md#safety-and-stock-ui) give you an interface fallback; [restore](docs/INSTALL.md#restore-stock-and-recover) removes the diskOS image.
 

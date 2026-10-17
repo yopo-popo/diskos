@@ -157,27 +157,6 @@ static void apply_theme_preset(int v){ (void)v; theme_reload_or_revert("theme_pr
 static void apply_font_size(int v){ (void)v; theme_reload_or_revert("font_size"); }
 static void apply_language(int v){ (void)v; theme_reload_or_revert("language"); }
 
-static void apply_old_tags(int v){
-    (void)v;
-    scanner_set_old_tags(cfg_get_int("old_tags", OLD_TAGS_AUTO));
-}
-static void old_tags_rescan_cb(lv_event_t *e){
-    if(lv_event_get_code(e) == LV_EVENT_CLICKED && !scanner_active()) ui_rescan_library();
-}
-/* The button owns this timer; cleaning or deleting the page deletes it too. */
-static void old_tags_rescan_tick(lv_timer_t *t){
-    lv_obj_t *bt = lv_timer_get_user_data(t);
-    if(scanner_active()) lv_obj_add_state(bt, LV_STATE_DISABLED);
-    else lv_obj_remove_state(bt, LV_STATE_DISABLED);
-}
-static void old_tags_rescan_del_cb(lv_event_t *e){
-    lv_timer_delete(lv_event_get_user_data(e));
-}
-static void old_tags_rescan_watch(lv_obj_t *bt){
-    lv_timer_t *t = lv_timer_create(old_tags_rescan_tick, 400, bt);
-    old_tags_rescan_tick(t);
-    lv_obj_add_event_cb(bt, old_tags_rescan_del_cb, LV_EVENT_DELETE, t);
-}
 static void apply_rescan(int v){ (void)v;
     ui_rescan_library();
 }
@@ -587,7 +566,6 @@ void ui_backlight_release(int fallback){   /* after the repaint: the latest leve
 }
 static void apply_brightness(int v){ if(v < 1) v = 1; ui_backlight(v); }
 void settings_apply_startup(int restore_brightness){
-    scanner_set_old_tags(cfg_get_int("old_tags", OLD_TAGS_AUTO));
     if(restore_brightness) apply_brightness(ui_effective_brightness());
     { int at = mdb_sysconfig_auto_time();              /* mirror the player's switch (it owns the value) */
       if(at >= 0 && at != cfg_get_int("auto_time", 1)) cfg_set_int("auto_time", at); }
@@ -635,7 +613,6 @@ static const char *const OPT_APPEARANCE[] = { "Dark", "Light" };
 static const char *const OPT_FONTSIZE[] = { "Small", "Medium", "Large" };
 static const char *const OPT_ALBUMVIEW[] = { "List", "Cover Flow" };
 static const char *const OPT_SAVERSTYLE[] = { "Cover", "Analog", "Minimal", "Digital", "Vinyl" };
-static const char *const OPT_OLDTAGS[] = { "Auto", "Western", "Cyrillic" };
 static const char *const OPT_BOOTDEF[] = { "diskOS", "Stock" };
 static const char *const OPT_ARTCACHE[] = { "Covers only","When Idle","Idle & Charging" };
 
@@ -770,8 +747,6 @@ static const setting_t TABLE[] = {
       "What the volume keys do on a double press: adjust the volume or switch track.", NULL },
     { "System",   "Vol Keys: Long Press", ST_CYCLER, "key_long", 0,0,0, OPT_VOLKEY, 2, NULL, apply_key_long, CTL_ACT_VOLUME,
       "What the volume keys do when held: adjust the volume or switch track.", NULL },
-    { "System",   "Old tags", ST_CYCLER, "old_tags", 0,0,0, OPT_OLDTAGS, 3, NULL, apply_old_tags, OLD_TAGS_AUTO,
-      "Legacy text: guess, Latin-1 or CP1251. Rescan Library to apply.", NULL },
     { "System",   "Rescan Library", ST_ACTION, NULL, 0,0,0, NULL,0, "Scan", apply_rescan, 0,
       "Re-scan the SD card for new or removed music.", NULL },
     { "System",   "Import Playlists", ST_ACTION, NULL, 0,0,0, NULL,0, "Import", apply_import_m3u, 0,
@@ -1056,19 +1031,19 @@ void setting_detail_refresh(void){
         lv_obj_t *vl = lv_label_create(g_detail_root);
         char b[24]; lv_label_set_text(vl, val_text(s,b,sizeof b));
         lv_obj_set_size(vl, 220, 32); lv_label_set_long_mode(vl, LV_LABEL_LONG_DOT);
-        lv_obj_align(vl, LV_ALIGN_CENTER, 0, s->apply == apply_old_tags ? -20 : 0);
+        lv_obj_align(vl, LV_ALIGN_CENTER, 0, 0);
         lv_obj_set_style_text_align(vl, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(vl, ui_current_accent(), 0);
         lv_obj_set_style_text_font(vl, TF(UI_24), 0);
         lv_obj_t *lb = lv_button_create(g_detail_root);
         lv_obj_remove_style_all(lb); lv_obj_set_size(lb, 48, 48);
-        lv_obj_align(lb, LV_ALIGN_CENTER, -110, s->apply == apply_old_tags ? -20 : 0);
+        lv_obj_align(lb, LV_ALIGN_CENTER, -110, 0);
         lv_obj_t *li = lv_label_create(lb); lv_label_set_text(li, LV_SYMBOL_LEFT);
         lv_obj_set_style_text_color(li, TC(TEXT_PRIMARY), 0); lv_obj_center(li);
         ui_on(lb, detail_cycle_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)-1, "settings.detail_cycle", UI_CORE);
         lv_obj_t *rb = lv_button_create(g_detail_root);
         lv_obj_remove_style_all(rb); lv_obj_set_size(rb, 48, 48);
-        lv_obj_align(rb, LV_ALIGN_CENTER, 110, s->apply == apply_old_tags ? -20 : 0);
+        lv_obj_align(rb, LV_ALIGN_CENTER, 110, 0);
         lv_obj_t *ri = lv_label_create(rb); lv_label_set_text(ri, LV_SYMBOL_RIGHT);
         lv_obj_set_style_text_color(ri, TC(TEXT_PRIMARY), 0); lv_obj_center(ri);
         ui_on(rb, detail_cycle_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)1, "settings.detail_cycle", UI_CORE);
@@ -1079,19 +1054,6 @@ void setting_detail_refresh(void){
         lv_obj_set_style_text_align(vl, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(vl, TC(TEXT_SECONDARY), 0);
         lv_obj_set_style_text_font(vl, TF(UI_20), 0);
-    }
-
-    /* Offer the existing scan action here; choosing a decoder never starts or cancels a scan. */
-    if(s->apply == apply_old_tags){
-        lv_obj_t *bt = lv_button_create(g_detail_root);
-        lv_obj_set_size(bt, 240, 36);
-        lv_obj_align(bt, LV_ALIGN_CENTER, 0, 28);
-        old_tags_rescan_watch(bt);
-        lv_obj_t *l = lv_label_create(bt);
-        lv_label_set_text(l, tr("Rescan Library"));
-        lv_obj_set_style_text_font(l, TF(UI_14), 0);
-        lv_obj_center(l);
-        ui_on(bt, old_tags_rescan_cb, LV_EVENT_CLICKED, NULL, "settings.old_tags_rescan", UI_CORE);
     }
 
     /* description at the bottom - per-option for cyclers (refreshes on change) */

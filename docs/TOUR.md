@@ -368,8 +368,7 @@ System covers language, power, library maintenance, time, updates, recovery, and
 | Vol Keys: Press | Adjust Volume by default; on V2.57 a single press can instead Switch Track. |
 | Vol Keys: Double Press | Adjust Volume by default; on V2.57 a double press can instead Switch Track. |
 | Vol Keys: Long Press | Adjust Volume by default; on V2.57 a hold can instead Switch Track. |
-| Old tags | Auto by default: guess legacy Cyrillic (CP1251) tags and CUE-sheet text. Western keeps the previous decoding; Cyrillic reads legacy text as CP1251. Use Rescan Library after changing the choice to apply it to existing songs; valid UTF-8 and UTF-16 tags are unchanged. |
-| Rescan Library | Scan the card with progress shown; tap Stop to cancel pending scan changes. |
+| Rescan Library | Scan the card with progress shown; tap Stop to cancel pending scan changes. Tags must be Unicode (UTF-8 or UTF-16): legacy text such as CP1251 or CP1255 isn't guessed. Each finished scan writes `diskos-scan-report.txt` to the card root, listing such tags, artist names split on `;` or `feat.`, folders left out by a `.nomedia` file, and files it couldn't read. |
 | Import Playlists | Import recognized .m3u and .m3u8 lists from the card. |
 | Default UI | diskOS by default; choose Stock for future normal boots. |
 | Automatic Time | On by default; network time takes effect after the next restart and Wi-Fi connection. |
