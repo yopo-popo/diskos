@@ -8,6 +8,8 @@
 #include "musicdb.h"
 #include "fwcaps.h"
 #include "artcache.h"
+#include "fonts_hebrew.h"
+#include "fonts_icons.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,10 +30,13 @@ static lv_obj_t *g_list;
 static lv_obj_t *g_title;
 static lv_obj_t *g_az_btn;    /* "A-Z" button -> opens the letter grid */
 static lv_obj_t *g_grid;      /* full alphabet grid overlay */
+static lv_obj_t *g_az_page[2];  /* the grid's letter pages: 0 English, 1 Hebrew */
+static int       g_az_lang = 0; /* the page the grid shows: 0 English, 1 Hebrew */
 static lv_obj_t *g_lhint = NULL, *g_lhint_lbl = NULL;  /* rim-scroll A-Z position hint */
 static uint32_t  g_lhint_tick = 0;
 static lv_timer_t *g_lhint_timer;
-static char      g_lhint_ch = 0;
+static unsigned char g_lhint_ch = 0;
+static const lv_font_t *g_lhint_font = NULL;  /* the hint's own (theme) face, restored after a Hebrew letter */
 static int g_view = VIEW_MENU;
 static int g_drill_kind = 0;  /* 1 album, 2 artist, 3 genre */
 /* Artist / Genre drills open on their ALBUMS (parity L23): level 1 = the album list (an "All Songs" row first), level 2 =
@@ -51,7 +56,7 @@ static int  g_alloc_n = 0;
 static int  g_fav_cap = 0;
 static int  g_grp_cap = 0;
 static int  g_first_cap = 0;
-static char *g_first = NULL;            /* per-row first letter for the A-Z scrubber */
+static unsigned char *g_first = NULL;   /* per-row jump-letter code (first_letter) for the A-Z scrubber */
 static int  g_count;
 
 /* group scratch (album/artist/genre views) */
@@ -78,10 +83,25 @@ static int g_jump_idx = -1;
 
 static void library_reload(void);
 
-static char first_letter(const char *s){
-    while(*s==' ') s++;
-    char c = toupper((unsigned char)*s);
+/* Jump-letter codes, one byte per row in g_first[]: 'A'..'Z' for Latin, '#' for anything else, and AZ_HEB+n for the
+ * Hebrew letter alef+n (U+05D0+n, UTF-8 D7 90+n; tav is n=26). A final form counts as its base letter, which Unicode
+ * puts right after it (kaf sofit U+05DA, kaf U+05DB), so finals fold with +1 and their codes never occur. Within one
+ * alphabet the codes keep its order, so "the next letter that has rows" is the next larger code of that alphabet (the
+ * lists don't order the alphabets by code: today's sort puts Hebrew before Latin). */
+#define AZ_HEB      0x80
+#define HEB_LETTERS 27            /* alef..tav, the 5 finals included */
+#define HEB_FINALS  0x28A400u     /* bit n: alef+n is a final form (kaf, mem, nun, pe, tsadi sofit = n 10 13 15 19 21) */
+static int heb_is_final(int n){ return (HEB_FINALS >> n) & 1; }
+static unsigned char first_letter(const char *s){
+    const unsigned char *p = (const unsigned char *)s;
+    while(*p==' ') p++;
+    if(p[0]==0xD7 && p[1]>=0x90 && p[1]<=0xAA){ int n = p[1] - 0x90; return (unsigned char)(AZ_HEB + n + heb_is_final(n)); }
+    unsigned char c = (unsigned char)toupper(p[0]);
     return (c>='A'&&c<='Z') ? c : '#';
+}
+static void az_code_text(unsigned char code, char b[3]){   /* a code's letter as a UTF-8 string */
+    if(code >= AZ_HEB){ b[0] = (char)0xD7; b[1] = (char)(0x90 + code - AZ_HEB); b[2] = 0; }
+    else { b[0] = (char)code; b[1] = 0; }
 }
 static void fmt_dur(char *b, size_t n, int ms){
     if(ms<=0){ b[0]=0; return; }
@@ -453,27 +473,73 @@ static void fill_start(int n){
     }
 }
 
-static void jump_to_letter(char L){
+static void jump_to_letter(unsigned char L){
     if(g_count<=0) return;
     int idx=-1;
     for(int i=0;i<g_count;i++) if(g_first[i]==L){ idx=i; break; }
-    if(idx<0) for(int i=0;i<g_count;i++) if(g_first[i]>=L){ idx=i; break; } /* nearest after */
+    if(idx<0){                                   /* nearest after: the first row of the next letter that has rows, */
+        int heb = L >= AZ_HEB;                   /* in the same alphabet ('#' counts with Latin, as before) */
+        unsigned char best=0;
+        for(int i=0;i<g_count;i++){ unsigned char c=g_first[i]; if(c>L && (c>=AZ_HEB)==heb && (!best || c<best)){ best=c; idx=i; } }
+        if(idx<0 && heb) for(int i=g_count-1;i>=0;i--) if(g_first[i]>=AZ_HEB){ idx=i; break; }   /* past tav: the last Hebrew row */
+    }
     if(idx<0) idx=g_count-1;
     /* row pitch = ROW_H + the list's 4px flex pad_row, so idx*ROW_H alone lands
      * progressively short for later letters. */
     g_jump_idx = idx;
     jump_finish();
 }
+/* close the grid and bring back the A-Z button it hid (the globe sits on the button's spot, and outline themes draw
+ * the grid see-through) */
+static void az_grid_close(void){
+    lv_obj_add_flag(g_grid, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(g_az_btn, LV_OBJ_FLAG_HIDDEN);
+}
 static void letter_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    jump_to_letter((char)(intptr_t)lv_event_get_user_data(e));
-    lv_obj_add_flag(g_grid, LV_OBJ_FLAG_HIDDEN);
+    jump_to_letter((unsigned char)(intptr_t)lv_event_get_user_data(e));
+    az_grid_close();
 }
 static void grid_bg_cb(lv_event_t *e){    /* tap outside closes */
-    if(lv_event_get_code(e)==LV_EVENT_CLICKED) lv_obj_add_flag(g_grid, LV_OBJ_FLAG_HIDDEN);
+    if(lv_event_get_code(e)==LV_EVENT_CLICKED) az_grid_close();
+}
+/* the list row at the top of the viewport (the A-Z hint and the grid's opening page follow it) */
+static int row_at_scroll(void){
+    int idx = (lv_obj_get_scroll_y(g_list) - g_hdr_extra_px)/(ROW_H + 4) - g_has_header;
+    if(idx < 0) idx = 0; else if(idx >= g_count) idx = g_count - 1;
+    return idx;
+}
+static void az_set_lang(int lang){
+    g_az_lang = lang;
+    for(int k=0;k<2;k++)
+        if(k==lang) lv_obj_clear_flag(g_az_page[k], LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(g_az_page[k], LV_OBJ_FLAG_HIDDEN);
+}
+static void az_lang_cb(lv_event_t *e){     /* the globe button: flip to the other alphabet */
+    if(lv_event_get_code(e)==LV_EVENT_CLICKED) az_set_lang(!g_az_lang);
+}
+/* dim the letters this list has no rows for (they stay tappable: they jump to the next letter that has rows) */
+static void az_dim_empty(void){
+    unsigned char has[256] = {0};
+    for(int i=0;i<g_count;i++) has[g_first[i]] = 1;
+    for(int k=0;k<2;k++){
+        uint32_t n = lv_obj_get_child_count(g_az_page[k]);
+        for(uint32_t j=0;j<n;j++){
+            lv_obj_t *cell = lv_obj_get_child(g_az_page[k], (int32_t)j);
+            unsigned char code = (unsigned char)(intptr_t)lv_obj_get_user_data(cell);
+            lv_obj_set_style_text_color(cell, has[code] ? TC(TEXT_PRIMARY) : TC(TEXT_DISABLED), 0);
+        }
+    }
 }
 static void az_btn_cb(lv_event_t *e){
-    if(lv_event_get_code(e)==LV_EVENT_CLICKED) lv_obj_clear_flag(g_grid, LV_OBJ_FLAG_HIDDEN);
+    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
+    if(g_count > 0){                             /* open on the alphabet of the row in view; a '#' row keeps the last page */
+        unsigned char c = g_first[row_at_scroll()];
+        if(c >= AZ_HEB) g_az_lang = 1; else if(c >= 'A' && c <= 'Z') g_az_lang = 0;
+    }
+    az_dim_empty();
+    az_set_lang(g_az_lang);
+    lv_obj_add_flag(g_az_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(g_grid, LV_OBJ_FLAG_HIDDEN);
 }
 static void az_show(int on){
     if(on) lv_obj_clear_flag(g_az_btn, LV_OBJ_FLAG_HIDDEN);
@@ -929,11 +995,16 @@ void library_scroll_letter_tick(void){
      * showed stale letters from a prior view. Allowlist, so any new view defaults to no hint. */
     if(!(g_view==VIEW_SONGS || g_view==VIEW_GROUP || g_view==VIEW_ALBUMS ||
          g_view==VIEW_ARTISTS || g_view==VIEW_GENRES || g_view==VIEW_FAVS)) return;
-    int pitch = ROW_H + 4;
-    int idx = (lv_obj_get_scroll_y(g_list) - g_hdr_extra_px)/pitch - g_has_header;
-    if(idx < 0) idx = 0; else if(idx >= g_count) idx = g_count - 1;
-    char ch = g_first[idx];
-    if(ch && ch != g_lhint_ch){ g_lhint_ch = ch; char b[2]={ch,0}; lv_label_set_text(g_lhint_lbl, b); }
+    unsigned char ch = g_first[row_at_scroll()];
+    if(ch && ch != g_lhint_ch){
+        const lv_font_t *cur = lv_obj_get_style_text_font(g_lhint_lbl, 0);
+        int was_heb = cur == &font_hebrew_40 || cur == &font_hebrew_24;
+        if(!was_heb) g_lhint_font = cur;          /* the face the theme gave it: Default 40px, the themed kits their 24px face */
+        if(ch >= AZ_HEB) lv_obj_set_style_text_font(g_lhint_lbl,
+            g_lhint_font && lv_font_get_line_height(g_lhint_font) < 36 ? &font_hebrew_24 : &font_hebrew_40, 0);
+        else if(was_heb && g_lhint_font) lv_obj_set_style_text_font(g_lhint_lbl, g_lhint_font, 0);
+        g_lhint_ch = ch; char b[3]; az_code_text(ch, b); lv_label_set_text(g_lhint_lbl, b);
+    }
     if(g_lhint_timer) lv_timer_resume(g_lhint_timer);
     g_lhint_tick = lv_tick_get();
     lv_obj_clear_flag(g_lhint, LV_OBJ_FLAG_HIDDEN);
@@ -950,7 +1021,7 @@ void library_ensure_capacity(void){
 }
 static void lib_ensure_first_cap(int need){
     if(need <= g_first_cap) return;
-    char *f = realloc(g_first, (size_t)need);
+    unsigned char *f = realloc(g_first, (size_t)need);
     if(f){ g_first = f; g_first_cap = need; }
 }
 static void lib_ensure_group_cap(int need){
@@ -1026,30 +1097,66 @@ void library_create(lv_obj_t *root){
         lv_obj_set_style_text_font(gt, TF(UI_14), 0);
         lv_obj_set_style_text_color(gt, TC(TEXT_MUTED), 0);
     }
-    {
-        static const char *AZ="ABCDEFGHIJKLMNOPQRSTUVWXYZ#";
-        int cols=5, cw=52, ch=48, n=27;      /* taller cells (48x44); last partial row centered */
-        int gw=cols*cw, x0=(360-gw)/2;
-        int rows=(n+cols-1)/cols;
-        int y0=48;   /* anchor top at the original grid top; taller cells grow downward (centering would clip the top row's outer corners) */
-        for(int i=0;i<n;i++){
-            int r=i/cols, c=i%cols;
-            int cells_in_row = (r==rows-1) ? (n - r*cols) : cols;  /* last row may be partial */
-            int row_x0 = x0 + ((cols - cells_in_row)*cw)/2;        /* centre it so Z/# avoid the clipped bottom-left corner */
-            lv_obj_t *cell=lv_button_create(g_grid);
-            lv_obj_remove_style_all(cell);
-            lv_obj_set_pos(cell, row_x0+c*cw, y0+r*ch); lv_obj_set_size(cell, cw-4, ch-4);
-            lv_obj_set_style_radius(cell, 8, 0);
-            lv_obj_set_style_bg_color(cell, TC(ACCENT_PRIMARY), LV_STATE_PRESSED);
-            lv_obj_set_style_bg_opa(cell, LV_OPA_COVER, LV_STATE_PRESSED);
-            lv_obj_set_style_text_color(cell, TC(TEXT_PRIMARY), 0);           /* the letter inherits these */
-            lv_obj_set_style_text_color(cell, TC(ON_ACCENT), LV_STATE_PRESSED);
-            ui_on(cell, letter_cb, LV_EVENT_CLICKED, (void*)(intptr_t)AZ[i], "library.letter", UI_CORE);
-            lv_obj_t *l=lv_label_create(cell);
-            char b[2]={AZ[i],0}; lv_label_set_text(l,b);
-            lv_obj_set_style_text_font(l,TF(UI_20),0);
-            lv_obj_center(l);
+    {   /* language button (globe, as on a phone keyboard) on the A-Z button's spot: flips English <-> Hebrew letters */
+        lv_obj_t *lb = lv_button_create(g_grid);
+        lv_obj_remove_style_all(lb);
+        lv_obj_set_pos(lb, 302, 158); lv_obj_set_size(lb, 44, 44);
+        lv_obj_set_style_radius(lb, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(lb, TC(SURFACE_RAISED), 0);
+        lv_obj_set_style_bg_opa(lb, LV_OPA_90, 0);
+        lv_obj_set_style_bg_color(lb, TC(ACCENT_PRIMARY), LV_STATE_PRESSED);
+        lv_obj_set_style_text_color(lb, TC(TEXT_PRIMARY), 0);
+        lv_obj_set_style_text_color(lb, TC(ON_ACCENT), LV_STATE_PRESSED);
+        ui_on(lb, az_lang_cb, LV_EVENT_CLICKED, NULL, "library.az_lang", UI_CORE);
+        lv_obj_t *gl = lv_label_create(lb);
+        lv_label_set_text(gl, "\xEF\x82\xAC");             /* U+F0AC globe */
+        lv_obj_set_style_text_font(gl, &font_icon_globe_20, 0);
+        lv_obj_center(gl);
+    }
+    {   /* the two letter pages: 5 cells a row from y0=48 down, the last partial row centred so its cells avoid the
+         * clipped bottom corners. Hebrew rows run right to left (alef top right). */
+        static unsigned char PAGE_EN[27], PAGE_HE[HEB_LETTERS];
+        int ne = 0, nh = 0;
+        for(int i=0;i<26;i++) PAGE_EN[ne++] = (unsigned char)('A' + i);
+        PAGE_EN[ne++] = '#';
+        for(int n=0;n<HEB_LETTERS;n++) if(!heb_is_final(n)) PAGE_HE[nh++] = (unsigned char)(AZ_HEB + n);   /* 22 letters */
+        PAGE_HE[nh++] = '#';
+        const unsigned char *codes[2] = { PAGE_EN, PAGE_HE };
+        const int counts[2] = { ne, nh };
+        for(int k=0;k<2;k++){
+            lv_obj_t *pg = lv_obj_create(g_grid);
+            lv_obj_remove_style_all(pg);
+            lv_obj_set_size(pg, 360, 360); lv_obj_set_pos(pg, 0, 0);
+            lv_obj_clear_flag(pg, LV_OBJ_FLAG_CLICKABLE);   /* taps between cells fall through to the grid (closes it) */
+            lv_obj_clear_flag(pg, LV_OBJ_FLAG_SCROLLABLE);
+            g_az_page[k] = pg;
+            int cols=5, cw=50, ch=48, n=counts[k];      /* taller cells (46x44) */
+            int x0=50;   /* left edge as before; the 50px pitch ends the right column at x=296, clear of the globe button at 302 */
+            int rows=(n+cols-1)/cols;
+            int y0=48;   /* anchor top at the original grid top; taller cells grow downward (centering would clip the top row's outer corners) */
+            for(int i=0;i<n;i++){
+                int r=i/cols, c=i%cols;
+                int cells_in_row = (r==rows-1) ? (n - r*cols) : cols;  /* last row may be partial */
+                int row_x0 = x0 + ((cols - cells_in_row)*cw)/2;
+                int slot = k ? cells_in_row - 1 - c : c;              /* Hebrew: right to left */
+                unsigned char code = codes[k][i];
+                lv_obj_t *cell=lv_button_create(pg);
+                lv_obj_remove_style_all(cell);
+                lv_obj_set_pos(cell, row_x0+slot*cw, y0+r*ch); lv_obj_set_size(cell, cw-4, ch-4);
+                lv_obj_set_style_radius(cell, 8, 0);
+                lv_obj_set_style_bg_color(cell, TC(ACCENT_PRIMARY), LV_STATE_PRESSED);
+                lv_obj_set_style_bg_opa(cell, LV_OPA_COVER, LV_STATE_PRESSED);
+                lv_obj_set_style_text_color(cell, TC(TEXT_PRIMARY), 0);           /* the letter inherits these */
+                lv_obj_set_style_text_color(cell, TC(ON_ACCENT), LV_STATE_PRESSED);
+                lv_obj_set_user_data(cell, (void*)(intptr_t)code);                 /* az_dim_empty reads it */
+                ui_on(cell, letter_cb, LV_EVENT_CLICKED, (void*)(intptr_t)code, "library.letter", UI_CORE);
+                lv_obj_t *l=lv_label_create(cell);
+                char b[3]; az_code_text(code, b); lv_label_set_text(l,b);
+                lv_obj_set_style_text_font(l, code >= AZ_HEB ? &font_hebrew_20 : TF(UI_20), 0);
+                lv_obj_center(l);
+            }
         }
+        az_set_lang(0);
     }
 
     /* alphabet hint overlay (rim-scroll position indicator) - centred, hidden */

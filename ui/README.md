@@ -110,7 +110,8 @@ The installer keeps the stock `mq_player` audio engine; only the UI is replaced.
   - **Montserrat** - Latin UI text - [`licenses/OFL-1.1-Montserrat.txt`](licenses/OFL-1.1-Montserrat.txt)
   - **Source Han Sans** - CJK glyph fallback - [`licenses/OFL-1.1-SourceHanSans.txt`](licenses/OFL-1.1-SourceHanSans.txt)
   - **Noto Sans** - Latin-extended / Greek / Cyrillic glyphs (`font_intl_14.c` .. `font_intl_20.c`) - [`licenses/OFL-1.1-NotoSans.txt`](licenses/OFL-1.1-NotoSans.txt)
-  - **Font Awesome 4.7.0** - UI + weather icon glyphs (`font_icons_20.c`, `font_icons_28.c`, `font_weather16.c`) - [`licenses/OFL-1.1-FontAwesome.txt`](licenses/OFL-1.1-FontAwesome.txt)
+  - **Noto Sans Hebrew** - Hebrew glyphs (`font_hebrew_14.c` .. `font_hebrew_20.c`, `font_hebrew_24.c`, `font_hebrew_40.c`) - [`licenses/OFL-1.1-NotoSans.txt`](licenses/OFL-1.1-NotoSans.txt)
+  - **Font Awesome 4.7.0** - UI + weather icon glyphs (`font_icons_20.c`, `font_icons_28.c`, `font_weather16.c`, `font_icon_globe_20.c`) - [`licenses/OFL-1.1-FontAwesome.txt`](licenses/OFL-1.1-FontAwesome.txt)
   - **IBM Plex Mono** (SemiBold/Bold) - "something" theme text (`font_mono_*.c`); converted under the name `diskos_mono`
     because the licence reserves the name "Plex" - [`licenses/OFL-1.1-IBMPlexMono.txt`](licenses/OFL-1.1-IBMPlexMono.txt)
   - **Doto** (weight 700, square dots) - "something" theme titles and date (`font_dot_*.c`), converted as `diskos_dot` - [`licenses/OFL-1.1-Doto.txt`](licenses/OFL-1.1-Doto.txt)
