@@ -3,8 +3,9 @@
 /* librarydb - diskOS's own music library database, /usr/data/diskos/db/library.db.
  *
  * library.db holds only what a rescan can rebuild from the files on the SD card (songs, albums, artists, the genres
- * written in the files). What the owner creates (collections, their genres, playlists) goes in user.db, which never
- * stores a library.db row number. FiiO's song.db stays only while the stock mq_player still plays.
+ * written in the files). What the owner creates (collections, their genres, playlists) goes in shelves.db, and what is
+ * written while listening (play counts, bookmarks, the queue) in listening.db; neither stores a library.db row number.
+ * FiiO's song.db stays only while the stock mq_player still plays.
  *
  * The scanner rebuilds library.db on every scan into library.db.new beside it and renames it over the old file only
  * when the scan read the whole card, so a failed or cancelled scan keeps the previous library. Songs the scan could not
@@ -25,8 +26,8 @@
 #define LDB_NAME 256            /* longest stored name in bytes, with its NUL (the scanner's TAGLEN) */
 #define LDB_MAXV 16             /* values kept per multi-valued tag (artists, genres) */
 
-/* Open a library.db or user.db connection. Every connection goes through here, because SQLite only enforces
- * REFERENCES / ON DELETE CASCADE after PRAGMA foreign_keys = ON on that connection. flags as sqlite3_open_v2.
+/* Open a library.db, shelves.db or listening.db connection. Every connection goes through here, because SQLite only
+ * enforces REFERENCES / ON DELETE CASCADE after PRAGMA foreign_keys = ON on that connection. flags as sqlite3_open_v2.
  * Returns SQLITE_OK with *out set; on failure *out is NULL. */
 int ldb_open(const char *path, int flags, sqlite3 **out);
 
@@ -86,6 +87,9 @@ typedef struct {
     long long bytes;                              /* size of the finished file */
     int carry_failed;                             /* the previous library.db could not be read: nothing carried */
 } ldb_stats;
+
+/* Create LIBRARYDB_DIR (owner-only) if needed, for library.db and the user files beside it. 0 = it is a directory. */
+int ldb_make_dir(void);
 
 typedef struct ldb_writer ldb_writer;
 /* Start writing library.db.new. reserve() = bytes of /usr/data that must stay free right now (song.db's journal and
@@ -162,5 +166,10 @@ int  ldb_album_paths(const char *album_artist, const char *album, char (*paths)[
 int  ldb_song_artist(const char *path, long long start_ms, int by_album_artist, char *out, int cap);
 /* The album of the song at path (start_ms < 0 = its first song in the file). 1 = found. */
 int  ldb_song_album(const char *path, long long start_ms, char *album_artist, int aacap, char *album, int acap);
+/* The start in its file of the song playing as path + title (a CUE/ISO track; 0 for a plain file). 1 = in the library. */
+int  ldb_track_start(const char *path, const char *title, long long *start_ms);
+/* Most Played (by_recent 0: most plays first) or Recent (1: last played first): the songs listening.db counted that
+ * are in the library. The caller opens listening.db first (lsdb_ready). 0 = nothing played yet, -1 = can't read. */
+int  ldb_read_history(int by_recent, ldb_list *out);
 
 #endif

@@ -8,6 +8,8 @@
 #include "netart.h"
 #include "ipc.h"
 #include "musicdb.h"   /* persistent per-song accent cache */
+#include "listeningdb.h"   /* play counts */
+#include "playcount.h"
 #include "scanner.h"   /* scan_read_chapters: Now Playing shows a book's current chapter */
 #include "artcache.h"   /* persistent decoded-cover cache on SD */
 #include "config.h"
@@ -85,7 +87,21 @@ static lv_obj_t *t_remain;
 
 static lv_color_t accent;
 static char last_path[256];
-static char g_stat_path[256];   /* last track counted in play history (count once per new track) */
+/* Play counts (listening.db): followed about once a second by a timer of its own, because ui_update is skipped while
+ * the screen is off, which is when most listening happens */
+static playcount_t g_playcount;
+static void playcount_tick(lv_timer_t *t){
+    (void)t;
+    track_state_t st;
+    ipc_get_state(&st);
+    if(!st.have_track || mdb_is_book_path(st.path)){ playcount_reset(&g_playcount); return; }   /* books keep bookmarks */
+    if(!st.title_ready) return;            /* hold until the real title: it tells the CUE tracks of one file apart */
+    if(playcount_sample(&g_playcount, st.path, st.title, ui_is_playing(), st.position_ms, st.duration_ms)){
+        long long start = 0;
+        ldb_track_start(st.path, st.title, &start);
+        lsdb_record_play(st.path, start);
+    }
+}
 /* Art cache key = album title + the track's PARENT DIRECTORY (not artist). This reuses art
  * within a real album AND within a compilation/various-artists album (same folder), but does
  * NOT reuse across two genuinely-different albums that merely share a title in different
@@ -2050,6 +2066,8 @@ void ui_create(lv_obj_t *root)
     if(theme_screen_plain(THEME_PLAIN_NOWPLAYING)) theme_screen_solid(scr);   /* the theme draws Now Playing plain */
 
     ui_fonts_init();
+    static lv_timer_t *s_playcount_timer;
+    if(!s_playcount_timer) s_playcount_timer = lv_timer_create(playcount_tick, 1000, NULL);
     lin_lut_init();   /* seed the OKLab sRGB LUT once, up front: dynamic accent compute
                        * (art worker) needs it whether or not the prewarm ever runs. */
     /* settings_apply_startup() ran before us and already loaded g_accent_mode/g_accent_color
@@ -2387,7 +2405,6 @@ void ui_update(const track_state_t *st)
 
     if(st == NULL || !st->have_track) {
         last_path[0] = '\0';
-        g_stat_path[0] = '\0';   /* clear so a later replay of the same track counts as a new play */
         update_accent_seed(st);   /* no-track -> neutral light grey (resets seed + applies once via the gate) */
 
         set_label_text_changed(title, "No Track");
@@ -2410,14 +2427,6 @@ void ui_update(const track_state_t *st)
 
     update_cover_for_path(st);   /* first: invalidates stale RAM art on a new album */
     update_accent_seed(st);      /* then: art-accent if THIS track's cover is ready, else text-hash */
-
-    /* count a play once per new track (diskOS play history -> Most-Played / Recently-Played), but
-     * only while actually PLAYING (st->state==2). Otherwise a boot-seeded paused track, or skipping
-     * through tracks while paused, would inflate play counts + recency for songs never really played. */
-    if(st->state==2 && st->path[0] && strcmp(g_stat_path, st->path) != 0){
-        copy_cstr(g_stat_path, sizeof g_stat_path, st->path);          /* track identity always (so a music replay after a book still counts) */
-        if(!mdb_is_book_path(st->path)) mdb_record_play(st->path);     /* but audiobooks are excluded from play history */
-    }
 
     set_label_text_changed(title, st->title[0] ? st->title : "Untitled");
     set_label_text_changed(artist, st->artist[0] ? st->artist : "");

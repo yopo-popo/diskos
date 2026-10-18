@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 diskOS contributors */
 #include "sdio.h"
 #include "musicdb.h"
+#include "listeningdb.h"   /* audiobook bookmarks */
 #include "sqlite3.h"
 #define JSMN_HEADER      /* declarations only; the implementation lives in ipc.c */
 #include "jsmn.h"
@@ -90,16 +91,8 @@ static sqlite3 *db(void){
             /* the cover fingerprint (artcache_key) the accent was computed from: a replaced cover -> new
              * fingerprint -> the accent is recomputed instead of staying on the old art's colour */
             sqlite3_exec(tmp, "ALTER TABLE SONG ADD COLUMN ACCENT_KEY TEXT;", 0, 0, 0);
-            /* diskOS-owned play history (separate table -> no SONG schema change, survives rescans,
-             * ignored by the stock player). Drives Most-Played / Recently-Played. */
-            sqlite3_exec(tmp, "CREATE TABLE IF NOT EXISTS PLAY_STATS(PATH TEXT PRIMARY KEY, "
-                              "PLAYS INTEGER DEFAULT 0, LAST_PLAYED INTEGER DEFAULT 0);", 0, 0, 0);
-            /* diskOS-owned audiobook progress (separate table, path-keyed like PLAY_STATS, survives
-             * rescans + the stock DB rebuild). One bookmark per book; MEMBER_PATH is the file that was
-             * playing (a multipart book has several), POSITION_MS the spot within it. */
-            sqlite3_exec(tmp, "CREATE TABLE IF NOT EXISTS BOOK_PROGRESS(BOOK_KEY TEXT PRIMARY KEY, "
-                              "MEMBER_PATH TEXT NOT NULL, POSITION_MS INTEGER NOT NULL DEFAULT 0, "
-                              "UPDATED_AT INTEGER NOT NULL DEFAULT 0, COMPLETED INTEGER NOT NULL DEFAULT 0);", 0, 0, 0);
+            /* play counts and audiobook bookmarks live in listening.db now (listeningdb.c); song.db's old
+             * PLAY_STATS / BOOK_PROGRESS tables are left as they are and no longer read */
             /* diskOS-owned monotone counter + per-playlist export identity. A playlist's export filename
              * is keyed by a UID from this counter, NOT its pid or creation time: the create-allocator can
              * reuse a pid after a delete (it UPDATEs a new row's id upward without advancing
@@ -1439,61 +1432,6 @@ int mdb_love_path(int love_id, char *out, int cap){
     sqlite3_finalize(st); return ok;
 }
 
-/* ---- Play history (diskOS PLAY_STATS): Most-Played / Recently-Played ------- */
-/* Record one play: bump PLAYS + stamp LAST_PLAYED for this path. Best-effort. */
-void mdb_record_play(const char *path){
-    if(!path || !path[0]) return;
-    sqlite3 *d = db(); if(!d) return;
-    sqlite3_stmt *st;
-    if(sqlite3_prepare_v2(d,
-        "INSERT INTO PLAY_STATS(PATH,PLAYS,LAST_PLAYED) VALUES(?1,1,?2) "
-        "ON CONFLICT(PATH) DO UPDATE SET PLAYS=PLAYS+1, LAST_PLAYED=?2;", -1, &st, NULL) != SQLITE_OK) return;
-    sqlite3_bind_text (st, 1, path, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 2, (sqlite3_int64)time(NULL));
-    sqlite3_step(st); sqlite3_finalize(st);
-}
-/* Fill `out` with songs from PLAY_STATS joined to SONG, ordered by plays (by_recent=0) or by
- * last-played time (by_recent=1). Playback is by SONG.ID, same as favourites. Returns count. */
-static int mdb_stats_list(mdb_song_t *out, int cap, int by_recent){
-    sqlite3 *d = db(); if(!d) return 0;
-    sqlite3_stmt *st;
-    const char *sql = by_recent
-      ? "SELECT IFNULL(S.TITLE,IFNULL(S.NAME,'Untitled')),IFNULL(S.ARTIST,''),IFNULL(S.ALBUM,''),"
-        "IFNULL(S.DURATION,0),S.ID FROM PLAY_STATS P JOIN SONG S ON S.PATH=P.PATH "
-        "WHERE lower(S.PATH) NOT LIKE '%.m4b' ORDER BY P.LAST_PLAYED DESC LIMIT ?1;"   /* books have their own view */
-      : "SELECT IFNULL(S.TITLE,IFNULL(S.NAME,'Untitled')),IFNULL(S.ARTIST,''),IFNULL(S.ALBUM,''),"
-        "IFNULL(S.DURATION,0),S.ID FROM PLAY_STATS P JOIN SONG S ON S.PATH=P.PATH "
-        "WHERE P.PLAYS>0 AND lower(S.PATH) NOT LIKE '%.m4b' ORDER BY P.PLAYS DESC, P.LAST_PLAYED DESC LIMIT ?1;";
-    if(sqlite3_prepare_v2(d, sql, -1, &st, NULL) != SQLITE_OK) return 0;
-    sqlite3_bind_int(st, 1, cap);
-    int n=0;
-    while(n<cap && sqlite3_step(st) == SQLITE_ROW){
-        mdb_song_t *s = &out[n++];
-        snprintf(s->title,  MDB_STR, "%s", colt(st,0));
-        snprintf(s->artist, MDB_STR, "%s", colt(st,1));
-        snprintf(s->album,  MDB_STR, "%s", colt(st,2));
-        s->album_h = album_hash(colt(st,2));
-        s->dur_ms = sqlite3_column_int(st,3);
-        s->id     = sqlite3_column_int(st,4);
-        s->genre[0] = 0;
-        trim(s->title); trim(s->artist); trim(s->album);
-    }
-    sqlite3_finalize(st); return n;
-}
-int mdb_stats_count(int by_recent){
-    sqlite3 *d = db(); if(!d) return -1;
-    sqlite3_stmt *st;
-    const char *sql = by_recent
-        ? "SELECT COUNT(*) FROM PLAY_STATS P JOIN SONG S ON S.PATH=P.PATH WHERE lower(S.PATH) NOT LIKE '%.m4b';"
-        : "SELECT COUNT(*) FROM PLAY_STATS P JOIN SONG S ON S.PATH=P.PATH WHERE P.PLAYS>0 AND lower(S.PATH) NOT LIKE '%.m4b';";
-    if(sqlite3_prepare_v2(d, sql, -1, &st, NULL) != SQLITE_OK) return -1;
-    int n = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
-    sqlite3_finalize(st);
-    return n;
-}
-int mdb_mostplayed(mdb_song_t *out, int cap){ return mdb_stats_list(out, cap, 0); }
-int mdb_recent(mdb_song_t *out, int cap){ return mdb_stats_list(out, cap, 1); }
-
 /* GENRE of the SONG row for `path` (or its sub-track `track`; the first row when 0), for the Song Info page. 1 = found (out set, "" when
  * untagged), 0 = no row / DB error. Safe off the UI thread (own prepared statement on the shared serialized handle). */
 int mdb_song_genre(const char *path, int track, char *out, int cap){
@@ -1518,8 +1456,8 @@ int mdb_is_book_path(const char *path){
     return n > 4 && !strcasecmp(path + n - 4, ".m4b");
 }
 
-/* List audiobooks (one book per .m4b), each joined to its saved progress. Ordered so a book with the
- * most recent bookmark leads ("continue listening"), then by add time. */
+/* List audiobooks (one book per .m4b) with their saved progress from listening.db. Ordered so the book saved most
+ * recently leads ("continue listening"), then by add time. */
 /* Returns the number of books (>=0), or -1 on a DB/read error (db unavailable, prepare failed, or a step
  * error). A caller must distinguish -1 (show a retry state) from 0 (genuinely no audiobooks), or a
  * transient DB failure looks like an empty library. */
@@ -1528,75 +1466,48 @@ int mdb_books(book_t *out, int max){
     sqlite3 *d = db(); if(!d) return -1;
     sqlite3_stmt *st;
     const char *sql =
-        "SELECT S.ID, IFNULL(S.TITLE,IFNULL(S.NAME,'Untitled')), IFNULL(S.ARTIST,''), S.PATH, "
-        "IFNULL(B.POSITION_MS,0), IFNULL(B.COMPLETED,0) "
-        "FROM BOOKS S LEFT JOIN BOOK_PROGRESS B ON B.BOOK_KEY = S.PATH "
-        "ORDER BY IFNULL(B.UPDATED_AT,0) DESC, IFNULL(S.ADD_TIME,0) DESC, S.ID DESC;";
+        "SELECT S.ID, IFNULL(S.TITLE,IFNULL(S.NAME,'Untitled')), IFNULL(S.ARTIST,''), S.PATH "
+        "FROM BOOKS S ORDER BY IFNULL(S.ADD_TIME,0) DESC, S.ID DESC;";
     if(sqlite3_prepare_v2(d, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    long long *seq = malloc((size_t)max * sizeof *seq);
+    if(!seq){ sqlite3_finalize(st); return -1; }
     int n = 0, rc;
     while(n < max && (rc = sqlite3_step(st)) == SQLITE_ROW){
-        book_t *b = &out[n++];
+        book_t *b = &out[n];
         b->id = sqlite3_column_int(st, 0);
         snprintf(b->title,  MDB_STR, "%s", colt(st, 1));
         snprintf(b->author, MDB_STR, "%s", colt(st, 2));
         snprintf(b->path, sizeof b->path, "%s", colt(st, 3));
-        b->position_ms = (long)sqlite3_column_int64(st, 4);
-        b->completed   = sqlite3_column_int(st, 5);
         trim(b->title); trim(b->author);
+        b->position_ms = 0; b->completed = 0; seq[n] = 0;
+        if(lsdb_book_progress(b->path, NULL, 0, &b->position_ms, &b->completed, NULL, &seq[n]) != 1){
+            b->position_ms = 0; b->completed = 0; seq[n] = 0;   /* no bookmark (or unreadable): listed as not started */
+        }
+        n++;
     }
     int err = (n == 0 && rc != SQLITE_DONE && rc != SQLITE_ROW);   /* first step errored (not "no rows") -> report as error */
     sqlite3_finalize(st);
+    for(int i = 1; i < n; i++){                                   /* stable: latest bookmark first, the rest by add time */
+        book_t bk = out[i]; long long sk = seq[i]; int j = i;
+        for(; j > 0 && seq[j-1] < sk; j--){ out[j] = out[j-1]; seq[j] = seq[j-1]; }
+        out[j] = bk; seq[j] = sk;
+    }
+    free(seq);
     return err ? -1 : n;
 }
 
-/* Saved resume position for a book. Returns 1 (fills member_out/position_ms) if a bookmark exists. */
-/* Returns 1 = bookmark found, 0 = no bookmark, -1 = read error (DB unavailable / prepare failed). A -1
- * must NOT be treated as "start from zero": a caller that then checkpoints would erase a real bookmark
- * that was only temporarily unreadable. */
+/* A book's bookmark, from listening.db. Returns 1 = bookmark found, 0 = no bookmark, -1 = read error. A -1 must NOT be
+ * treated as "start from zero": a caller that then checkpoints would erase a real bookmark that was only temporarily
+ * unreadable. */
 int mdb_book_progress(const char *key, char *member_out, int member_cap, long *position_ms, int *completed_out, long *updated_out){
-    if(completed_out) *completed_out = 0;
-    if(updated_out) *updated_out = 0;
-    if(!key) return -1;
-    sqlite3 *d = db(); if(!d) return -1;
-    sqlite3_stmt *st; int found = 0;
-    /* read POSITION, COMPLETED and UPDATED_AT together so a caller can decide resume-vs-restart from the
-     * LATEST saved state (the book may have finished since the list was built) and how long it's been idle. */
-    if(sqlite3_prepare_v2(d, "SELECT MEMBER_PATH,POSITION_MS,COMPLETED,UPDATED_AT FROM BOOK_PROGRESS WHERE BOOK_KEY=? LIMIT 1;", -1, &st, NULL) != SQLITE_OK)
-        return -1;
-    sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
-    int rc = sqlite3_step(st);
-    if(rc == SQLITE_ROW){
-        if(member_out && member_cap > 0) snprintf(member_out, (size_t)member_cap, "%s", colt(st, 0));
-        if(position_ms) *position_ms = (long)sqlite3_column_int64(st, 1);
-        if(completed_out) *completed_out = sqlite3_column_int(st, 2);
-        if(updated_out) *updated_out = (long)sqlite3_column_int64(st, 3);
-        found = 1;
-    } else if(rc != SQLITE_DONE){
-        found = -1;   /* BUSY / IOERR etc. -> a read error, not "no bookmark" */
-    }
-    sqlite3_finalize(st);
-    return found;
+    return lsdb_book_progress(key, member_out, member_cap, position_ms, completed_out, updated_out, NULL);
 }
 
-/* Checkpoint a book's position (upsert). Called periodically during playback and on pause/exit.
+/* Checkpoint a book's position in listening.db. Called periodically during playback and on pause/exit.
  * Returns 1 if the row was actually written, 0 on any failure (so the caller can retry rather than
  * advance its save-throttle timestamp and silently drop the bookmark). */
 int mdb_book_save(const char *key, const char *member_path, long position_ms, int completed){
-    if(!key || !member_path) return 0;
-    sqlite3 *d = db(); if(!d) return 0;
-    sqlite3_stmt *st;
-    const char *sql =
-        "INSERT INTO BOOK_PROGRESS(BOOK_KEY,MEMBER_PATH,POSITION_MS,UPDATED_AT,COMPLETED) VALUES(?1,?2,?3,?4,?5) "
-        "ON CONFLICT(BOOK_KEY) DO UPDATE SET MEMBER_PATH=?2,POSITION_MS=?3,UPDATED_AT=?4,COMPLETED=?5;";
-    if(sqlite3_prepare_v2(d, sql, -1, &st, NULL) != SQLITE_OK) return 0;
-    sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 2, member_path, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 3, position_ms < 0 ? 0 : position_ms);
-    sqlite3_bind_int64(st, 4, (sqlite3_int64)time(NULL));
-    sqlite3_bind_int(st, 5, completed ? 1 : 0);
-    int ok = (sqlite3_step(st) == SQLITE_DONE);
-    sqlite3_finalize(st);
-    return ok;
+    return lsdb_book_save(key, member_path, position_ms, completed);
 }
 
 /* Audiobook isolation: the stock player builds the music queue as an unfiltered SELECT FROM SONG, so a

@@ -6,6 +6,7 @@
 #include "folderbrowser.h"
 #include "books.h"
 #include "musicdb.h"
+#include "listeningdb.h"   /* Most Played / Recent */
 #include "fwcaps.h"
 #include "artcache.h"
 #include "fonts_hebrew.h"
@@ -82,6 +83,7 @@ static int g_vrows;
  * slot in that same order, as the stock player only plays its song.db rows (mdb_song_ids_for finds them). */
 static ldb_list g_lsongs, g_lalbums, g_lalbum;
 static ldb_list g_lartists, g_lgenres;  /* the Artists and Genres views */
+static ldb_list g_lhist;                /* Most Played / Recent */
 static int g_lartists_by_aa = -1;       /* the Artists grouping g_lartists was read in (mdb_artist_mode) */
 static ldb_list g_lscope, g_lscope_songs;   /* an artist's / a genre's albums (level 1) and songs (level 0 or 2) */
 static const ldb_list *g_lcur;          /* the song list on screen (Songs, an album, an artist's or a genre's songs) */
@@ -161,12 +163,6 @@ static void row_two(lv_obj_t *r, const char *top, const char *sub, const char *r
 }
 
 /* ---- callbacks ---------------------------------------------------------- */
-static void song_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    int id=(int)(uintptr_t)lv_event_get_user_data(e);
-    if(!g_song_cb || !g_song_cb(id)) return;   /* refused / not sent: already toasted, stay on the list */
-    screen_show(SCR_NOWPLAYING);
-}
 static void reload_async(void *p){ (void)p; library_reload(); }
 
 /* ---- playing library.db lists ---------------------------------------------------------------------------------- */
@@ -479,11 +475,6 @@ static lv_obj_t *add_row(lv_obj_t *parent, int i){
             ui_on(r, fav_row_cb, LV_EVENT_LONG_PRESSED, (void*)(uintptr_t)i, "library.fav_row.long", UI_CORE);
             fmt_dur(dur,sizeof dur,g_favs[i].dur_ms);
             row_two(r, g_favs[i].title, g_favs[i].artist, dur, KIT_VALUE_DURATION);
-            break;
-        case VIEW_MOSTPLAYED: case VIEW_RECENT:   /* tap plays the song (via song_cb, by id) */
-            ui_on(r, song_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)g_favs[i].id, "library.song", UI_CORE);
-            fmt_dur(dur,sizeof dur,g_favs[i].dur_ms);
-            row_two(r, g_favs[i].title[0]?g_favs[i].title:"Untitled", g_favs[i].artist, dur, KIT_VALUE_DURATION);
             break;
     }
     theme_list_row(r);
@@ -964,13 +955,13 @@ static void library_reload(void){
         add_play_header(0);
         for(int i=0;i<n;i++) g_first[i]=first_letter(g_favs[i].title);
         g_count=n; fill_start(n); az_show(1);
-    } else if(g_view==VIEW_MOSTPLAYED || g_view==VIEW_RECENT){
-        int need = mdb_stats_count(g_view==VIEW_RECENT);
-        if(need < 0) need = mdb_total_song_count();
-        if(need < 0) need = mdb_song_count() > 256 ? mdb_song_count() : 256;
-        lib_ensure_fav_cap(need);
-        int n = (g_view==VIEW_MOSTPLAYED) ? mdb_mostplayed(g_favs, g_fav_cap) : mdb_recent(g_favs, g_fav_cap);
-        if(n<=0){ empty_label(tr("Nothing played yet")); return; }
+    } else if(g_view==VIEW_MOSTPLAYED || g_view==VIEW_RECENT){         /* listening.db's play counts, library.db's songs */
+        ldb_list_free(&g_lhist);                                       /* plays change it: read it every time */
+        int n = lsdb_ready() ? ldb_read_history(g_view==VIEW_RECENT, &g_lhist) : -1;
+        lib_ensure_first_cap(n);
+        if(n > g_first_cap) n = g_first_cap;
+        if(n<=0){ empty_label(tr(n < 0 ? "Can't read play history" : "Nothing played yet")); return; }
+        lcur_set(&g_lhist);
         g_count=n; fill_start(n);   /* ordered by plays / recency -> no Play-All header, no A-Z */
     } else { /* VIEW_PLAYLISTS */
         /* grow the buffers to the real playlist count (kept file-scope: playlist_cb reads

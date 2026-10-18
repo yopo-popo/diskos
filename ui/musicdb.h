@@ -148,7 +148,7 @@ int  mdb_total_song_count(void);                            /* full SONG count i
 int  mdb_is_book_path(const char *path);                    /* 1 if this path is an audiobook (.m4b) */
 int  mdb_song_genre(const char *path, int track, char *out, int cap);   /* GENRE of the song row for `path` (sub-track `track` > 0, else the first row); 1 = found. Safe off the UI thread */
 int  mdb_books(book_t *out, int max);                       /* list audiobooks, continue-listening first */
-int  mdb_book_progress(const char *key, char *member_out, int member_cap, long *position_ms, int *completed_out, long *updated_out); /* 1 if bookmark */
+int  mdb_book_progress(const char *key, char *member_out, int member_cap, long *position_ms, int *completed_out, long *updated_out); /* 1 if bookmark (listening.db) */
 int  mdb_book_save(const char *key, const char *member_path, long position_ms, int completed);  /* 1=written, 0=failed (caller should retry, not advance its throttle) */
 int  mdb_reserved_slot_set(const char *path);  /* set the reserved list_type-5 slot (seq 0) to this single path for isolated audiobook playback; 1=ok */
 int  mdb_reserved_slot_set_playlist(long pid);  /* set the reserved slot (seq 0) to a user playlist's members for isolated playlist playback; returns member count, 0=fail/empty */
@@ -172,10 +172,6 @@ int  mdb_search(const char *q, const mdb_song_t **out, int cap);
 int  mdb_favorites(mdb_song_t *out, int cap, int stock_order);   /* stock_order: the player's type-6 queue order */
 int  mdb_favorite_count(void);                                   /* MY_LOVE music rows (may exceed SONG); -1 = error */
 int  mdb_love_path(int love_id, char *out, int cap);              /* MY_LOVE.PATH for a MY_LOVE.ID; 1 = found */
-void mdb_record_play(const char *path);            /* bump PLAY_STATS on a new track */
-int  mdb_stats_count(int by_recent);
-int  mdb_mostplayed(mdb_song_t *out, int cap);     /* songs by play count desc */
-int  mdb_recent(mdb_song_t *out, int cap);         /* songs by last-played desc */
 int  mdb_unfavorite(int love_id);                   /* remove by MY_LOVE.ID */
 int  mdb_playlist_sync_registry(void);   /* reconcile PLAYLIST_INFO with stock's CUSTOM_PLAYLIST_INDEX; 2 = synced, 1 = no index, 0 = failed */
 int  mdb_playlist_num(void);   /* count of playlists (to size a dynamic buffer, no fixed cap) */

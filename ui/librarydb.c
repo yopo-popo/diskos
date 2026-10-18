@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include "librarydb.h"
+#include "listeningdb.h"   /* only its path: the history lists attach it */
 
 #define NEW_PATH LIBRARYDB_PATH ".new"
 
@@ -532,13 +533,16 @@ int ldb_room_ok(ldb_writer *w){
 }
 
 #define WHY(...) do{ if(why && whycap > 0) snprintf(why, (size_t)whycap, __VA_ARGS__); }while(0)
-ldb_writer *ldb_begin(long long (*reserve)(void), char *why, int whycap){
-    WHY("%s", "");
+int ldb_make_dir(void){
     char parent[sizeof LIBRARYDB_DIR];
     snprintf(parent, sizeof parent, "%s", LIBRARYDB_DIR);
     char *sl = strrchr(parent, '/');
     if(sl && sl != parent){ *sl = 0; mkdir_owner(parent, 0755); }
-    if(mkdir_owner(LIBRARYDB_DIR, 0700) != 0){
+    return mkdir_owner(LIBRARYDB_DIR, 0700);
+}
+ldb_writer *ldb_begin(long long (*reserve)(void), char *why, int whycap){
+    WHY("%s", "");
+    if(ldb_make_dir() != 0){
         WHY("can't create %s (%s)", LIBRARYDB_DIR, strerror(errno));
         return NULL;
     }
@@ -895,6 +899,11 @@ static const char *READ_GENRE_ALBUMS = SCOPE_ALBUMS("SELECT t.album_artist AS aa
     " FROM tracks t WHERE (t.album_artist, t.album_title) IN (SELECT t2.album_artist, t2.album_title"
     " FROM track_file_genres g JOIN tracks t2 ON t2.id=g.track_id WHERE g.genre=?1 AND t2.album_title IS NOT NULL)"
     " GROUP BY t.album_artist, t.album_title HAVING min(%s)=1");
+/* Most Played and Recent: the songs of listening.db's play counts that are in the library (attached as ls) */
+#define HISTORY_FROM "FROM ls.listened_songs h JOIN tracks t ON t.path=h.path AND t.start_ms=h.start_ms"
+static const char *const READ_HISTORY[2] = {
+    "SELECT " SONG_COLS " " HISTORY_FROM " ORDER BY h.play_count DESC, h.last_play_seq DESC;",
+    "SELECT " SONG_COLS " " HISTORY_FROM " ORDER BY h.last_play_seq DESC;" };
 static const char *scope_cond(int kind, const char *key){
     switch(kind){
     case LDB_SCOPE_GENRE: return "t.id IN (SELECT g.track_id FROM track_file_genres g WHERE g.genre=?1)";
@@ -1111,4 +1120,45 @@ int ldb_song_album(const char *path, long long start_ms, char *album_artist, int
     sqlite3_finalize(st);
     sqlite3_close(db);
     return ok;
+}
+int ldb_track_start(const char *path, const char *title, long long *start_ms){
+    *start_ms = 0;
+    if(!path) return 0;
+    sqlite3 *db = reader_open();
+    if(!db) return 0;
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    /* a plain file has one track; a CUE/ISO file's track is the one with this title, else its first */
+    if(sqlite3_prepare_v2(db, "SELECT start_ms FROM tracks WHERE path=?1 ORDER BY (title IS ?2) DESC, start_ms LIMIT 1;",
+                          -1, &st, NULL) == SQLITE_OK){
+        sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, title ? title : "", -1, SQLITE_STATIC);
+        if(sqlite3_step(st) == SQLITE_ROW){ *start_ms = sqlite3_column_int64(st, 0); found = 1; }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return found;
+}
+int ldb_read_history(int by_recent, ldb_list *out){
+    memset(out, 0, sizeof *out);
+    if(access(LISTENINGDB_PATH, F_OK) != 0) return errno == ENOENT ? 0 : -1;   /* no file: nothing played yet */
+    long long stamp[4];
+    file_stamp(stamp);
+    sqlite3 *db = reader_open();
+    if(!db) return -1;
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if(sqlite3_prepare_v2(db, "ATTACH DATABASE ?1 AS ls;", -1, &st, NULL) == SQLITE_OK){   /* read-only, like the library */
+        sqlite3_bind_text(st, 1, LISTENINGDB_PATH, -1, SQLITE_STATIC);
+        int rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        st = NULL;
+        if(rc == SQLITE_DONE && sqlite3_prepare_v2(db, READ_HISTORY[by_recent != 0], -1, &st, NULL) == SQLITE_OK)
+            n = read_list(st, out);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    if(n < 0){ ldb_list_free(out); return -1; }
+    memcpy(out->stamp, stamp, sizeof stamp);
+    return n;
 }
