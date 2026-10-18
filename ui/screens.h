@@ -113,7 +113,8 @@ const char *ui_route_mac(void);                  /* main.c: MAC the player is ro
 void bt_boot_restore(void);   /* at startup: re-enable BT + arm auto-route if it was on */
 void bt_notify_player_restart(void);   /* player restarted: forget stale auto-route so the poll re-routes */
 int  ui_player_settling(void);         /* 1 while the player is still in its post-restart late-init settle window */
-void library_open_album(const char *name);
+void library_open_album(const char *album_artist, const char *album);   /* an album by its library.db key */
+int  library_play_album(const char *album_artist, const char *album);   /* play it from the start; 1 = sent */
 void library_open_artist(const char *name);
 void albumwall_create(lv_obj_t *root);     /* SCR_ALBUMWALL: cover-flow album browser */
 void albumwall_refresh(void);              /* rebuilt per entry from the album list */

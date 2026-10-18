@@ -113,4 +113,38 @@ int ldb_failed(const ldb_writer *w);
 const char *ldb_error(const ldb_writer *w);
 void ldb_get_stats(const ldb_writer *w, ldb_stats *st);
 
+/* ---- reading: the Library's lists ----
+ * Each read opens library.db read-only, loads one whole list in library order (English, Hebrew, then '#') and closes
+ * the file again, so a scan that replaced library.db is seen by the next read. A list owns its strings; keep it as
+ * long as the rows on screen use it and ask ldb_list_current whether the file is still the one it was read from. */
+typedef struct {
+    const char *title;          /* song title / album title */
+    const char *artist;         /* song: its artists joined with ", " ("" = none); album: the album artist ("" = unknown) */
+    const char *path;           /* song: its file; album: its first song's file (for the cover) */
+    const char *album;          /* song: its album, NULL = none (album lists: NULL) */
+    const char *album_artist;   /* song: with an album, its album artist (album lists: NULL) */
+    long long start_ms;         /* song: where it starts in the file (CUE/ISO), else 0 */
+    int source;                 /* song: LDB_SRC_* */
+    int disc, track;            /* song: 0 = not tagged */
+    int duration_ms;            /* song: 0 = unknown */
+    int count;                  /* album: its songs */
+    int letter;                 /* the jump-bar letter of its sort key (ldb_key_letter) */
+} ldb_item;
+typedef struct {
+    ldb_item *v; int n;
+    char *pool;                 /* the strings */
+    long long stamp[4];         /* the library.db it was read from */
+} ldb_list;
+/* Each returns the number of rows (0 = none), or -1 when library.db is missing, from another schema version or can't
+ * be read; out is then an empty list. Free it with ldb_list_free (also fine on an empty or zeroed list). */
+int  ldb_read_songs(ldb_list *out);                                    /* every song, by title, then artist */
+int  ldb_read_albums(ldb_list *out);                                   /* every album, by title, then album artist */
+int  ldb_read_album_songs(const char *album_artist, const char *album, ldb_list *out);   /* disc and track order */
+int  ldb_list_current(const ldb_list *l);   /* 1 = library.db is still the file l was read from */
+void ldb_list_free(ldb_list *l);
+/* The album's first songs' files, at most max, distinct (cover lookups). Returns the count, 0 on any failure. */
+int  ldb_album_paths(const char *album_artist, const char *album, char (*paths)[512], int max);
+/* The album of the song at path (start_ms < 0 = its first song in the file). 1 = found. */
+int  ldb_song_album(const char *path, long long start_ms, char *album_artist, int aacap, char *album, int acap);
+
 #endif

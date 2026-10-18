@@ -10,6 +10,7 @@
 #include "artcache.h"
 #include "fonts_hebrew.h"
 #include "fonts_icons.h"
+#include "lvgl/src/indev/lv_indev_private.h"   /* vrow_held: the object a pointer holds */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,13 +74,28 @@ static long *g_plids = NULL;
 static int  *g_plcounts = NULL;
 static int   g_plcap = 0;                    /* allocated slots in g_plnames/g_plids/g_plcounts */
 
-/* Streamed list fill: building all song rows at once froze the UI for seconds, so
- * we render the first screenful immediately and stream the rest in via a timer
- * (non-blocking). g_buf holds the song pointers for SONGS/GROUP. */
+/* g_buf holds the song pointers for SONGS/GROUP. */
 static const mdb_song_t **g_buf = NULL;
-static int g_fill_i, g_fill_n;
-static lv_timer_t *g_fill_timer;
-static int g_jump_idx = -1;
+
+/* A view's rows: only those near the viewport exist as objects. LVGL moves, lays out and styles every child of a list on
+ * each scroll step, so building all 10,000 rows of Songs made scrolling crawl (and a streamed fill kept adding to it).
+ * A spacer as tall as all the rows keeps their place in the list, below any headers; the rows near the viewport are its
+ * children at their own y, made and deleted as the list scrolls (vlist_sync). */
+#define ROW_PITCH  (ROW_H + 4)          /* a row and the list's pad_row */
+#define VROW_EXTRA 3                    /* rows kept past each edge of the viewport */
+#define VROW_MAX   40
+static lv_obj_t *g_vspace;              /* the spacer; NULL while the view has no rows */
+static struct { lv_obj_t *obj; int idx; } g_vrow[VROW_MAX];
+static int g_vrows;
+
+/* Songs, Albums and an album's songs come from diskOS's own library.db (librarydb), in its order: English, Hebrew,
+ * then '#'. The rows on screen carry their index into these lists. They play through the reserved custom-playlist
+ * slot in that same order, as the stock player only plays its song.db rows (mdb_song_ids_for finds them). */
+static ldb_list g_lsongs, g_lalbums, g_lalbum;
+static const ldb_list *g_lcur;          /* the song list on screen (Songs or an album), NULL in the other views */
+static int *g_lids;                     /* SONG.IDs of g_lcur's songs, found when it is first played */
+static int  g_lids_ok;
+static char g_alb_artist[LDB_NAME], g_alb_title[LDB_NAME];   /* the open album (g_drill_kind 1): its exact key */
 
 static void library_reload(void);
 
@@ -103,14 +119,20 @@ static void az_code_text(unsigned char code, char b[3]){   /* a code's letter as
     if(code >= AZ_HEB){ b[0] = (char)0xD7; b[1] = (char)(0x90 + code - AZ_HEB); b[2] = 0; }
     else { b[0] = (char)code; b[1] = 0; }
 }
+/* library.db's jump letter (ldb_key_letter: 'A'..'Z', 0x80 + alef..tav without the finals, '#') as a code here */
+static unsigned char az_code(int letter){
+    static const unsigned char HEB_N[22] = { 0,1,2,3,4,5,6,7,8,9,11,12,14,16,17,18,20,22,23,24,25,26 };
+    if(letter >= 0x80 && letter < 0x80 + 22) return (unsigned char)(AZ_HEB + HEB_N[letter - 0x80]);
+    return (letter >= 'A' && letter <= 'Z') ? (unsigned char)letter : '#';
+}
 static void fmt_dur(char *b, size_t n, int ms){
     if(ms<=0){ b[0]=0; return; }
     long long t=((long long)ms+500)/1000; snprintf(b,n,"%lld:%02lld", t/60, t%60);   /* no int overflow near INT32_MAX */
 }
 
 /* ---- rows --------------------------------------------------------------- */
-static lv_obj_t *base_row(void){
-    lv_obj_t *r = lv_obj_create(g_list);
+static lv_obj_t *base_row_in(lv_obj_t *parent){
+    lv_obj_t *r = lv_obj_create(parent);
     lv_obj_remove_style_all(r);
     lv_obj_set_size(r, 268, ROW_H);
     lv_obj_set_style_radius(r, 10, 0);
@@ -120,6 +142,7 @@ static lv_obj_t *base_row(void){
     lv_obj_add_flag(r, LV_OBJ_FLAG_CLICKABLE);
     return r;
 }
+static lv_obj_t *base_row(void){ return base_row_in(g_list); }
 static void row_two(lv_obj_t *r, const char *top, const char *sub, const char *right, kit_value_kind_t kind){
     lv_obj_t *t = lv_label_create(r);
     lv_label_set_text(t, top); lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
@@ -163,6 +186,73 @@ static void song_cb(lv_event_t *e){
     screen_show(SCR_NOWPLAYING);
 }
 static void reload_async(void *p){ (void)p; library_reload(); }
+
+/* ---- playing library.db lists ---------------------------------------------------------------------------------- */
+static void lcur_set(const ldb_list *l){ g_lcur = l; g_lids_ok = 0; }
+static const int *lcur_ids(void){
+    if(!g_lcur || g_lcur->n <= 0) return NULL;
+    if(!g_lids_ok){
+        free(g_lids);
+        g_lids = malloc((size_t)g_lcur->n * sizeof *g_lids);
+        if(!g_lids || mdb_song_ids_for(g_lcur->v, g_lcur->n, g_lids) < 0){ free(g_lids); g_lids = NULL; return NULL; }
+        g_lids_ok = 1;
+    }
+    return g_lids;
+}
+/* Play list l from row i (-1 the first song, -2 a random one) in the list's order. ids = its songs' SONG.IDs.
+ * Returns 1 if a play was sent; every failure toasts once (here or in ui_play_plan). */
+static int lplay(const ldb_list *l, const int *ids, int i){
+    if(!l || !ids || l->n <= 0){ ui_toast("Couldn't play that list"); return 0; }
+    if(i == -2) i = rand() % l->n;
+    else if(i < 0) i = 0;
+    if(i >= l->n) return 0;
+    for(int k = 0; ids[i] <= 0 && k < l->n; k++) i = (i + 1) % l->n;   /* Play All / Shuffle: the next song that can play */
+    if(ids[i] <= 0){ ui_toast("Rescan to play these songs"); return 0; }
+    mdb_plan_t plan;
+    if(!mdb_plan_from_ids(ids, l->n, &plan)){ ui_toast("Couldn't play that list"); return 0; }
+    int ok = ui_play_plan(&plan, ids[i]);
+    mdb_plan_free(&plan);
+    return ok;
+}
+static void lsong_cb(lv_event_t *e){
+    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
+    int i = (int)(uintptr_t)lv_event_get_user_data(e);
+    if(!g_lcur || i < 0 || i >= g_lcur->n) return;
+    const int *ids = lcur_ids();
+    if(ids && ids[i] <= 0){ ui_toast("Rescan to play this song"); return; }   /* never start a different song */
+    if(!lplay(g_lcur, ids, i)) return;                      /* refused / not sent: already toasted, stay on the list */
+    screen_show(SCR_NOWPLAYING);
+}
+int library_play_album(const char *album_artist, const char *album){
+    ldb_list l;
+    int n = ldb_read_album_songs(album_artist, album, &l), ok = 0;
+    int *ids = n > 0 ? malloc((size_t)n * sizeof *ids) : NULL;
+    if(ids && mdb_song_ids_for(l.v, n, ids) >= 0) ok = lplay(&l, ids, -1);
+    else ui_toast("Couldn't play that album");
+    free(ids);
+    ldb_list_free(&l);
+    return ok;
+}
+static void open_album(const char *album_artist, const char *album, int deeplink){
+    snprintf(g_alb_artist, sizeof g_alb_artist, "%s", album_artist ? album_artist : "");
+    snprintf(g_alb_title, sizeof g_alb_title, "%s", album ? album : "");
+    snprintf(g_drill, MDB_STR, "%s", g_alb_title);          /* library_drill_context's album name (stock queues) */
+    g_view=VIEW_GROUP; g_drill_kind=1; g_scope_lvl=0; g_scope_from_albums=0; g_deeplink=deeplink;
+    library_reload();
+}
+static void lalbum_cb(lv_event_t *e){
+    if(lv_event_get_code(e)!=LV_EVENT_SHORT_CLICKED) return;
+    int i = (int)(uintptr_t)lv_event_get_user_data(e);
+    if(g_view!=VIEW_ALBUMS || i < 0 || i >= g_lalbums.n) return;
+    open_album(g_lalbums.v[i].artist, g_lalbums.v[i].title, 0);   /* back returns to Albums */
+}
+static void lalbum_play_cb(lv_event_t *e){   /* long-press an album: play it now */
+    if(lv_event_get_code(e)!=LV_EVENT_LONG_PRESSED) return;
+    int i = (int)(uintptr_t)lv_event_get_user_data(e);
+    if(g_view!=VIEW_ALBUMS || i < 0 || i >= g_lalbums.n) return;
+    ui_set_workmode(0);                        /* sequential */
+    if(library_play_album(g_lalbums.v[i].artist, g_lalbums.v[i].title)) screen_show(SCR_NOWPLAYING);
+}
 
 /* ---- "Remove from Favourites?" confirm (long-press is easy to trigger by
  * accident, so removal needs an explicit confirm). ------------------------ */
@@ -369,9 +459,9 @@ static void scope_album_play_cb(lv_event_t *e){   /* long-press an album row: pl
 
 /* ---- A-Z grid ----------------------------------------------------------- */
 /* build one row for the current view at list index i (data already prepared) */
-static void add_row(int i){
+static lv_obj_t *add_row(lv_obj_t *parent, int i){
     char dur[12];
-    lv_obj_t *r = base_row();
+    lv_obj_t *r = base_row_in(parent);
     if(g_view==VIEW_GROUP && g_drill_kind!=1 && g_scope_lvl==1){       /* artist/genre -> albums: "All Songs" first */
         char cnt[12];
         if(i==0){
@@ -385,7 +475,19 @@ static void add_row(int i){
             row_two(r, g_gnames[i-1], g_drill_kind==3 ? g_gartists[i-1] : NULL, cnt, KIT_VALUE_COUNT);
         }
         theme_list_row(r);
-        return;
+        return r;
+    }
+    if(g_lcur){                                                         /* Songs or an album (library.db) */
+        const ldb_item *it = &g_lcur->v[i];
+        ui_on(r, lsong_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)i, "library.song", UI_CORE);
+        fmt_dur(dur,sizeof dur,it->duration_ms);
+        if(g_view==VIEW_GROUP && it->track > 0 && cfg_get_int("track_numbers", 0)){
+            char num[LDB_NAME + 16];                       /* album list + Track Numbers on: "3 Title" (stock "%d %s") */
+            snprintf(num, sizeof num, "%d %s", it->track, it->title);
+            row_two(r, num, it->artist, dur, KIT_VALUE_DURATION);
+        } else row_two(r, it->title, it->artist, dur, KIT_VALUE_DURATION);
+        theme_list_row(r);
+        return r;
     }
     switch(g_view){
         case VIEW_SONGS: case VIEW_GROUP:
@@ -401,11 +503,12 @@ static void add_row(int i){
             } else
             row_two(r, g_buf[i]->title[0]?g_buf[i]->title:"Untitled", g_buf[i]->artist, dur, KIT_VALUE_DURATION);
             break;
-        case VIEW_ALBUMS: {
-            ui_on(r, group_cb, LV_EVENT_SHORT_CLICKED, (void*)(uintptr_t)i, "library.group", UI_CORE);
-            ui_on(r, group_play_cb, LV_EVENT_LONG_PRESSED, (void*)(uintptr_t)i, "library.group_play.long", UI_CORE);
-            char cnt[12]; snprintf(cnt,sizeof cnt,"%d",g_gcounts[i]);
-            row_two(r, g_gnames[i], mdb_artist_missing(g_gartists[i]) ? "Unknown artist" : g_gartists[i], cnt, KIT_VALUE_COUNT);
+        case VIEW_ALBUMS: {                                            /* library.db */
+            const ldb_item *a = &g_lalbums.v[i];
+            ui_on(r, lalbum_cb, LV_EVENT_SHORT_CLICKED, (void*)(uintptr_t)i, "library.album", UI_CORE);
+            ui_on(r, lalbum_play_cb, LV_EVENT_LONG_PRESSED, (void*)(uintptr_t)i, "library.album_play.long", UI_CORE);
+            char cnt[12]; snprintf(cnt,sizeof cnt,"%d",a->count);
+            row_two(r, a->title, mdb_artist_missing(a->artist) ? "Unknown artist" : a->artist, cnt, KIT_VALUE_COUNT);
             break; }
         case VIEW_ARTISTS:
             ui_on(r, group_cb, LV_EVENT_SHORT_CLICKED, (void*)(uintptr_t)i, "library.group", UI_CORE);
@@ -431,46 +534,55 @@ static void add_row(int i){
             break;
     }
     theme_list_row(r);
+    return r;
 }
-static void fill_stop(void){
-    if(g_fill_timer){ lv_timer_del(g_fill_timer); g_fill_timer=NULL; }
-    g_jump_idx = -1;
+static void vlist_stop(void){ g_vspace = NULL; g_vrows = 0; }
+static void vspace_delete_cb(lv_event_t *e){ if(lv_event_get_target(e) == g_vspace) vlist_stop(); }
+/* a row a pointer is pressing, or pressed last: deleting it makes LVGL drop the touch, which stops a drag or a fling */
+static int vrow_held(const lv_obj_t *r){
+    for(lv_indev_t *in = lv_indev_get_next(NULL); in; in = lv_indev_get_next(in))
+        if(in->pointer.act_obj == r || in->pointer.last_obj == r) return 1;
+    return 0;
 }
-static void jump_finish(void){
-    if(g_jump_idx < 0) return;
-    /* Leave a screenful below the target so streaming does not clamp it short. */
-    int need = g_jump_idx + 1 + (LIST_H + ROW_H + 3)/(ROW_H+4);
-    if(g_fill_i < need && g_fill_i < g_fill_n) return;
-    int idx = g_jump_idx;
-    g_jump_idx = -1;              /* first: this scroll emits SCROLL_BEGIN too */
-    lv_obj_scroll_to_y(g_list, (idx + g_has_header)*(ROW_H+4), LV_ANIM_OFF);
-}
-/* A newer scroll (touch drag, rim) replaces a pending A-Z target. */
-void library_jump_cancel(void){ g_jump_idx = -1; }
-static void list_scroll_cb(lv_event_t *e){ (void)e; library_jump_cancel(); }
-static void fill_cb(lv_timer_t *t){
-    if(screen_current() != SCR_LIBRARY){
-        g_jump_idx = -1;
-        lv_timer_pause(t);
-        return;
+/* make the rows near the viewport and delete the others (a held one stays until the pointer lets it go) */
+static void vlist_sync(void){
+    if(!g_vspace || g_count <= 0) return;
+    int y = lv_obj_get_scroll_y(g_list) - lv_obj_get_y(g_vspace);    /* the viewport's top, in the spacer */
+    int lo = (y > 0 ? y / ROW_PITCH : 0) - VROW_EXTRA;
+    int hi = y + LIST_H < 0 ? -1 : (y + LIST_H) / ROW_PITCH + VROW_EXTRA;
+    if(lo < 0) lo = 0;
+    if(hi >= g_count) hi = g_count - 1;
+    if(hi - lo > 63) hi = lo + 63;
+    uint64_t have = 0;
+    int k = 0;
+    for(int j = 0; j < g_vrows; j++){
+        int i = g_vrow[j].idx;
+        if(i >= lo && i <= hi) have |= 1ull << (i - lo);
+        else if(!vrow_held(g_vrow[j].obj)){ lv_obj_delete(g_vrow[j].obj); continue; }
+        g_vrow[k++] = g_vrow[j];
     }
-    uint32_t start = lv_tick_get();
-    int end = g_fill_i + 40; if(end > g_fill_n) end = g_fill_n;
-    do { add_row(g_fill_i++); }
-    while(g_fill_i < end && lv_tick_elaps(start) < 4);
-    jump_finish();
-    if(g_fill_i >= g_fill_n) fill_stop();
-    (void)t;
+    g_vrows = k;
+    for(int i = lo; i <= hi && g_vrows < VROW_MAX; i++){
+        if(have >> (i - lo) & 1) continue;
+        lv_obj_t *r = add_row(g_vspace, i);
+        lv_obj_set_pos(r, 0, i * ROW_PITCH);
+        g_vrow[g_vrows].obj = r; g_vrow[g_vrows].idx = i; g_vrows++;
+    }
 }
+static void list_scroll_cb(lv_event_t *e){ (void)e; vlist_sync(); }
+/* A-Z jumps land at once (every row's place exists), so there is never a pending target for a newer scroll to cancel. */
+void library_jump_cancel(void){}
+/* the view's n rows (g_count), below the headers already in the list */
 static void fill_start(int n){
-    fill_stop();
-    g_fill_n = n; g_fill_i = 0;
-    int first = n < 18 ? n : 18;                 /* first screenful, instantly */
-    for(; g_fill_i < first; g_fill_i++) add_row(g_fill_i);
-    if(g_fill_i < g_fill_n){
-        g_fill_timer = lv_timer_create(fill_cb, 16, NULL);
-        if(screen_current() != SCR_LIBRARY) lv_timer_pause(g_fill_timer);
-    }
+    vlist_stop();
+    if(n <= 0) return;
+    g_vspace = lv_obj_create(g_list);
+    lv_obj_remove_style_all(g_vspace);
+    lv_obj_set_size(g_vspace, 268, n * ROW_PITCH - 4);
+    lv_obj_clear_flag(g_vspace, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(g_vspace, vspace_delete_cb, LV_EVENT_DELETE, NULL);
+    lv_obj_update_layout(g_list);       /* the spacer's y, and the scroll range the A-Z jumps clamp to */
+    vlist_sync();
 }
 
 static void jump_to_letter(unsigned char L){
@@ -486,8 +598,7 @@ static void jump_to_letter(unsigned char L){
     if(idx<0) idx=g_count-1;
     /* row pitch = ROW_H + the list's 4px flex pad_row, so idx*ROW_H alone lands
      * progressively short for later letters. */
-    g_jump_idx = idx;
-    jump_finish();
+    lv_obj_scroll_to_y(g_list, (idx + g_has_header)*ROW_PITCH, LV_ANIM_OFF);
 }
 /* close the grid and bring back the A-Z button it hid (the globe sits on the button's spot, and outline themes draw
  * the grid see-through) */
@@ -617,6 +728,11 @@ static int current_list_context(int *lt, char *name, int cap){
 /* Play the current list, setting the play-mode first (0=Sequential, 1=Shuffle).
  * Play-mode = 0102 (ground-truth captured 2026-06-25); ui_set_workmode applies it. */
 static void play_list_mode(int mode){
+    if(g_lcur){                                                       /* Songs or an album (library.db) */
+        cfg_set_int("work_mode", mode); ui_set_workmode(mode);
+        if(lplay(g_lcur, lcur_ids(), mode == 1 ? -2 : -1)) screen_show(SCR_NOWPLAYING);
+        return;
+    }
     if(g_view==VIEW_GROUP && g_drill_kind!=1 && g_scope_lvl==2){     /* one album of an artist / genre: its own stock queue */
         cfg_set_int("work_mode", mode); ui_set_workmode(mode);
         if(scope_play_album(g_scope_album, mode == 1 ? -2 : -1)) screen_show(SCR_NOWPLAYING);
@@ -666,7 +782,7 @@ static void hdr_btn(lv_obj_t *row, int x, const char *txt, lv_event_cb_t cb){
 /* Album detail header: the album cover on top (from the art cache) with the artist beneath it, shown
  * above the Play All / Shuffle row for an album drill - from EITHER the list view or the cover flow. */
 static int g_hdr_cover_ctr;
-static void add_album_cover_header(const char *album, const char *artist){
+static void add_album_cover_header(const char *album, const char *artist, const char *const *paths, int n){
     lv_obj_t *r = lv_obj_create(g_list);
     lv_obj_remove_style_all(r);
     artist = mdb_artist_missing(artist) ? "Unknown artist" : artist;
@@ -680,11 +796,9 @@ static void add_album_cover_header(const char *album, const char *artist){
     /* Resolve the album's cached 148px cover (first track that has one) into a ROTATING /tmp file so
      * LVGL's image cache can't serve a previous album's bitmap for a reused filename. */
     char src[64]; src[0] = 0;
-    int ids[6]; int n = mdb_album_track_ids(album, ids, 6);
     for(int i=0;i<n;i++){
-        char track[512]; track[0]=0;
         char tmp[48]; snprintf(tmp, sizeof tmp, "/tmp/album_hdr%d.bmp", g_hdr_cover_ctr & 3);
-        if(mdb_song_path(ids[i], track, sizeof track) && track[0] && artcache_get_cover(track, tmp)==0){
+        if(paths[i] && paths[i][0] && artcache_get_cover(paths[i], tmp)==0){
             snprintf(src, sizeof src, "A:%s", tmp); g_hdr_cover_ctr++;
             break;
         }
@@ -725,6 +839,22 @@ static void add_album_cover_header(const char *album, const char *artist){
     }
 }
 
+static void add_mdb_album_cover_header(const char *album, const char *artist){   /* an album of an artist / genre (song.db) */
+    int ids[6]; int n = mdb_album_track_ids(album, ids, 6);
+    char track[6][512]; const char *paths[6]; int m = 0;
+    for(int i=0;i<n;i++) if(mdb_song_path(ids[i], track[m], sizeof track[m]) && track[m][0]){ paths[m] = track[m]; m++; }
+    add_album_cover_header(album, artist, paths, m);
+}
+static void add_ldb_album_cover_header(void){          /* the open album: covers from its first songs' files */
+    const char *paths[6]; int m = 0;
+    for(int i=0;i<g_lalbum.n && m<6;i++){
+        int seen = 0;
+        for(int j=0;j<m && !seen;j++) seen = !strcmp(paths[j], g_lalbum.v[i].path);
+        if(!seen) paths[m++] = g_lalbum.v[i].path;
+    }
+    add_album_cover_header(g_alb_title, g_alb_artist, paths, m);
+}
+
 /* the first row of a song list: [ Play All ] [ Shuffle ]. centered=1 screen-centres the pair (used under
  * the album cover card, so it lines up with the centred cover instead of the left-aligned list rows). */
 static void add_play_header(int centered){
@@ -743,6 +873,17 @@ static void add_play_header(int centered){
  * setting / one album of an artist), so each CUE/ISO track is added as its own row. */
 static void add_plist_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
+    if(g_lcur){                                       /* an album (library.db): its songs' SONG rows, in list order */
+        const int *li = lcur_ids();
+        int *ids = li ? malloc((size_t)g_lcur->n * sizeof *ids) : NULL, m = 0;
+        if(!ids){ ui_toast("Couldn't add these songs"); return; }
+        for(int i=0;i<g_lcur->n;i++) if(li[i] > 0) ids[m++] = li[i];
+        if(m) plpick_set_ids(ids, m);
+        free(ids);
+        if(!m){ ui_toast("Rescan to add these songs"); return; }
+        screen_show(SCR_PLPICK);
+        return;
+    }
     if(!g_buf || g_count <= 0 || (g_view!=VIEW_GROUP)){ ui_toast("Nothing to add"); return; }
     int *ids = malloc((size_t)g_count * sizeof *ids);
     if(!ids){ ui_toast("Out of memory"); return; }
@@ -767,14 +908,15 @@ _Static_assert(sizeof(VIEW_TITLE)/sizeof(VIEW_TITLE[0]) == VIEW_COUNT, "VIEW_TIT
 static void library_reload(void){
     if(!g_list) return;
     if(g_lhint){ lv_obj_add_flag(g_lhint, LV_OBJ_FLAG_HIDDEN); g_lhint_ch = 0; if(g_lhint_timer) lv_timer_pause(g_lhint_timer); }  /* don't leave a stale A-Z hint across views */
-    fill_stop();              /* cancel any in-flight stream before wiping rows */
+    vlist_stop();             /* before wiping rows: the scroll back to the top must not touch them */
     lv_obj_clean(g_list);
+    lcur_set(NULL);
     g_count = 0;
     g_has_header = 0;
     g_hdr_extra_px = 0;
     lv_obj_scroll_to_y(g_list, 0, LV_ANIM_OFF);
 
-    const char *ttl = (g_view==VIEW_GROUP) ? ((g_drill_kind!=1 && g_scope_lvl==2) ? g_scope_album : g_drill) : VIEW_TITLE[g_view];
+    const char *ttl = (g_view==VIEW_GROUP) ? ((g_drill_kind!=1 && g_scope_lvl==2) ? g_scope_album : g_drill_kind==1 ? g_alb_title : g_drill) : VIEW_TITLE[g_view];
     if(g_view==VIEW_GROUP && g_drill_kind==2 && g_scope_lvl!=2 && !g_drill[0]) ttl = "Unknown artist";
     theme_title_text(g_title, (g_view==VIEW_GROUP) ? ttl : tr(ttl));
     az_show(0);
@@ -823,6 +965,26 @@ static void library_reload(void){
     }
 
     (void)dur;
+    if(g_view==VIEW_SONGS || (g_view==VIEW_GROUP && g_drill_kind==1)){   /* library.db: every song, or one album */
+        ldb_list *l = g_view==VIEW_SONGS ? &g_lsongs : &g_lalbum;
+        int n;
+        if(g_view==VIEW_SONGS && ldb_list_current(l)) n = l->n;         /* unchanged since the last read: keep it */
+        else {
+            ldb_list_free(l);
+            n = g_view==VIEW_SONGS ? ldb_read_songs(l) : ldb_read_album_songs(g_alb_artist, g_alb_title, l);
+        }
+        lib_ensure_first_cap(n);
+        if(n > g_first_cap) n = g_first_cap;
+        if(n<=0){ empty_scan(tr("No songs found")); return; }
+        lcur_set(l);
+        if(g_view==VIEW_GROUP) add_ldb_album_cover_header();           /* album: cover on top */
+        add_play_header(g_view==VIEW_GROUP);                            /* centre the pair under the album cover */
+        if(g_view==VIEW_GROUP) add_plist_row(1);                        /* add these songs to a playlist */
+        for(int i=0;i<n;i++) g_first[i]=az_code(l->v[i].letter);
+        g_count=n; fill_start(n);
+        if(g_view==VIEW_SONGS) az_show(1);
+        return;
+    }
     if(g_view==VIEW_SONGS || g_view==VIEW_GROUP){
         lib_alloc_buffers(mdb_song_count());
     }
@@ -850,18 +1012,20 @@ static void library_reload(void){
         else { n=mdb_song_count(); if(n>cap) n=cap; for(int i=0;i<n;i++) g_buf[i]=mdb_song(i); }
         if(n<=0){ empty_scan(tr("No songs found")); return; }
         int is_album = (g_view==VIEW_GROUP && (g_drill_kind==1 || g_scope_lvl==2));
-        if(is_album) add_album_cover_header(g_scope_lvl==2 && g_drill_kind!=1 ? g_scope_album : g_drill, n>0 ? g_buf[0]->artist : NULL);  /* album drill: cover on top */
+        if(is_album) add_mdb_album_cover_header(g_scope_album, n>0 ? g_buf[0]->artist : NULL);  /* album drill: cover on top */
         add_play_header(is_album);                                       /* centre the pair under the album cover */
         if(g_view==VIEW_GROUP) add_plist_row(is_album);                  /* album / artist / genre: add these songs to a playlist */
         for(int i=0;i<n;i++) g_first[i]=first_letter(g_buf[i]->title);
         g_count=n; fill_start(n);
         if(g_view==VIEW_SONGS) az_show(1);
-    } else if(g_view==VIEW_ALBUMS){
-        lib_ensure_group_cap(mdb_album_count());
-        int cap = g_grp_cap < g_first_cap ? g_grp_cap : g_first_cap;
-        int n=mdb_albums(g_gnames,g_gartists,g_gcounts,cap);
+    } else if(g_view==VIEW_ALBUMS){                                    /* library.db */
+        int n;
+        if(ldb_list_current(&g_lalbums)) n = g_lalbums.n;
+        else { ldb_list_free(&g_lalbums); n = ldb_read_albums(&g_lalbums); }
+        lib_ensure_first_cap(n);
+        if(n > g_first_cap) n = g_first_cap;
         if(n<=0){ empty_scan(tr("No albums found")); return; }
-        for(int i=0;i<n;i++) g_first[i]=first_letter(g_gnames[i]);
+        for(int i=0;i<n;i++) g_first[i]=az_code(g_lalbums.v[i].letter);
         g_count=n; fill_start(n); az_show(1);
     } else if(g_view==VIEW_ARTISTS){
         lib_ensure_group_cap(mdb_artist_count());
@@ -936,11 +1100,10 @@ void library_set_song_click_cb(library_song_click_cb_t cb){ g_song_cb=cb; }
  * (e.g. a playlist deleted from the playlist view) so the list isn't stale. */
 void library_refresh(void){ if(g_list) library_reload(); }
 /* Catalog rows change only on an explicit refresh (scan/settings) or a new drill.
- * Keep the rows and any in-flight fill on back navigation.
+ * Keep the rows on back navigation.
  * DB-backed views can change elsewhere while hidden; drills also re-resolve their
  * album cover after NP has populated the artwork cache. */
 void library_enter(void){
-    g_jump_idx = -1;
     if(g_view == VIEW_GROUP || g_view == VIEW_PLAYLISTS || g_view == VIEW_FAVS ||
        g_view == VIEW_MOSTPLAYED || g_view == VIEW_RECENT) library_refresh();
     else {
@@ -948,7 +1111,6 @@ void library_enter(void){
         if(g_lhint){ lv_obj_add_flag(g_lhint, LV_OBJ_FLAG_HIDDEN); g_lhint_ch = 0; if(g_lhint_timer) lv_timer_pause(g_lhint_timer); }
         if(g_list) lv_obj_scroll_to_y(g_list, 0, LV_ANIM_OFF);
     }
-    if(g_fill_timer) lv_timer_resume(g_fill_timer);
 }
 /* The Artists grouping changed (Settings): an open artist drill's key may not exist in the new grouping, so step back
  * to the Artists list; whatever Library shows is rebuilt from the new keys. */
@@ -970,10 +1132,8 @@ int library_drill_context(int *list_type, char *name, int cap){
     return 1;
 }
 
-/* deep-link from the Now Playing 3-dot menu: jump straight to an album/artist */
-void library_open_album(const char *name){
-    g_view=VIEW_GROUP; g_drill_kind=1; g_scope_lvl=0; g_scope_from_albums=0; g_deeplink=1; snprintf(g_drill, MDB_STR, "%s", name); library_reload();
-}
+/* deep-link from the Now Playing 3-dot menu or the cover flow: jump straight to an album (its library.db key) / artist */
+void library_open_album(const char *album_artist, const char *album){ open_album(album_artist, album, 1); }
 void library_open_artist(const char *name){
     g_view=VIEW_GROUP; g_drill_kind=2; g_scope_lvl=0; g_scope_from_albums=0; g_deeplink=1; snprintf(g_drill, MDB_STR, "%s", name); library_reload();
 }
@@ -1064,7 +1224,7 @@ void library_create(lv_obj_t *root){
     lv_obj_set_scroll_dir(g_list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(g_list, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_flag(g_list, LV_OBJ_FLAG_SCROLL_MOMENTUM);
-    lv_obj_add_event_cb(g_list, list_scroll_cb, LV_EVENT_SCROLL_BEGIN, NULL);
+    lv_obj_add_event_cb(g_list, list_scroll_cb, LV_EVENT_SCROLL, NULL);
 
     /* "A-Z" button (bottom-right) opens the alphabet grid */
     g_az_btn = lv_button_create(root);

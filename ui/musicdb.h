@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 diskOS contributors */
 #ifndef MUSICDB_H
 #define MUSICDB_H
+#include "librarydb.h"
 
 #define MDB_MAX_SONGS   1500
 #define MDB_MAX_GROUPS  600
@@ -92,6 +93,10 @@ static inline int mdb_id_cmp(const void *a, const void *b){
 int  mdb_plan_materialize(mdb_plan_t *plan);   /* type 5: write the reserved slot, adopt the player's real order */
 int  mdb_plan_pos(const mdb_plan_t *plan, int song_id);                           /* 1-based position, 0 = not in it */
 void mdb_plan_free(mdb_plan_t *plan);
+/* library.db songs as the stock player's song.db rows (while it still plays): ids[i] = the SONG.ID of items[i], 0 when
+ * song.db doesn't have it. Returns how many were found, -1 on a DB error. */
+int  mdb_song_ids_for(const ldb_item *items, int n, int *ids);
+int  mdb_plan_from_ids(const int *ids, int n, mdb_plan_t *plan);   /* type-5 plan of those rows in that order, 0s left out; 1 = built (caller frees) */
 int  mdb_subtrack_count(const char *path, int iso_only);   /* CUE/ISO rows under one PATH (iso_only: IS_ISO rows only) */
 int  mdb_subtrack_plan(const char *const *paths, int npaths, mdb_plan_t *plan);   /* type-5 plan of their tracks, TRACK order; 1 = built (caller frees) */
 

@@ -1656,7 +1656,7 @@ static long long ldb_reserve(void){
 _Static_assert(TAGLEN == LDB_NAME, "library.db names are the scanner's tag values");
 
 /* The scan report: short, capped lists, written to the SD card once the walk has read the whole card. */
-enum { REP_ENC, REP_SPLIT, REP_NOMEDIA, REP_KEPT, REP_N };
+enum { REP_ENC, REP_SPLIT, REP_NOMEDIA, REP_KEPT, REP_HIDDEN, REP_N };
 #define REP_MAX 500                     /* lines per list; the rest are only counted */
 typedef struct { char *buf; size_t len, cap; int n, more; } rep_list;
 static rep_list g_rep[REP_N];
@@ -2577,13 +2577,23 @@ static void walk(const char *dir, int depth){
              * NOR vanished/renamed books are ever pruned. Restrict to depth 0 (the real cache dir at the SD
              * root): a user's ".diskos" deeper in the tree may hold indexed songs and must still block. */
             if(depth == 0 && strcmp(e->d_name, ".diskos") == 0) continue;
+            /* The folders macOS keeps at the root of every card it mounts (search index, file-event log, trash,
+             * temporary and version stores) hold no music the library could have, so they don't block it either. */
+            static const char *const MAC_ROOT[] = { ".Spotlight-V100", ".fseventsd", ".Trashes", ".TemporaryItems",
+                                                    ".DocumentRevisions-V100" };
+            int mac = 0;
+            for(int k = 0; depth == 0 && k < (int)(sizeof MAC_ROOT / sizeof *MAC_ROOT) && !mac; k++) mac = !strcmp(e->d_name, MAC_ROOT[k]);
+            if(mac) continue;
             /* other dotfile/dotdir: don't index it, but a skipped dot-DIRECTORY may hold songs already
              * in the DB that this walk won't re-see, so block the vanished-row prune to avoid deleting them. */
             int wl = snprintf(path,sizeof path,"%s/%s",dir,e->d_name);
             struct stat ds;
             /* block the prune if this skipped dot-entry is a directory (may hold indexed songs) OR we
              * could not stat it (unknown type -> stay safe, never risk deleting its subtree's rows). */
-            if(wl<=0 || wl>=(int)sizeof path || lstat(path,&ds)!=0 || S_ISDIR(ds.st_mode)) g_prune_blocked = 1;
+            if(wl<=0 || wl>=(int)sizeof path || lstat(path,&ds)!=0 || S_ISDIR(ds.st_mode)){
+                g_prune_blocked = 1;
+                rep_add(REP_HIDDEN, "  %s/", wl > 0 && wl < (int)sizeof path ? rel_path(path) : e->d_name);
+            }
             continue;
         }
         int w = snprintf(path,sizeof path,"%s/%s",dir,e->d_name);
@@ -2705,6 +2715,7 @@ static void report_write(long secs, int published){
     report_list(f, REP_SPLIT, "Artists split into several names (on ';' or \"feat.\")");
     report_list(f, REP_NOMEDIA, "Folders left out of the library (.nomedia)");
     report_list(f, REP_KEPT, "Couldn't read this scan (their songs from the previous scan stay)");
+    report_list(f, REP_HIDDEN, "Hidden folders not scanned (while one is on the card, songs removed from it stay in song.db)");
     int bad = fflush(f) != 0 || ferror(f);
     if(!bad) fsync(fileno(f));
     if(fclose(f) != 0) bad = 1;

@@ -18,7 +18,9 @@
 #include <errno.h>
 #include <fcntl.h>
 
+#ifndef DB_PATH
 #define DB_PATH "/usr/data/fiio/db/song.db"
+#endif
 
 /* The whole library is held in a dynamically-sized array (no fixed cap): sized to
  * the actual SONG count at load. Loaded ONCE at startup, so the realloc never moves
@@ -227,9 +229,11 @@ static int playlist_has_m3u_cols(sqlite3 *d){ return table_has_col(d, "CUSTOM_PL
     "CASE WHEN (IS_CUE=1 OR IS_ISO=1) THEN TRACK END,ID"
 #define MDB_GROUP_CODE_EXPR "CASE WHEN NULLIF(ALBUM_ARTIST,'') IS NOT NULL AND ALBUM_ARTIST_CODE IS NOT NULL THEN ALBUM_ARTIST_CODE ELSE ARTIST_CODE END"
 
+static void slot_memo_drop(void);
 int mdb_load(void){
     g_n = 0; g_load_err = 0;
     groups_free();                 /* library reloaded -> drop cached Artists/Albums/Genres */
+    slot_memo_drop();              /* and what the reserved slot was last written with */
     sqlite3 *d = db(); if(!d){ g_load_err = 1; return 0; }
     /* size the array to the real count first (no 1500 cap) */
     sqlite3_stmt *cst;
@@ -608,9 +612,35 @@ int mdb_album_plan(const mdb_album_key_t *k, mdb_plan_t *plan){
  * each row mapped back to its song, so plan->ids becomes the real queue order. Fails (returns 0, slot untouched on a
  * write failure) if any song can't be written or read back exactly once - never a position against a different
  * queue. */
+/* What the last materialize left in the slot: the plan's SONG rows as given, the order the player reads them in, and the
+ * slot rows' count and ID range. CUSTOM_PLAYLIST.ID only grows, so any other write to the slot (a playlist, a book,
+ * another plan) changes that range; while it is unchanged the same plan plays from the slot as it is, without
+ * rewriting it (a library's whole song list is thousands of rows). Dropped on every mdb_load: a scan may have changed
+ * the SONG rows the slot copied. */
+static struct { int *in, *out; int n; long long cnt, lo, hi; } g_slot;
+static void slot_memo_drop(void){ free(g_slot.in); free(g_slot.out); memset(&g_slot, 0, sizeof g_slot); }
+static int slot_range(sqlite3 *d, long long r[3]){
+    sqlite3_stmt *st; int ok = 0;
+    if(sqlite3_prepare_v2(d, "SELECT count(*),min(ID),max(ID),(SELECT count(*) FROM CUSTOM_PLAYLIST_INDEX WHERE LIST_ID="
+                             XSTR(DISKOS_RSV_LISTID) ") FROM CUSTOM_PLAYLIST WHERE PLAYLIST_ID=" XSTR(DISKOS_RSV_LISTID) ";",
+                          -1, &st, NULL) != SQLITE_OK) return 0;
+    if(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 3) == 1){
+        for(int c = 0; c < 3; c++) r[c] = sqlite3_column_int64(st, c);
+        ok = 1;
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
 int mdb_plan_materialize(mdb_plan_t *plan){
     if(!plan || plan->list_type != 5 || !plan->ids || plan->count <= 0) return 0;
     sqlite3 *d = db(); if(!d) return 0;
+    long long r[3];
+    if(g_slot.n == plan->count && !memcmp(g_slot.in, plan->ids, (size_t)plan->count * sizeof *plan->ids)
+       && slot_range(d, r) && r[0] == g_slot.cnt && r[1] == g_slot.lo && r[2] == g_slot.hi){
+        int *o = malloc((size_t)plan->count * sizeof *o);
+        if(o){ memcpy(o, g_slot.out, (size_t)plan->count * sizeof *o); free(plan->ids); plan->ids = o; return 1; }
+    }
+    slot_memo_drop();                                   /* the slot is about to change */
     if(sqlite3_exec(d, "BEGIN IMMEDIATE;", 0, 0, 0) != SQLITE_OK) return 0;
     int ok = sqlite3_exec(d, "INSERT OR IGNORE INTO CUSTOM_PLAYLIST_INDEX (LIST_ID,LIST_NAME,M3U_PATH) VALUES ("
                              XSTR(DISKOS_RSV_LISTID) ",'diskos-book','');", 0, 0, 0) == SQLITE_OK
@@ -677,7 +707,12 @@ int mdb_plan_materialize(mdb_plan_t *plan){
     } else for(int i = 0; i < n && !dup; i++) for(int j = i + 1; j < n && !dup; j++) dup = (order[i] == order[j]);
     free(sorted);
     if(dup){ free(order); return 0; }
-    free(plan->ids); plan->ids = order;
+    int *out = malloc((size_t)n * sizeof *out);
+    if(out && slot_range(d, r)){
+        memcpy(out, order, (size_t)n * sizeof *out);
+        g_slot.in = plan->ids; g_slot.out = out; g_slot.n = n; g_slot.cnt = r[0]; g_slot.lo = r[1]; g_slot.hi = r[2];
+    } else { free(out); free(plan->ids); }
+    plan->ids = order;
     return 1;
 }
 int mdb_plan_pos(const mdb_plan_t *plan, int song_id){
@@ -686,6 +721,41 @@ int mdb_plan_pos(const mdb_plan_t *plan, int song_id){
     return 0;
 }
 void mdb_plan_free(mdb_plan_t *plan){ if(plan){ free(plan->ids); plan->ids = NULL; plan->count = 0; } }
+
+/* library.db songs -> their SONG rows, while the stock player still plays song.db: a file's own row, or the CUE/ISO
+ * row of that track in the file (the scanner numbers both the same way). */
+int mdb_song_ids_for(const ldb_item *items, int n, int *ids){
+    sqlite3 *d = db(); if(!d || !items || !ids || n < 0) return -1;
+    sqlite3_stmt *st;
+    if(sqlite3_prepare_v2(d, "SELECT MIN(ID) FROM SONG WHERE PATH=?1 AND COALESCE(IS_CUE,0)=?2 AND COALESCE(IS_ISO,0)=?3"
+                             " AND (?2+?3=0 OR TRACK=?4);", -1, &st, NULL) != SQLITE_OK) return -1;
+    int found = 0;
+    for(int i = 0; i < n; i++){
+        sqlite3_reset(st);
+        sqlite3_bind_text(st, 1, items[i].path, -1, SQLITE_STATIC);
+        sqlite3_bind_int(st, 2, items[i].source == LDB_SRC_CUE);
+        sqlite3_bind_int(st, 3, items[i].source == LDB_SRC_ISO);
+        sqlite3_bind_int(st, 4, items[i].track);
+        int rc = sqlite3_step(st);
+        if(rc != SQLITE_ROW){ sqlite3_finalize(st); return -1; }
+        ids[i] = sqlite3_column_int(st, 0);
+        if(ids[i] > 0) found++;
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+int mdb_plan_from_ids(const int *ids, int n, mdb_plan_t *plan){
+    if(!plan) return 0;
+    memset(plan, 0, sizeof *plan);
+    if(!ids || n <= 0) return 0;
+    int *v = malloc((size_t)n * sizeof *v);
+    if(!v) return 0;
+    int m = 0;
+    for(int i = 0; i < n; i++) if(ids[i] > 0) v[m++] = ids[i];
+    if(!m){ free(v); return 0; }
+    plan->list_type = 5; plan->ids = v; plan->count = m;
+    return 1;
+}
 
 /* CUE / ISO sub-tracks kept under one file PATH (Browse Files): how many rows PATH has with IS_CUE or IS_ISO set
  * (iso_only = count IS_ISO rows only). 0 when none or on a DB error. */

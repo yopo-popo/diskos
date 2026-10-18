@@ -92,13 +92,11 @@ static void ctx_info_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKE
 static void ctx_lyrics_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED){ lyrics_open(); } }
 static void ctx_album_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    /* drill the canonical DB album for this track (its path), not the player's
-     * metadata album string, which may not match the DB and show an empty list */
-    char dbal[160], dbar[160];
-    const char *album = g_album;
-    if(mdb_song_meta_by_path(g_path, dbal, sizeof dbal, dbar, sizeof dbar) && dbal[0]) album = dbal;
-    if(!album[0]){ ui_toast("No album info"); return; }
-    library_open_album(album); screen_show(SCR_LIBRARY);
+    /* drill the library's album for this track (its path), not the player's metadata album string, which may
+     * not match the library and show an empty list */
+    char aa[LDB_NAME], album[LDB_NAME];
+    if(!ldb_song_album(g_path, -1, aa, sizeof aa, album, sizeof album)){ ui_toast("No album info"); return; }
+    library_open_album(aa, album); screen_show(SCR_LIBRARY);
 }
 static void ctx_artist_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;

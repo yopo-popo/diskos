@@ -845,3 +845,169 @@ void ldb_end(ldb_writer *w){
     free(w->nomedia);
     free(w);
 }
+
+/* ---- the reader ---- */
+/* The columns every list query returns, in this order: title, artist, path, album, album_artist, start_ms, source,
+ * disc, track, duration_ms, count, sort key. */
+#define TRACK_ARTISTS "(SELECT group_concat(artist, ', ') FROM (SELECT artist FROM track_artists WHERE track_id=t.id ORDER BY position))"
+#define SONG_COLS "t.title," TRACK_ARTISTS ",t.path,t.album_title,t.album_artist,t.start_ms,t.source,t.disc,t.track,t.duration_ms,NULL,t.title_key"
+static const char *READ_SONGS =
+    "SELECT " SONG_COLS " FROM tracks t"
+    " LEFT JOIN track_artists ta ON ta.track_id=t.id AND ta.position=0 LEFT JOIN artists a ON a.name=ta.artist"
+    " ORDER BY t.title_key, a.name_key, t.title, t.album_title, t.disc, t.track, t.path, t.start_ms;";
+#define ALBUM_ORDER "ORDER BY t.disc, t.track, t.title_key, t.path, t.start_ms"
+static const char *READ_ALBUM_SONGS =
+    "SELECT " SONG_COLS " FROM tracks t WHERE t.album_artist=?1 AND t.album_title=?2 " ALBUM_ORDER ";";
+static const char *READ_ALBUMS =
+    "SELECT a.title, a.album_artist,"
+    " (SELECT t.path FROM tracks t WHERE t.album_artist=a.album_artist AND t.album_title=a.title " ALBUM_ORDER " LIMIT 1),"
+    " NULL, NULL, 0, 0, 0, 0, 0,"
+    " (SELECT count(*) FROM tracks t WHERE t.album_artist=a.album_artist AND t.album_title=a.title), a.title_key"
+    " FROM albums a ORDER BY a.title_key, a.album_artist_key, a.title, a.album_artist;";
+
+static void file_stamp(long long s[4]){
+    struct stat st;
+    if(stat(LIBRARYDB_PATH, &st) != 0){ s[0] = s[1] = s[2] = s[3] = 0; return; }
+    s[0] = (long long)st.st_ino; s[1] = (long long)st.st_size;
+    s[2] = (long long)st.st_mtim.tv_sec; s[3] = (long long)st.st_mtim.tv_nsec;
+}
+int ldb_list_current(const ldb_list *l){
+    long long s[4];
+    file_stamp(s);
+    return l && l->stamp[0] && !memcmp(s, l->stamp, sizeof s);
+}
+void ldb_list_free(ldb_list *l){
+    if(!l) return;
+    free(l->v); free(l->pool);
+    memset(l, 0, sizeof *l);
+}
+/* library.db, read-only, only when it carries this schema version */
+static sqlite3 *reader_open(void){
+    sqlite3 *db = NULL;
+    if(ldb_open(LIBRARYDB_PATH, SQLITE_OPEN_READONLY, &db) != SQLITE_OK) return NULL;
+    if(query_int(db, "PRAGMA user_version;") != LIBRARYDB_SCHEMA){ sqlite3_close(db); return NULL; }
+    return db;
+}
+/* Strings go into one pool as offsets while it grows; they become pointers once it is final. */
+#define NOSTR ((size_t)-1)
+typedef struct { ldb_item it; size_t off[5]; } row_build;
+static size_t pool_add(char **pool, size_t *len, size_t *cap, const unsigned char *s, int null_ok){
+    if(!s){ if(null_ok) return NOSTR; s = (const unsigned char *)""; }
+    size_t n = strlen((const char *)s) + 1;
+    if(*len + n > *cap){
+        size_t nc = *cap ? *cap * 2 : 65536;
+        while(nc < *len + n) nc *= 2;
+        char *p = realloc(*pool, nc);
+        if(!p) return NOSTR - 1;
+        *pool = p; *cap = nc;
+    }
+    memcpy(*pool + *len, s, n);
+    size_t at = *len; *len += n;
+    return at;
+}
+static int read_list(sqlite3_stmt *st, ldb_list *out){
+    row_build *rows = NULL; int n = 0, cap = 0, ok = 1, rc = SQLITE_DONE;
+    char *pool = NULL; size_t plen = 0, pcap = 0;
+    while(ok && (rc = sqlite3_step(st)) == SQLITE_ROW){
+        if(n == cap){
+            int nc = cap ? cap * 2 : 256;
+            row_build *p = realloc(rows, (size_t)nc * sizeof *rows);
+            if(!p){ ok = 0; break; }
+            rows = p; cap = nc;
+        }
+        row_build *r = &rows[n];
+        memset(r, 0, sizeof *r);
+        for(int c = 0; c < 5; c++){
+            r->off[c] = pool_add(&pool, &plen, &pcap, sqlite3_column_text(st, c), c >= 3);
+            if(r->off[c] == NOSTR - 1) ok = 0;
+        }
+        r->it.start_ms = sqlite3_column_int64(st, 5);
+        r->it.source = sqlite3_column_int(st, 6);
+        r->it.disc = sqlite3_column_int(st, 7);
+        r->it.track = sqlite3_column_int(st, 8);
+        r->it.duration_ms = sqlite3_column_int(st, 9);
+        r->it.count = sqlite3_column_int(st, 10);
+        r->it.letter = ldb_key_letter((const char *)sqlite3_column_text(st, 11));
+        n++;
+    }
+    if(ok && rc != SQLITE_DONE) ok = 0;
+    ldb_item *v = ok ? malloc((size_t)(n ? n : 1) * sizeof *v) : NULL;
+    if(!v){ free(rows); free(pool); return -1; }
+    for(int i = 0; i < n; i++){
+        const char **f[5] = { &rows[i].it.title, &rows[i].it.artist, &rows[i].it.path, &rows[i].it.album, &rows[i].it.album_artist };
+        for(int c = 0; c < 5; c++) *f[c] = rows[i].off[c] == NOSTR ? NULL : pool + rows[i].off[c];
+        v[i] = rows[i].it;
+    }
+    free(rows);
+    out->v = v; out->n = n; out->pool = pool;
+    return n;
+}
+static int read_query(const char *sql, const char *a1, const char *a2, ldb_list *out){
+    memset(out, 0, sizeof *out);
+    long long stamp[4];
+    file_stamp(stamp);                                 /* before opening: a newer file read under an older stamp only reloads */
+    sqlite3 *db = reader_open();
+    if(!db) return -1;
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK){
+        if(a1) sqlite3_bind_text(st, 1, a1, -1, SQLITE_STATIC);
+        if(a2) sqlite3_bind_text(st, 2, a2, -1, SQLITE_STATIC);
+        n = read_list(st, out);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    if(n < 0){ ldb_list_free(out); return -1; }
+    memcpy(out->stamp, stamp, sizeof stamp);
+    return n;
+}
+int ldb_read_songs(ldb_list *out){ return read_query(READ_SONGS, NULL, NULL, out); }
+int ldb_read_albums(ldb_list *out){ return read_query(READ_ALBUMS, NULL, NULL, out); }
+int ldb_read_album_songs(const char *album_artist, const char *album, ldb_list *out){
+    if(!album_artist || !album){ memset(out, 0, sizeof *out); return -1; }
+    return read_query(READ_ALBUM_SONGS, album_artist, album, out);
+}
+int ldb_album_paths(const char *album_artist, const char *album, char (*paths)[512], int max){
+    if(!album_artist || !album || max <= 0) return 0;
+    sqlite3 *db = reader_open();
+    if(!db) return 0;
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if(sqlite3_prepare_v2(db, "SELECT t.path FROM tracks t WHERE t.album_artist=?1 AND t.album_title=?2 " ALBUM_ORDER ";",
+                          -1, &st, NULL) == SQLITE_OK){
+        sqlite3_bind_text(st, 1, album_artist, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, album, -1, SQLITE_STATIC);
+        while(n < max && sqlite3_step(st) == SQLITE_ROW){
+            const char *p = (const char *)sqlite3_column_text(st, 0);
+            if(!p || strlen(p) >= 512) continue;
+            int seen = 0;
+            for(int i = 0; i < n && !seen; i++) seen = !strcmp(paths[i], p);
+            if(!seen) snprintf(paths[n++], 512, "%s", p);
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return n;
+}
+int ldb_song_album(const char *path, long long start_ms, char *album_artist, int aacap, char *album, int acap){
+    if(!path || aacap <= 0 || acap <= 0) return 0;
+    album_artist[0] = album[0] = 0;
+    sqlite3 *db = reader_open();
+    if(!db) return 0;
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if(sqlite3_prepare_v2(db, "SELECT album_artist, album_title FROM tracks WHERE path=?1 AND album_title IS NOT NULL"
+                              " AND (?2 < 0 OR start_ms=?2) ORDER BY start_ms LIMIT 1;", -1, &st, NULL) == SQLITE_OK){
+        sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 2, start_ms);
+        if(sqlite3_step(st) == SQLITE_ROW){
+            const char *aa = (const char *)sqlite3_column_text(st, 0), *al = (const char *)sqlite3_column_text(st, 1);
+            snprintf(album_artist, (size_t)aacap, "%s", aa ? aa : "");
+            snprintf(album, (size_t)acap, "%s", al ? al : "");
+            ok = 1;
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return ok;
+}

@@ -41,10 +41,7 @@ static lv_obj_t *g_side[AW_CARDS];    /* turned sprite widget per card */
 static lv_obj_t *g_initial;
 static lv_obj_t *g_name, *g_artist, *g_counter;
 
-static char  (*g_names)[MDB_STR];
-static char  (*g_artists)[MDB_STR];
-static int    *g_counts;
-static int     g_names_cap = 0;   /* allocated entries in the three album buffers (grows with the library) */
+static ldb_list g_alb;            /* the albums, from library.db (title, album artist, first song's file) */
 static int     g_aw_inited = 0;   /* one-time blank-sprite + LRU init done */
 static int     g_nalb;
 static int     g_cur;
@@ -248,7 +245,7 @@ static void aw_labels(void){
     if(g_nalb<=0) return;
     sprite_t *c = aw_sprite(g_cur);
     if(c && !c->has_cover){
-        char in[8]={0}; const char *nm=g_names[g_cur];
+        char in[8]={0}; const char *nm=g_alb.v[g_cur].title;
         if(nm && nm[0]){ unsigned char c0=(unsigned char)nm[0];
             int len=(c0<0x80)?1:((c0>>5)==0x6)?2:((c0>>4)==0xE)?3:((c0>>3)==0x1E)?4:1;
             for(int i=0;i<len && nm[i];i++) in[i]=nm[i];
@@ -256,8 +253,8 @@ static void aw_labels(void){
         }else in[0]='?';
         lv_label_set_text(g_initial, in); lv_obj_clear_flag(g_initial, LV_OBJ_FLAG_HIDDEN);
     }else lv_obj_add_flag(g_initial, LV_OBJ_FLAG_HIDDEN);
-    lv_label_set_text(g_name, g_names[g_cur]);
-    lv_label_set_text(g_artist, mdb_artist_missing(g_artists[g_cur]) ? "Unknown artist" : g_artists[g_cur]);
+    lv_label_set_text(g_name, g_alb.v[g_cur].title);
+    lv_label_set_text(g_artist, mdb_artist_missing(g_alb.v[g_cur].artist) ? "Unknown artist" : g_alb.v[g_cur].artist);
     char cc[24]; snprintf(cc,sizeof cc,"%d / %d", g_cur+1, g_nalb); lv_label_set_text(g_counter, cc);
 }
 static void aw_render_all(void){ for(int c=0;c<AW_CARDS;c++) aw_render_card(c); }
@@ -335,8 +332,12 @@ void albumwall_drag_end(void){                           /* release: throw a few
     uint32_t dur = (uint32_t)(dist*120.0f) + 130; if(dur > 700) dur = 700;
     aw_anim_to(target, dur);
 }
-void albumwall_play(void){ if(g_nalb<=0) return; cfg_set_int("work_mode",0); ui_set_workmode(0); if(ui_play_list(3,g_names[g_cur],1)) screen_show(SCR_NOWPLAYING); }
-void albumwall_open(void){ if(g_nalb<=0) return; library_open_album(g_names[g_cur]); screen_show(SCR_LIBRARY); }
+void albumwall_play(void){
+    if(g_nalb<=0) return;
+    cfg_set_int("work_mode",0); ui_set_workmode(0);
+    if(library_play_album(g_alb.v[g_cur].artist, g_alb.v[g_cur].title)) screen_show(SCR_NOWPLAYING);
+}
+void albumwall_open(void){ if(g_nalb<=0) return; library_open_album(g_alb.v[g_cur].artist, g_alb.v[g_cur].title); screen_show(SCR_LIBRARY); }
 
 /* ---- prefetch ----------------------------------------------------------------------------------- */
 /* When the background prewarm lands a new cover, drop any placeholder sprites so they re-bake with the
@@ -361,57 +362,33 @@ static void aw_rebake_new_covers(void){
  * (cheap: one indexed lookup per album - the WORKER skips albums whose cover is already cached, so no SD
  * file checks run on the UI thread) so it catches same-count library changes, and needs no visit to the
  * Album view. Started at boot, after each scan, and on Cover Flow open. */
-static char (*g_seed_names)[MDB_STR];
-static int         g_seed_n, g_seed_cur;
+static ldb_list    g_seed;                                  /* the albums being walked (library.db) */
+static int         g_seed_cur;
 static lv_timer_t *g_seed_timer;
-static int *g_seed_rep;                                     /* per album: representative SONG.ID (0 = none) */
 static void aw_seed_cb(lv_timer_t *t){
-    if(!g_seed_names || g_seed_cur >= g_seed_n){ lv_timer_delete(t); g_seed_timer = NULL; return; }
+    if(g_seed_cur >= g_seed.n){ lv_timer_delete(t); g_seed_timer = NULL; return; }
     lv_timer_set_period(t, 50);                                 /* back to full pace (a full queue slows it below) */
-    for(int k=0; k<3 && g_seed_cur < g_seed_n; k++){
-        /* The album's representative song (its first in library order, recorded when the album cache was built):
-         * one indexed ID lookup instead of comparing the album name against every song. Only if that path can't
-         * be read fall back to the album's other songs, as before. */
-        int ids[6], m = 0;
-        if(g_seed_rep && g_seed_rep[g_seed_cur] > 0){ ids[0] = g_seed_rep[g_seed_cur]; m = 1; }
-        for(int pass = 0; pass < 2; pass++){
-            int found = 0;
-            for(int i=0;i<m;i++){
-                char track[512]; track[0]=0;
-                if(mdb_song_path(ids[i], track, sizeof track) && track[0]){
-                    found = 1;
-                    if(!ui_prewarm_enqueue(track)){            /* queue full: the worker isn't draining it right now
+    for(int k=0; k<3 && g_seed_cur < g_seed.n; k++){
+        /* The album's first song (library.db lists it with the album). Only if it has no path fall back to the
+         * album's other songs. */
+        const ldb_item *a = &g_seed.v[g_seed_cur];
+        char paths[6][512]; int m = 0;
+        if(a->path && a->path[0] && strlen(a->path) < sizeof paths[0]){ snprintf(paths[0], sizeof paths[0], "%s", a->path); m = 1; }
+        else m = ldb_album_paths(a->artist, a->title, paths, 6);
+        if(m > 0 && !ui_prewarm_enqueue(paths[0])){             /* queue full: the worker isn't draining it right now
                                                                  * (heat, card access, a live decode) - retry this album
                                                                  * slowly instead of re-querying it 20x a second */
-                        lv_timer_set_period(t, 2000);
-                        return;
-                    }
-                    break;                                      /* one representative track per album */
-                }
-            }
-            if(found || pass) break;
-            m = mdb_album_track_ids(g_seed_names[g_seed_cur], ids, 6);   /* fallback: the slow scan */
+            lv_timer_set_period(t, 2000);
+            return;
         }
         g_seed_cur++;
     }
 }
 void albumwall_prewarm_seed(void){                          /* MAIN thread: (re)start the incremental enqueue walk */
-    static char (*artists)[MDB_STR]; static int *counts; static int seed_cap = 0;
-    int want = mdb_album_count();                           /* size to the real album count (no >600 truncation) */
-    if(want < 1) return;                                    /* <0 = OOM building the cache, 0 = empty -> nothing to seed (retry next start) */
-    if(!g_seed_names || seed_cap < want){                   /* main-thread only + repopulated below -> free+malloc safe */
-        free(g_seed_names); free(artists); free(counts); free(g_seed_rep);
-        g_seed_names = malloc((size_t)want*MDB_STR);
-        artists      = malloc((size_t)want*MDB_STR);
-        counts       = malloc((size_t)want*sizeof(int));
-        g_seed_rep   = malloc((size_t)want*sizeof(int));
-        if(!g_seed_names || !artists || !counts || !g_seed_rep){ free(g_seed_names); free(artists); free(counts); free(g_seed_rep); g_seed_names=NULL; artists=NULL; counts=NULL; g_seed_rep=NULL; seed_cap=0; return; }
-        seed_cap = want;
-    }
-    g_seed_n = mdb_albums(g_seed_names, artists, counts, seed_cap); g_seed_cur = 0;
-    if(mdb_album_rep_ids(g_seed_rep, seed_cap) != g_seed_n)
-        for(int i=0;i<seed_cap;i++) g_seed_rep[i] = 0;      /* reps unavailable -> every album uses the fallback scan */
-    if(g_seed_n > 0 && !g_seed_timer) g_seed_timer = lv_timer_create(aw_seed_cb, 50, NULL);
+    ldb_list_free(&g_seed);                                 /* main-thread only: the timer reads it on this thread too */
+    g_seed_cur = 0;
+    if(ldb_read_albums(&g_seed) < 1) return;                /* no library.db yet, or empty: nothing to seed (retry next start) */
+    if(!g_seed_timer) g_seed_timer = lv_timer_create(aw_seed_cb, 50, NULL);
 }
 
 static lv_timer_t *g_prefetch;
@@ -463,8 +440,7 @@ static int aw_prefetch_step(unsigned g){
                 if(pthread_create(&th, NULL, aw_worker, NULL)==0){ pthread_detach(th); g_wstarted = 1; }
             }
             if(g_wstarted){
-                int ids[6]; g_wn = mdb_album_track_ids(g_names[sp->idx], ids, 6);
-                for(int i=0;i<g_wn;i++){ g_wpaths[i][0]=0; mdb_song_path(ids[i], g_wpaths[i], sizeof g_wpaths[i]); }
+                g_wn = ldb_album_paths(g_alb.v[sp->idx].artist, g_alb.v[sp->idx].title, g_wpaths, 6);
                 g_widx = sp->idx; g_wac_gen = g; sp->asked = 1; g_wbusy = g_wwant = 1;
                 pthread_cond_signal(&g_wcv);
             }
@@ -522,24 +498,6 @@ void albumwall_refresh(void){
         for(int i=0;i<AW_LRU;i++) g_lru[i].idx=-1;
         g_aw_inited = 1;
     }
-    /* Size the album buffers to the REAL album count so a >600-album library is never truncated (the
-     * Library list sizes dynamically too). They're repopulated fresh below, so free+malloc on grow is safe. */
-    { int want = mdb_album_count();
-      if(want < 0){                       /* album cache couldn't be built (OOM) -> don't fake a capacity-1 buffer;
-                                           * drop to the "Out of memory" path below instead of a 1-album list */
-          free(g_names); free(g_artists); free(g_counts); g_names=NULL; g_artists=NULL; g_counts=NULL; g_names_cap=0;
-      } else {
-          if(want < 1) want = 1;
-          if(!g_names || g_names_cap < want){
-              free(g_names); free(g_artists); free(g_counts);
-              g_names   = malloc((size_t)want * MDB_STR);
-              g_artists = malloc((size_t)want * MDB_STR);
-              g_counts  = malloc((size_t)want * sizeof(int));
-              if(!g_names||!g_artists||!g_counts){ free(g_names); free(g_artists); free(g_counts); g_names=NULL; g_artists=NULL; g_counts=NULL; g_names_cap=0; }
-              else g_names_cap = want;
-          }
-      }
-    }
     lv_anim_delete(&g_anim_tag, NULL);           /* stop any in-flight fling BEFORE lv_obj_clean frees the widgets it animates */
     for(int i=0;i<AW_LRU;i++) aw_drop(&g_lru[i]);   /* album list may have changed */
     g_off = 0; g_animating = 0; g_drag_on = 0;
@@ -550,10 +508,13 @@ void albumwall_refresh(void){
     lv_obj_set_style_bg_opa(g_root, LV_OPA_COVER, 0);
     ui_header_cb(g_root, "Albums", aw_back_cb);
 
-    g_nalb = g_names ? mdb_albums(g_names, g_artists, g_counts, g_names_cap) : 0;
+    /* the album list, read again only when a scan replaced library.db (the sprites were dropped above either way) */
+    int rd = 0;
+    if(!ldb_list_current(&g_alb)){ ldb_list_free(&g_alb); rd = ldb_read_albums(&g_alb); }
+    g_nalb = g_alb.n;
     if(g_nalb <= 0){
         lv_obj_t *e = lv_label_create(g_root);
-        lv_label_set_text(e, g_names ? "No albums found" : "Out of memory");
+        lv_label_set_text(e, rd < 0 ? "Scan the library to see albums" : "No albums found");
         lv_obj_center(e); lv_obj_set_style_text_color(e, TC(TEXT_MUTED), 0);
         return;
     }
