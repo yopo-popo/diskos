@@ -851,10 +851,10 @@ void ldb_end(ldb_writer *w){
  * disc, track, duration_ms, count, sort key. */
 #define TRACK_ARTISTS "(SELECT group_concat(artist, ', ') FROM (SELECT artist FROM track_artists WHERE track_id=t.id ORDER BY position))"
 #define SONG_COLS "t.title," TRACK_ARTISTS ",t.path,t.album_title,t.album_artist,t.start_ms,t.source,t.disc,t.track,t.duration_ms,NULL,t.title_key"
-static const char *READ_SONGS =
-    "SELECT " SONG_COLS " FROM tracks t"
-    " LEFT JOIN track_artists ta ON ta.track_id=t.id AND ta.position=0 LEFT JOIN artists a ON a.name=ta.artist"
-    " ORDER BY t.title_key, a.name_key, t.title, t.album_title, t.disc, t.track, t.path, t.start_ms;";
+/* songs by title, then their first artist */
+#define SONG_FROM "FROM tracks t LEFT JOIN track_artists ta ON ta.track_id=t.id AND ta.position=0 LEFT JOIN artists a ON a.name=ta.artist"
+#define SONG_ORDER "ORDER BY t.title_key, a.name_key, t.title, t.album_title, t.disc, t.track, t.path, t.start_ms"
+static const char *READ_SONGS = "SELECT " SONG_COLS " " SONG_FROM " " SONG_ORDER ";";
 #define ALBUM_ORDER "ORDER BY t.disc, t.track, t.title_key, t.path, t.start_ms"
 static const char *READ_ALBUM_SONGS =
     "SELECT " SONG_COLS " FROM tracks t WHERE t.album_artist=?1 AND t.album_title=?2 " ALBUM_ORDER ";";
@@ -864,6 +864,45 @@ static const char *READ_ALBUMS =
     " NULL, NULL, 0, 0, 0, 0, 0,"
     " (SELECT count(*) FROM tracks t WHERE t.album_artist=a.album_artist AND t.album_title=a.title), a.title_key"
     " FROM albums a ORDER BY a.title_key, a.album_artist_key, a.title, a.album_artist;";
+
+/* The Artists view's key of song t under "By Album Artist": its album artist, else (no album) its first artist. */
+#define GROUP_KEY "COALESCE(t.album_artist, (SELECT x.artist FROM track_artists x WHERE x.track_id=t.id AND x.position=0), '')"
+/* Artists: the names k, by their sort key; "" (Unknown artist) last */
+#define ARTIST_ROWS(k) "SELECT k.name, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0," \
+    " CASE WHEN k.name='' THEN '4' ELSE COALESCE(a.name_key, '3') END AS key" \
+    " FROM (" k ") k LEFT JOIN artists a ON a.name=k.name ORDER BY key, k.name;"
+static const char *READ_ARTISTS = ARTIST_ROWS("SELECT artist AS name FROM track_artists UNION"
+    " SELECT '' WHERE EXISTS (SELECT 1 FROM tracks t WHERE t.id NOT IN (SELECT track_id FROM track_artists))");
+static const char *READ_GROUP_ARTISTS = ARTIST_ROWS("SELECT DISTINCT " GROUP_KEY " AS name FROM tracks t");
+/* genres have no stored sort key: the reader's diskos_sort_key makes it, with the scanner's rule */
+static const char *READ_GENRES =
+    "SELECT g.genre, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, count(*), diskos_sort_key(g.genre) AS key"
+    " FROM track_file_genres g GROUP BY g.genre ORDER BY key, g.genre;";
+/* A scope's lists, with %s = the scope's condition on song t (scope_cond, its key in ?1). */
+static const char *READ_SCOPE_SONGS = "SELECT " SONG_COLS " " SONG_FROM " WHERE %s " SONG_ORDER ";";
+static const char *READ_SCOPE_ALBUM_SONGS =
+    "SELECT " SONG_COLS " FROM tracks t WHERE t.album_artist=?2 AND t.album_title=?3 AND %s " ALBUM_ORDER ";";
+static const char *READ_SCOPE_COUNT = "SELECT count(*) FROM tracks t WHERE %s;";
+#define SCOPE_ALBUMS(s) "SELECT a.title, a.album_artist," \
+    " (SELECT t.path FROM tracks t WHERE t.album_artist=a.album_artist AND t.album_title=a.title " ALBUM_ORDER " LIMIT 1)," \
+    " NULL, NULL, 0, 0, 0, 0, 0, s.n, a.title_key FROM (" s ") s JOIN albums a ON a.album_artist=s.aa AND a.title=s.at" \
+    " ORDER BY a.title_key, a.album_artist_key, a.title, a.album_artist;"
+/* an artist's albums: those with a song of the scope, counting those songs */
+static const char *READ_SCOPE_ALBUMS = SCOPE_ALBUMS("SELECT t.album_artist AS aa, t.album_title AS at, count(*) AS n"
+    " FROM tracks t WHERE t.album_title IS NOT NULL AND %s GROUP BY t.album_artist, t.album_title");
+/* a genre's albums: only those whose every song has the genre (yopo, 2026-10-17) */
+static const char *READ_GENRE_ALBUMS = SCOPE_ALBUMS("SELECT t.album_artist AS aa, t.album_title AS at, count(*) AS n"
+    " FROM tracks t WHERE (t.album_artist, t.album_title) IN (SELECT t2.album_artist, t2.album_title"
+    " FROM track_file_genres g JOIN tracks t2 ON t2.id=g.track_id WHERE g.genre=?1 AND t2.album_title IS NOT NULL)"
+    " GROUP BY t.album_artist, t.album_title HAVING min(%s)=1");
+static const char *scope_cond(int kind, const char *key){
+    switch(kind){
+    case LDB_SCOPE_GENRE: return "t.id IN (SELECT g.track_id FROM track_file_genres g WHERE g.genre=?1)";
+    case LDB_SCOPE_GROUP: return GROUP_KEY "=?1";
+    default: return key[0] ? "t.id IN (SELECT x.track_id FROM track_artists x WHERE x.artist=?1)"
+                           : "(?1='' AND t.id NOT IN (SELECT x.track_id FROM track_artists x))";   /* Unknown artist */
+    }
+}
 
 static void file_stamp(long long s[4]){
     struct stat st;
@@ -885,7 +924,11 @@ void ldb_list_free(ldb_list *l){
 static sqlite3 *reader_open(void){
     sqlite3 *db = NULL;
     if(ldb_open(LIBRARYDB_PATH, SQLITE_OPEN_READONLY, &db) != SQLITE_OK) return NULL;
-    if(query_int(db, "PRAGMA user_version;") != LIBRARYDB_SCHEMA){ sqlite3_close(db); return NULL; }
+    if(query_int(db, "PRAGMA user_version;") != LIBRARYDB_SCHEMA ||
+       sqlite3_create_function(db, "diskos_sort_key", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sort_key_fn, NULL, NULL) != SQLITE_OK){
+        sqlite3_close(db);
+        return NULL;
+    }
     return db;
 }
 /* Strings go into one pool as offsets while it grows; they become pointers once it is final. */
@@ -942,7 +985,7 @@ static int read_list(sqlite3_stmt *st, ldb_list *out){
     out->v = v; out->n = n; out->pool = pool;
     return n;
 }
-static int read_query(const char *sql, const char *a1, const char *a2, ldb_list *out){
+static int read_query(const char *sql, const char *const *args, int nargs, ldb_list *out){
     memset(out, 0, sizeof *out);
     long long stamp[4];
     file_stamp(stamp);                                 /* before opening: a newer file read under an older stamp only reloads */
@@ -951,8 +994,7 @@ static int read_query(const char *sql, const char *a1, const char *a2, ldb_list 
     sqlite3_stmt *st = NULL;
     int n = -1;
     if(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK){
-        if(a1) sqlite3_bind_text(st, 1, a1, -1, SQLITE_STATIC);
-        if(a2) sqlite3_bind_text(st, 2, a2, -1, SQLITE_STATIC);
+        for(int i = 0; i < nargs; i++) sqlite3_bind_text(st, i + 1, args[i], -1, SQLITE_STATIC);
         n = read_list(st, out);
     }
     sqlite3_finalize(st);
@@ -961,11 +1003,48 @@ static int read_query(const char *sql, const char *a1, const char *a2, ldb_list 
     memcpy(out->stamp, stamp, sizeof stamp);
     return n;
 }
-int ldb_read_songs(ldb_list *out){ return read_query(READ_SONGS, NULL, NULL, out); }
-int ldb_read_albums(ldb_list *out){ return read_query(READ_ALBUMS, NULL, NULL, out); }
+int ldb_read_songs(ldb_list *out){ return read_query(READ_SONGS, NULL, 0, out); }
+int ldb_read_albums(ldb_list *out){ return read_query(READ_ALBUMS, NULL, 0, out); }
 int ldb_read_album_songs(const char *album_artist, const char *album, ldb_list *out){
     if(!album_artist || !album){ memset(out, 0, sizeof *out); return -1; }
-    return read_query(READ_ALBUM_SONGS, album_artist, album, out);
+    const char *args[2] = { album_artist, album };
+    return read_query(READ_ALBUM_SONGS, args, 2, out);
+}
+int ldb_read_artists(int by_album_artist, ldb_list *out){
+    return read_query(by_album_artist ? READ_GROUP_ARTISTS : READ_ARTISTS, NULL, 0, out);
+}
+int ldb_read_genres(ldb_list *out){ return read_query(READ_GENRES, NULL, 0, out); }
+/* a scope list: fmt with the scope's condition put in, args = the key, then any others */
+static int scope_query(const char *fmt, int kind, const char *const *args, int nargs, ldb_list *out){
+    char sql[2048];
+    memset(out, 0, sizeof *out);
+    for(int i = 0; i < nargs; i++) if(!args[i]) return -1;
+    int w = snprintf(sql, sizeof sql, fmt, scope_cond(kind, args[0]));
+    if(w < 0 || w >= (int)sizeof sql) return -1;
+    return read_query(sql, args, nargs, out);
+}
+int ldb_read_scope_albums(int kind, const char *key, ldb_list *out){
+    return scope_query(kind == LDB_SCOPE_GENRE ? READ_GENRE_ALBUMS : READ_SCOPE_ALBUMS, kind, &key, 1, out);
+}
+int ldb_read_scope_songs(int kind, const char *key, ldb_list *out){ return scope_query(READ_SCOPE_SONGS, kind, &key, 1, out); }
+int ldb_read_scope_album_songs(int kind, const char *key, const char *album_artist, const char *album, ldb_list *out){
+    const char *args[3] = { key, album_artist, album };
+    return scope_query(READ_SCOPE_ALBUM_SONGS, kind, args, 3, out);
+}
+int ldb_scope_count(int kind, const char *key){
+    char sql[512];
+    if(!key || snprintf(sql, sizeof sql, READ_SCOPE_COUNT, scope_cond(kind, key)) >= (int)sizeof sql) return -1;
+    sqlite3 *db = reader_open();
+    if(!db) return -1;
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK){
+        sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
+        if(sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return n;
 }
 int ldb_album_paths(const char *album_artist, const char *album, char (*paths)[512], int max){
     if(!album_artist || !album || max <= 0) return 0;
@@ -988,6 +1067,28 @@ int ldb_album_paths(const char *album_artist, const char *album, char (*paths)[5
     sqlite3_finalize(st);
     sqlite3_close(db);
     return n;
+}
+int ldb_song_artist(const char *path, long long start_ms, int by_album_artist, char *out, int cap){
+    if(!path || cap <= 0) return 0;
+    out[0] = 0;
+    sqlite3 *db = reader_open();
+    if(!db) return 0;
+    sqlite3_stmt *st = NULL;
+    const char *sql = by_album_artist
+        ? "SELECT " GROUP_KEY " FROM tracks t WHERE t.path=?1 AND (?2 < 0 OR t.start_ms=?2) ORDER BY t.start_ms LIMIT 1;"
+        : "SELECT x.artist FROM tracks t JOIN track_artists x ON x.track_id=t.id AND x.position=0"
+          " WHERE t.path=?1 AND (?2 < 0 OR t.start_ms=?2) ORDER BY t.start_ms LIMIT 1;";
+    if(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK){
+        sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 2, start_ms);
+        if(sqlite3_step(st) == SQLITE_ROW){
+            const char *a = (const char *)sqlite3_column_text(st, 0);
+            snprintf(out, (size_t)cap, "%s", a ? a : "");
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return out[0] != 0;
 }
 int ldb_song_album(const char *path, long long start_ms, char *album_artist, int aacap, char *album, int acap){
     if(!path || aacap <= 0 || acap <= 0) return 0;

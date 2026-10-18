@@ -44,38 +44,27 @@ static int g_drill_kind = 0;  /* 1 album, 2 artist, 3 genre */
  * one album's songs by that artist / in that genre, level 0 = the flat all-songs drill (the old view; also a deep link). */
 static int  g_scope_lvl = 0;
 static int  g_scope_from_albums = 0;   /* the flat list was opened from the albums list ("All Songs"): Back returns there */
-static char g_scope_album[MDB_STR];
+static char g_scope_album_artist[LDB_NAME], g_scope_album[LDB_NAME];   /* level 2: the open album's key */
 static int  g_scope_total = 0;   /* songs in the whole scope (the "All Songs" row's count) */
 static int g_deeplink = 0;    /* drill opened from the NP hub -> back leaves the Library */
 static int g_has_header = 0;   /* a Play All / Shuffle row is the first list child */
 static int g_hdr_extra_px = 0; /* extra leading height above the rows (the album cover header), for scroll math */
-static char g_drill[MDB_STR];
+static char g_drill[LDB_NAME];   /* the open album's title, or the artist / genre */
 static library_song_click_cb_t g_song_cb;
 
-/* Scratch grows on entry, independently for songs, copied rows, groups and A-Z. */
-static int  g_alloc_n = 0;
+/* Scratch grows on entry, independently for copied rows and A-Z. */
 static int  g_fav_cap = 0;
-static int  g_grp_cap = 0;
 static int  g_first_cap = 0;
 static unsigned char *g_first = NULL;   /* per-row jump-letter code (first_letter) for the A-Z scrubber */
 static int  g_count;
 
-/* group scratch (album/artist/genre views) */
-static char (*g_gnames)[MDB_STR]  = NULL;
-static char (*g_gartists)[MDB_STR] = NULL;
-static int  *g_gcounts = NULL;
-static void lib_alloc_buffers(int songs);
 static void lib_ensure_first_cap(int need);
-static void lib_ensure_group_cap(int need);   /* grow group buffers to an exact count (artist view) */
 static void lib_ensure_fav_cap(int need);     /* copied rows can outnumber songs */
 static mdb_song_t *g_favs = NULL;
 static char (*g_plnames)[MDB_STR] = NULL;   /* dynamic: grown to the real playlist count (no 64 cap) */
 static long *g_plids = NULL;
 static int  *g_plcounts = NULL;
 static int   g_plcap = 0;                    /* allocated slots in g_plnames/g_plids/g_plcounts */
-
-/* g_buf holds the song pointers for SONGS/GROUP. */
-static const mdb_song_t **g_buf = NULL;
 
 /* A view's rows: only those near the viewport exist as objects. LVGL moves, lays out and styles every child of a list on
  * each scroll step, so building all 10,000 rows of Songs made scrolling crawl (and a streamed fill kept adding to it).
@@ -88,11 +77,14 @@ static lv_obj_t *g_vspace;              /* the spacer; NULL while the view has n
 static struct { lv_obj_t *obj; int idx; } g_vrow[VROW_MAX];
 static int g_vrows;
 
-/* Songs, Albums and an album's songs come from diskOS's own library.db (librarydb), in its order: English, Hebrew,
- * then '#'. The rows on screen carry their index into these lists. They play through the reserved custom-playlist
+/* Songs, Albums, Artists, Genres and their songs come from diskOS's own library.db (librarydb), in its order: English,
+ * Hebrew, then '#'. The rows on screen carry their index into these lists. They play through the reserved custom-playlist
  * slot in that same order, as the stock player only plays its song.db rows (mdb_song_ids_for finds them). */
 static ldb_list g_lsongs, g_lalbums, g_lalbum;
-static const ldb_list *g_lcur;          /* the song list on screen (Songs or an album), NULL in the other views */
+static ldb_list g_lartists, g_lgenres;  /* the Artists and Genres views */
+static int g_lartists_by_aa = -1;       /* the Artists grouping g_lartists was read in (mdb_artist_mode) */
+static ldb_list g_lscope, g_lscope_songs;   /* an artist's / a genre's albums (level 1) and songs (level 0 or 2) */
+static const ldb_list *g_lcur;          /* the song list on screen (Songs, an album, an artist's or a genre's songs) */
 static int *g_lids;                     /* SONG.IDs of g_lcur's songs, found when it is first played */
 static int  g_lids_ok;
 static char g_alb_artist[LDB_NAME], g_alb_title[LDB_NAME];   /* the open album (g_drill_kind 1): its exact key */
@@ -169,20 +161,10 @@ static void row_two(lv_obj_t *r, const char *top, const char *sub, const char *r
 }
 
 /* ---- callbacks ---------------------------------------------------------- */
-static int missing_artist_play(int id){
-    mdb_plan_t plan;
-    if(!mdb_artist_plan("", &plan)){ ui_toast("Couldn't play that list"); return 0; }
-    if(id < 0) id = plan.ids[id == -2 ? rand() % plan.count : 0];
-    int ok = ui_play_plan(&plan, id);
-    mdb_plan_free(&plan);
-    return ok;
-}
 static void song_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
     int id=(int)(uintptr_t)lv_event_get_user_data(e);
-    if(g_view==VIEW_GROUP && g_drill_kind==2 && !g_drill[0]){
-        if(!missing_artist_play(id)) return;
-    } else if(!g_song_cb || !g_song_cb(id)) return;   /* refused / not sent: already toasted, stay on the list */
+    if(!g_song_cb || !g_song_cb(id)) return;   /* refused / not sent: already toasted, stay on the list */
     screen_show(SCR_NOWPLAYING);
 }
 static void reload_async(void *p){ (void)p; library_reload(); }
@@ -223,20 +205,23 @@ static void lsong_cb(lv_event_t *e){
     if(!lplay(g_lcur, ids, i)) return;                      /* refused / not sent: already toasted, stay on the list */
     screen_show(SCR_NOWPLAYING);
 }
+/* Play list l (n = its read's result, freed here) from its first song. */
+static int lplay_once(ldb_list *l, int n, const char *fail){
+    int *ids = n > 0 ? malloc((size_t)n * sizeof *ids) : NULL, ok = 0;
+    if(ids && mdb_song_ids_for(l->v, n, ids) >= 0) ok = lplay(l, ids, -1);
+    else ui_toast(fail);
+    free(ids);
+    ldb_list_free(l);
+    return ok;
+}
 int library_play_album(const char *album_artist, const char *album){
     ldb_list l;
-    int n = ldb_read_album_songs(album_artist, album, &l), ok = 0;
-    int *ids = n > 0 ? malloc((size_t)n * sizeof *ids) : NULL;
-    if(ids && mdb_song_ids_for(l.v, n, ids) >= 0) ok = lplay(&l, ids, -1);
-    else ui_toast("Couldn't play that album");
-    free(ids);
-    ldb_list_free(&l);
-    return ok;
+    return lplay_once(&l, ldb_read_album_songs(album_artist, album, &l), "Couldn't play that album");
 }
 static void open_album(const char *album_artist, const char *album, int deeplink){
     snprintf(g_alb_artist, sizeof g_alb_artist, "%s", album_artist ? album_artist : "");
     snprintf(g_alb_title, sizeof g_alb_title, "%s", album ? album : "");
-    snprintf(g_drill, MDB_STR, "%s", g_alb_title);          /* library_drill_context's album name (stock queues) */
+    snprintf(g_drill, sizeof g_drill, "%s", g_alb_title);   /* library_drill_context's album name (stock queues) */
     g_view=VIEW_GROUP; g_drill_kind=1; g_scope_lvl=0; g_scope_from_albums=0; g_deeplink=deeplink;
     library_reload();
 }
@@ -346,34 +331,37 @@ static void pl_new_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
     kbinput_open("Playlist name", "", pl_new_done);   /* create an empty playlist */
 }
+/* an artist's (drill kind 2) or a genre's (3) library.db scope: an artist follows the Artists grouping (Settings) */
+static int scope_of(int drill_kind){
+    return drill_kind==3 ? LDB_SCOPE_GENRE : mdb_artist_mode() ? LDB_SCOPE_GROUP : LDB_SCOPE_ARTIST;
+}
+/* an Artists / Genres row: index gi of the view's list, NULL if it is gone */
+static const char *group_name(int gi){
+    const ldb_list *l = g_view==VIEW_GENRES ? &g_lgenres : g_view==VIEW_ARTISTS ? &g_lartists : NULL;
+    return l && gi >= 0 && gi < l->n ? l->v[gi].title : NULL;
+}
 static void group_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_SHORT_CLICKED) return;
-    int gi=(int)(uintptr_t)lv_event_get_user_data(e);
-    g_drill_kind = (g_view==VIEW_ALBUMS)?1:(g_view==VIEW_GENRES)?3:2;
-    snprintf(g_drill, MDB_STR, "%s", g_gnames[gi]);
+    const char *name = group_name((int)(uintptr_t)lv_event_get_user_data(e));
+    if(!name) return;
+    g_drill_kind = g_view==VIEW_GENRES ? 3 : 2;
+    snprintf(g_drill, sizeof g_drill, "%s", name);
     g_scope_from_albums = 0;
-    g_scope_lvl = (g_drill_kind != 1 && mdb_scope_albums(g_drill_kind==3 ? MDB_SCOPE_GENRE : MDB_SCOPE_ARTIST, g_drill, NULL, NULL, NULL, 0) > 0) ? 1 : 0;
-    int keep=g_view; g_view=VIEW_GROUP; (void)keep;
+    g_scope_lvl = 1;   /* its albums; the reload shows the flat list when it has none */
+    g_view=VIEW_GROUP;
     g_deeplink=0;   /* normal in-library drill: back returns to the category list */
     library_reload();
 }
-/* Long-press an album/artist/genre row -> play the whole group right away
+/* Long-press an artist/genre row -> play the whole group right away
  * (saves drilling in + tapping Play All). Short tap still drills in. */
 static void group_play_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_LONG_PRESSED) return;
-    int gi=(int)(uintptr_t)lv_event_get_user_data(e);
-    int kind = (g_view==VIEW_ALBUMS)?1:(g_view==VIEW_GENRES)?3:2;
-    int lt   = (kind==1)?3:(kind==3)?10:2;   /* 3=album, 10=genre, 2=artist */
+    const char *name = group_name((int)(uintptr_t)lv_event_get_user_data(e));
+    if(!name) return;
     ui_set_workmode(0);                        /* sequential */
-    if(lt == 2 && !g_gnames[gi][0]){
-        if(!missing_artist_play(-1)) return;
-    } else if(lt == 2 && mdb_artist_mode()){          /* Artists by album artist: through the artist plan, or nothing */
-        mdb_plan_t plan; int ok = 0;
-        if(!mdb_artist_plan(g_gnames[gi], &plan)){ ui_toast("Couldn't play that list"); return; }
-        ok = ui_play_plan(&plan, plan.ids[0]); mdb_plan_free(&plan);
-        if(!ok) return;                        /* refused or not sent: ui_play_plan already said why; stay on the list */
-    } else if(!ui_play_list(lt, g_gnames[gi], 1)) return;
-    screen_show(SCR_NOWPLAYING);
+    ldb_list l;
+    int n = ldb_read_scope_songs(scope_of(g_view==VIEW_GENRES ? 3 : 2), name, &l);
+    if(lplay_once(&l, n, "Couldn't play that list")) screen_show(SCR_NOWPLAYING);
 }
 static void menu_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
@@ -410,7 +398,6 @@ static void back_cb(lv_event_t *e){
 }
 
 /* ---- artist / genre -> albums -> songs ---------------------------------------------------------------------------- */
-static int scope_kind(void){ return g_drill_kind==3 ? MDB_SCOPE_GENRE : MDB_SCOPE_ARTIST; }
 static void scope_all_cb(lv_event_t *e){          /* "All Songs": the flat list (Play All / Shuffle on the whole artist / genre) */
     if(lv_event_get_code(e)!=LV_EVENT_SHORT_CLICKED) return;
     g_scope_lvl = 0; g_scope_from_albums = 1; library_reload();
@@ -418,43 +405,19 @@ static void scope_all_cb(lv_event_t *e){          /* "All Songs": the flat list 
 static void scope_album_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_SHORT_CLICKED) return;
     int ai=(int)(uintptr_t)lv_event_get_user_data(e);
-    if(g_view!=VIEW_GROUP || g_scope_lvl!=1 || ai<0 || ai>=g_count-1) return;
-    snprintf(g_scope_album, MDB_STR, "%s", g_gnames[ai]);
+    if(g_view!=VIEW_GROUP || g_scope_lvl!=1 || ai<0 || ai>=g_lscope.n) return;
+    snprintf(g_scope_album_artist, sizeof g_scope_album_artist, "%s", g_lscope.v[ai].artist);
+    snprintf(g_scope_album, sizeof g_scope_album, "%s", g_lscope.v[ai].title);
     g_scope_lvl = 2; library_reload();
-}
-/* Play song_id through an album plan. Types 2/3/5/7 go through ui_play_plan; the genre+album queue (8) is the same frame
- * and jump sent straight through ui_play_list (ui_play_plan only knows 2/3/5/7). */
-static int scope_play_plan(mdb_plan_t *plan, int song_id){
-    if(plan->list_type == 8){
-        int pos = mdb_plan_pos(plan, song_id);
-        if(pos < 1){ ui_toast("Couldn't find that song"); return 0; }
-        return ui_play_list(8, plan->name, pos);
-    }
-    return ui_play_plan(plan, song_id);
-}
-/* Play one album of the current artist / genre: song_id < 0 = from the start, -2 = a random song (Shuffle) */
-static int scope_play_album(const char *album, int song_id){
-    mdb_plan_t plan;
-    if(!mdb_scope_album_plan(scope_kind(), g_drill, album, &plan)){ ui_toast("Couldn't play that list"); return 0; }
-    if(song_id == -2 && plan.count > 1) song_id = plan.ids[rand() % plan.count];
-    else if(song_id < 0) song_id = plan.ids[0];
-    int ok = scope_play_plan(&plan, song_id);
-    mdb_plan_free(&plan);
-    return ok;
-}
-static void scope_song_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    int id=(int)(uintptr_t)lv_event_get_user_data(e);
-    if(!scope_play_album(g_scope_album, id)) return;   /* refused / not sent: already toasted, stay on the list */
-    screen_show(SCR_NOWPLAYING);
 }
 static void scope_album_play_cb(lv_event_t *e){   /* long-press an album row: play it now (as the Albums list does) */
     if(lv_event_get_code(e)!=LV_EVENT_LONG_PRESSED) return;
     int ai=(int)(uintptr_t)lv_event_get_user_data(e);
-    if(g_view!=VIEW_GROUP || g_scope_lvl!=1 || ai<0 || ai>=g_count-1) return;
+    if(g_view!=VIEW_GROUP || g_scope_lvl!=1 || ai<0 || ai>=g_lscope.n) return;
     ui_set_workmode(0);                        /* sequential */
-    if(!scope_play_album(g_gnames[ai], -1)) return;
-    screen_show(SCR_NOWPLAYING);
+    ldb_list l;
+    int n = ldb_read_scope_album_songs(scope_of(g_drill_kind), g_drill, g_lscope.v[ai].artist, g_lscope.v[ai].title, &l);
+    if(lplay_once(&l, n, "Couldn't play that list")) screen_show(SCR_NOWPLAYING);
 }
 
 /* ---- A-Z grid ----------------------------------------------------------- */
@@ -469,19 +432,22 @@ static lv_obj_t *add_row(lv_obj_t *parent, int i){
             ui_on(r, scope_all_cb, LV_EVENT_SHORT_CLICKED, NULL, "library.scope_all", UI_CORE);
             row_two(r, tr("All Songs"), NULL, cnt, KIT_VALUE_COUNT);
         } else {
-            snprintf(cnt, sizeof cnt, "%d", g_gcounts[i-1]);
+            const ldb_item *a = &g_lscope.v[i-1];
+            snprintf(cnt, sizeof cnt, "%d", a->count);
             ui_on(r, scope_album_cb, LV_EVENT_SHORT_CLICKED, (void*)(uintptr_t)(i-1), "library.scope_album", UI_CORE);
             ui_on(r, scope_album_play_cb, LV_EVENT_LONG_PRESSED, (void*)(uintptr_t)(i-1), "library.scope_album_play.long", UI_CORE);
-            row_two(r, g_gnames[i-1], g_drill_kind==3 ? g_gartists[i-1] : NULL, cnt, KIT_VALUE_COUNT);
+            /* the album artist under the title, unless it's the artist open here */
+            const char *sub = g_drill_kind!=3 && !strcmp(a->artist, g_drill) ? NULL : mdb_artist_missing(a->artist) ? "Unknown artist" : a->artist;
+            row_two(r, a->title, sub, cnt, KIT_VALUE_COUNT);
         }
         theme_list_row(r);
         return r;
     }
-    if(g_lcur){                                                         /* Songs or an album (library.db) */
+    if(g_lcur){                                                         /* a song list (library.db) */
         const ldb_item *it = &g_lcur->v[i];
         ui_on(r, lsong_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)i, "library.song", UI_CORE);
         fmt_dur(dur,sizeof dur,it->duration_ms);
-        if(g_view==VIEW_GROUP && it->track > 0 && cfg_get_int("track_numbers", 0)){
+        if(g_view==VIEW_GROUP && (g_drill_kind==1 || g_scope_lvl==2) && it->track > 0 && cfg_get_int("track_numbers", 0)){
             char num[LDB_NAME + 16];                       /* album list + Track Numbers on: "3 Title" (stock "%d %s") */
             snprintf(num, sizeof num, "%d %s", it->track, it->title);
             row_two(r, num, it->artist, dur, KIT_VALUE_DURATION);
@@ -490,19 +456,6 @@ static lv_obj_t *add_row(lv_obj_t *parent, int i){
         return r;
     }
     switch(g_view){
-        case VIEW_SONGS: case VIEW_GROUP:
-            if(g_view==VIEW_GROUP && g_drill_kind!=1 && g_scope_lvl==2)
-                ui_on(r, scope_song_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)g_buf[i]->id, "library.scope_song", UI_CORE);
-            else
-                ui_on(r, song_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)g_buf[i]->id, "library.song", UI_CORE);
-            fmt_dur(dur,sizeof dur,g_buf[i]->dur_ms);
-            if(g_view==VIEW_GROUP && (g_drill_kind==1 || g_scope_lvl==2) && g_buf[i]->track > 0 && cfg_get_int("track_numbers", 0)){
-                char num[MDB_STR + 16];                    /* album list + Track Numbers on: "3 Title" (stock "%d %s") */
-                snprintf(num, sizeof num, "%d %s", g_buf[i]->track, g_buf[i]->title[0]?g_buf[i]->title:"Untitled");
-                row_two(r, num, g_buf[i]->artist, dur, KIT_VALUE_DURATION);
-            } else
-            row_two(r, g_buf[i]->title[0]?g_buf[i]->title:"Untitled", g_buf[i]->artist, dur, KIT_VALUE_DURATION);
-            break;
         case VIEW_ALBUMS: {                                            /* library.db */
             const ldb_item *a = &g_lalbums.v[i];
             ui_on(r, lalbum_cb, LV_EVENT_SHORT_CLICKED, (void*)(uintptr_t)i, "library.album", UI_CORE);
@@ -510,16 +463,16 @@ static lv_obj_t *add_row(lv_obj_t *parent, int i){
             char cnt[12]; snprintf(cnt,sizeof cnt,"%d",a->count);
             row_two(r, a->title, mdb_artist_missing(a->artist) ? "Unknown artist" : a->artist, cnt, KIT_VALUE_COUNT);
             break; }
-        case VIEW_ARTISTS:
+        case VIEW_ARTISTS:                                             /* library.db */
             ui_on(r, group_cb, LV_EVENT_SHORT_CLICKED, (void*)(uintptr_t)i, "library.group", UI_CORE);
             ui_on(r, group_play_cb, LV_EVENT_LONG_PRESSED, (void*)(uintptr_t)i, "library.group_play.long", UI_CORE);
-            row_two(r, g_gnames[i][0] ? g_gnames[i] : "Unknown artist", NULL, NULL, KIT_VALUE_COUNT);
+            row_two(r, g_lartists.v[i].title[0] ? g_lartists.v[i].title : "Unknown artist", NULL, NULL, KIT_VALUE_COUNT);
             break;
-        case VIEW_GENRES: {
+        case VIEW_GENRES: {                                            /* library.db */
             ui_on(r, group_cb, LV_EVENT_SHORT_CLICKED, (void*)(uintptr_t)i, "library.group", UI_CORE);
             ui_on(r, group_play_cb, LV_EVENT_LONG_PRESSED, (void*)(uintptr_t)i, "library.group_play.long", UI_CORE);
-            char cnt[12]; snprintf(cnt,sizeof cnt,"%d",g_gcounts[i]);
-            row_two(r, g_gnames[i], NULL, cnt, KIT_VALUE_COUNT);
+            char cnt[12]; snprintf(cnt,sizeof cnt,"%d",g_lgenres.v[i].count);
+            row_two(r, g_lgenres.v[i].title, NULL, cnt, KIT_VALUE_COUNT);
             break; }
         case VIEW_FAVS:
             ui_on(r, fav_row_cb, LV_EVENT_SHORT_CLICKED, (void*)(uintptr_t)i, "library.fav_row", UI_CORE);
@@ -728,36 +681,18 @@ static int current_list_context(int *lt, char *name, int cap){
 /* Play the current list, setting the play-mode first (0=Sequential, 1=Shuffle).
  * Play-mode = 0102 (ground-truth captured 2026-06-25); ui_set_workmode applies it. */
 static void play_list_mode(int mode){
-    if(g_lcur){                                                       /* Songs or an album (library.db) */
+    if(g_lcur){                                                       /* a song list (library.db) */
         cfg_set_int("work_mode", mode); ui_set_workmode(mode);
         if(lplay(g_lcur, lcur_ids(), mode == 1 ? -2 : -1)) screen_show(SCR_NOWPLAYING);
-        return;
-    }
-    if(g_view==VIEW_GROUP && g_drill_kind!=1 && g_scope_lvl==2){     /* one album of an artist / genre: its own stock queue */
-        cfg_set_int("work_mode", mode); ui_set_workmode(mode);
-        if(scope_play_album(g_scope_album, mode == 1 ? -2 : -1)) screen_show(SCR_NOWPLAYING);
         return;
     }
     int lt; char nm[160];
     if(!current_list_context(&lt, nm, sizeof nm)) return;
     cfg_set_int("work_mode", mode); ui_set_workmode(mode);
     int pos = 1;
-    /* shuffle: start on a random track (not always the first). Skip artist lists (lt==2):
-     * the UI's split-artist count can exceed the player's exact ARTIST=? list -> out-of-range pos. */
-    if(mode == 1 && g_count > 1 && lt != 2) pos = 1 + (rand() % g_count);
+    if(mode == 1 && g_count > 1) pos = 1 + (rand() % g_count);   /* shuffle: start on a random track (not always the first) */
     /* V2.57 favourites start from a MY_LOVE.ID, not a position (index 0 is refused) */
     if(lt == 6 && fw_fav_play_by_love_id()){ if(pos > g_count || !ui_play_favorite(g_favs[pos-1].love_id, pos)) return; }
-    else if(lt == 2 && !nm[0]){
-        if(!missing_artist_play(mode == 1 ? -2 : -1)) return;
-    }
-    else if(lt == 2 && mdb_artist_mode()){          /* Artists by album artist: through the artist plan, or nothing */
-        mdb_plan_t plan; int ok = 0;
-        if(!mdb_artist_plan(nm, &plan)){ ui_toast("Couldn't play that list"); return; }
-        int i = (mode == 1 && plan.count > 1) ? rand() % plan.count : 0;
-        ok = ui_play_plan(&plan, plan.ids[i]);
-        mdb_plan_free(&plan);
-        if(!ok) return;                        /* refused or not sent: ui_play_plan already said why; stay on the list */
-    }
     else if(!ui_play_list(lt, nm, pos)) return;
     screen_show(SCR_NOWPLAYING);
 }
@@ -839,20 +774,14 @@ static void add_album_cover_header(const char *album, const char *artist, const 
     }
 }
 
-static void add_mdb_album_cover_header(const char *album, const char *artist){   /* an album of an artist / genre (song.db) */
-    int ids[6]; int n = mdb_album_track_ids(album, ids, 6);
-    char track[6][512]; const char *paths[6]; int m = 0;
-    for(int i=0;i<n;i++) if(mdb_song_path(ids[i], track[m], sizeof track[m]) && track[m][0]){ paths[m] = track[m]; m++; }
-    add_album_cover_header(album, artist, paths, m);
-}
-static void add_ldb_album_cover_header(void){          /* the open album: covers from its first songs' files */
+static void add_ldb_album_cover_header(const ldb_list *l, const char *album, const char *artist){   /* covers from its first songs' files */
     const char *paths[6]; int m = 0;
-    for(int i=0;i<g_lalbum.n && m<6;i++){
+    for(int i=0;i<l->n && m<6;i++){
         int seen = 0;
-        for(int j=0;j<m && !seen;j++) seen = !strcmp(paths[j], g_lalbum.v[i].path);
-        if(!seen) paths[m++] = g_lalbum.v[i].path;
+        for(int j=0;j<m && !seen;j++) seen = !strcmp(paths[j], l->v[i].path);
+        if(!seen) paths[m++] = l->v[i].path;
     }
-    add_album_cover_header(g_alb_title, g_alb_artist, paths, m);
+    add_album_cover_header(album, artist, paths, m);
 }
 
 /* the first row of a song list: [ Play All ] [ Shuffle ]. centered=1 screen-centres the pair (used under
@@ -869,27 +798,17 @@ static void add_play_header(int centered){
 }
 
 /* "Playlist" button under Play All / Shuffle on an album, artist or genre song list: opens the add-to-playlist picker with
- * exactly the songs this list shows (g_buf, i.e. the same membership the view uses: first-artist split / Album Artist
- * setting / one album of an artist), so each CUE/ISO track is added as its own row. */
+ * exactly the songs this list shows, so each CUE/ISO track is added as its own row. */
 static void add_plist_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    if(g_lcur){                                       /* an album (library.db): its songs' SONG rows, in list order */
-        const int *li = lcur_ids();
-        int *ids = li ? malloc((size_t)g_lcur->n * sizeof *ids) : NULL, m = 0;
-        if(!ids){ ui_toast("Couldn't add these songs"); return; }
-        for(int i=0;i<g_lcur->n;i++) if(li[i] > 0) ids[m++] = li[i];
-        if(m) plpick_set_ids(ids, m);
-        free(ids);
-        if(!m){ ui_toast("Rescan to add these songs"); return; }
-        screen_show(SCR_PLPICK);
-        return;
-    }
-    if(!g_buf || g_count <= 0 || (g_view!=VIEW_GROUP)){ ui_toast("Nothing to add"); return; }
-    int *ids = malloc((size_t)g_count * sizeof *ids);
-    if(!ids){ ui_toast("Out of memory"); return; }
-    for(int i=0;i<g_count;i++) ids[i] = g_buf[i]->id;
-    plpick_set_ids(ids, g_count);
+    if(!g_lcur){ ui_toast("Nothing to add"); return; }
+    const int *li = lcur_ids();                       /* its songs' SONG rows, in list order */
+    int *ids = li ? malloc((size_t)g_lcur->n * sizeof *ids) : NULL, m = 0;
+    if(!ids){ ui_toast("Couldn't add these songs"); return; }
+    for(int i=0;i<g_lcur->n;i++) if(li[i] > 0) ids[m++] = li[i];
+    if(m) plpick_set_ids(ids, m);
     free(ids);
+    if(!m){ ui_toast("Rescan to add these songs"); return; }
     screen_show(SCR_PLPICK);
 }
 static void add_plist_row(int centered){
@@ -965,57 +884,44 @@ static void library_reload(void){
     }
 
     (void)dur;
-    if(g_view==VIEW_SONGS || (g_view==VIEW_GROUP && g_drill_kind==1)){   /* library.db: every song, or one album */
-        ldb_list *l = g_view==VIEW_SONGS ? &g_lsongs : &g_lalbum;
-        int n;
-        if(g_view==VIEW_SONGS && ldb_list_current(l)) n = l->n;         /* unchanged since the last read: keep it */
-        else {
-            ldb_list_free(l);
-            n = g_view==VIEW_SONGS ? ldb_read_songs(l) : ldb_read_album_songs(g_alb_artist, g_alb_title, l);
-        }
-        lib_ensure_first_cap(n);
-        if(n > g_first_cap) n = g_first_cap;
-        if(n<=0){ empty_scan(tr("No songs found")); return; }
-        lcur_set(l);
-        if(g_view==VIEW_GROUP) add_ldb_album_cover_header();           /* album: cover on top */
-        add_play_header(g_view==VIEW_GROUP);                            /* centre the pair under the album cover */
-        if(g_view==VIEW_GROUP) add_plist_row(1);                        /* add these songs to a playlist */
-        for(int i=0;i<n;i++) g_first[i]=az_code(l->v[i].letter);
-        g_count=n; fill_start(n);
-        if(g_view==VIEW_SONGS) az_show(1);
-        return;
-    }
-    if(g_view==VIEW_SONGS || g_view==VIEW_GROUP){
-        lib_alloc_buffers(mdb_song_count());
-    }
     if(g_view==VIEW_GROUP && g_drill_kind!=1 && g_scope_lvl==1){       /* artist / genre -> its albums */
-        lib_ensure_group_cap(mdb_scope_albums(scope_kind(), g_drill, NULL, NULL, NULL, 0) + 1);
-        int n = mdb_scope_albums(scope_kind(), g_drill, g_gnames, g_gartists, g_gcounts, g_grp_cap);
-        int cap = g_grp_cap < g_first_cap ? g_grp_cap : g_first_cap;
-        if(n > cap - 1) n = cap - 1;
-        if(n <= 0) g_scope_lvl = 0;                                     /* the albums went away (rescan): show the flat list */
+        ldb_list_free(&g_lscope);
+        int n = ldb_read_scope_albums(scope_of(g_drill_kind), g_drill, &g_lscope);
+        lib_ensure_first_cap(n + 1);
+        if(n > g_first_cap - 1) n = g_first_cap - 1;
+        if(n <= 0) g_scope_lvl = 0;                                     /* no albums (or gone in a rescan): the flat list */
         else {
-            g_scope_total = (g_drill_kind==3) ? mdb_genre_songs(g_drill, g_buf, g_alloc_n) : mdb_artist_songs(g_drill, g_buf, g_alloc_n);
+            g_scope_total = ldb_scope_count(scope_of(g_drill_kind), g_drill);
             g_first[0] = '#';
-            for(int i=0;i<n;i++) g_first[i+1]=first_letter(g_gnames[i]);
+            for(int i=0;i<n;i++) g_first[i+1]=az_code(g_lscope.v[i].letter);
             g_count = n + 1; fill_start(n + 1);
             if(n > 12) az_show(1);
             return;
         }
     }
-    if(g_view==VIEW_SONGS || g_view==VIEW_GROUP){
-        lib_ensure_first_cap(g_alloc_n);
-        int cap = g_alloc_n < g_first_cap ? g_alloc_n : g_first_cap;
+    if(g_view==VIEW_SONGS || g_view==VIEW_GROUP){                      /* library.db: every song, an album, or a scope's */
+        int is_album = g_view==VIEW_GROUP && (g_drill_kind==1 || g_scope_lvl==2);
+        ldb_list *l = g_view==VIEW_SONGS ? &g_lsongs : g_drill_kind==1 ? &g_lalbum : &g_lscope_songs;
         int n;
-        if(g_view==VIEW_GROUP && g_drill_kind!=1 && g_scope_lvl==2) n=mdb_scope_album_songs(scope_kind(),g_drill,g_scope_album,g_buf,cap);
-        else if(g_view==VIEW_GROUP) n=(g_drill_kind==1)?mdb_album_songs(g_drill,g_buf,cap):(g_drill_kind==3)?mdb_genre_songs(g_drill,g_buf,cap):mdb_artist_songs(g_drill,g_buf,cap);
-        else { n=mdb_song_count(); if(n>cap) n=cap; for(int i=0;i<n;i++) g_buf[i]=mdb_song(i); }
+        if(g_view==VIEW_SONGS && ldb_list_current(l)) n = l->n;         /* unchanged since the last read: keep it */
+        else {
+            ldb_list_free(l);
+            n = g_view==VIEW_SONGS ? ldb_read_songs(l)
+              : g_drill_kind==1 ? ldb_read_album_songs(g_alb_artist, g_alb_title, l)
+              : g_scope_lvl==2 ? ldb_read_scope_album_songs(scope_of(g_drill_kind), g_drill, g_scope_album_artist, g_scope_album, l)
+              : ldb_read_scope_songs(scope_of(g_drill_kind), g_drill, l);
+        }
+        lib_ensure_first_cap(n);
+        if(n > g_first_cap) n = g_first_cap;
         if(n<=0){ empty_scan(tr("No songs found")); return; }
-        int is_album = (g_view==VIEW_GROUP && (g_drill_kind==1 || g_scope_lvl==2));
-        if(is_album) add_mdb_album_cover_header(g_scope_album, n>0 ? g_buf[0]->artist : NULL);  /* album drill: cover on top */
-        add_play_header(is_album);                                       /* centre the pair under the album cover */
-        if(g_view==VIEW_GROUP) add_plist_row(is_album);                  /* album / artist / genre: add these songs to a playlist */
-        for(int i=0;i<n;i++) g_first[i]=first_letter(g_buf[i]->title);
+        lcur_set(l);
+        if(is_album){                                                   /* album: cover on top */
+            if(g_drill_kind==1) add_ldb_album_cover_header(l, g_alb_title, g_alb_artist);
+            else add_ldb_album_cover_header(l, g_scope_album, g_scope_album_artist);
+        }
+        add_play_header(is_album);                                      /* centre the pair under the album cover */
+        if(g_view==VIEW_GROUP) add_plist_row(is_album);                 /* add these songs to a playlist */
+        for(int i=0;i<n;i++) g_first[i]=az_code(l->v[i].letter);
         g_count=n; fill_start(n);
         if(g_view==VIEW_SONGS) az_show(1);
     } else if(g_view==VIEW_ALBUMS){                                    /* library.db */
@@ -1027,19 +933,23 @@ static void library_reload(void){
         if(n<=0){ empty_scan(tr("No albums found")); return; }
         for(int i=0;i<n;i++) g_first[i]=az_code(g_lalbums.v[i].letter);
         g_count=n; fill_start(n); az_show(1);
-    } else if(g_view==VIEW_ARTISTS){
-        lib_ensure_group_cap(mdb_artist_count());
-        int cap = g_grp_cap < g_first_cap ? g_grp_cap : g_first_cap;
-        int n=mdb_artists(g_gnames,cap);
+    } else if(g_view==VIEW_ARTISTS){                                   /* library.db, in the Artists grouping */
+        int by_aa = mdb_artist_mode(), n;
+        if(g_lartists_by_aa == by_aa && ldb_list_current(&g_lartists)) n = g_lartists.n;
+        else { ldb_list_free(&g_lartists); n = ldb_read_artists(by_aa, &g_lartists); g_lartists_by_aa = by_aa; }
+        lib_ensure_first_cap(n);
+        if(n > g_first_cap) n = g_first_cap;
         if(n<=0){ empty_scan(tr("No artists found")); return; }
-        for(int i=0;i<n;i++) g_first[i]=first_letter(g_gnames[i]);
+        for(int i=0;i<n;i++) g_first[i]=az_code(g_lartists.v[i].letter);
         g_count=n; fill_start(n); az_show(1);
-    } else if(g_view==VIEW_GENRES){
-        lib_ensure_group_cap(mdb_genre_count());
-        int cap = g_grp_cap < g_first_cap ? g_grp_cap : g_first_cap;
-        int n=mdb_genres(g_gnames,g_gcounts,cap);
+    } else if(g_view==VIEW_GENRES){                                    /* library.db */
+        int n;
+        if(ldb_list_current(&g_lgenres)) n = g_lgenres.n;
+        else { ldb_list_free(&g_lgenres); n = ldb_read_genres(&g_lgenres); }
+        lib_ensure_first_cap(n);
+        if(n > g_first_cap) n = g_first_cap;
         if(n<=0){ empty_scan(tr("No genres found")); return; }
-        for(int i=0;i<n;i++) g_first[i]=first_letter(g_gnames[i]);
+        for(int i=0;i<n;i++) g_first[i]=az_code(g_lgenres.v[i].letter);
         g_count=n; fill_start(n); az_show(1);
     } else if(g_view==VIEW_FAVS){
         /* favourites can outnumber SONG (a favourite whose song left the library stays in MY_LOVE - and in the V2.57
@@ -1135,7 +1045,7 @@ int library_drill_context(int *list_type, char *name, int cap){
 /* deep-link from the Now Playing 3-dot menu or the cover flow: jump straight to an album (its library.db key) / artist */
 void library_open_album(const char *album_artist, const char *album){ open_album(album_artist, album, 1); }
 void library_open_artist(const char *name){
-    g_view=VIEW_GROUP; g_drill_kind=2; g_scope_lvl=0; g_scope_from_albums=0; g_deeplink=1; snprintf(g_drill, MDB_STR, "%s", name); library_reload();
+    g_view=VIEW_GROUP; g_drill_kind=2; g_scope_lvl=0; g_scope_from_albums=0; g_deeplink=1; snprintf(g_drill, sizeof g_drill, "%s", name); library_reload();
 }
 
 /* ---- rim-scroll alphabet hint: a big centred letter shown while flying through
@@ -1170,12 +1080,6 @@ void library_scroll_letter_tick(void){
     lv_obj_clear_flag(g_lhint, LV_OBJ_FLAG_HIDDEN);
 }
 
-/* Rows and the fill timer must be cleared before growing scratch. */
-static void lib_alloc_buffers(int songs){
-    if(songs <= g_alloc_n) return;
-    const mdb_song_t **buf = realloc(g_buf, (size_t)songs * sizeof *buf);
-    if(buf){ g_buf = buf; g_alloc_n = songs; }
-}
 void library_ensure_capacity(void){
     /* The next reload sizes only the active view, after stopping its fill. */
 }
@@ -1183,21 +1087,6 @@ static void lib_ensure_first_cap(int need){
     if(need <= g_first_cap) return;
     unsigned char *f = realloc(g_first, (size_t)need);
     if(f){ g_first = f; g_first_cap = need; }
-}
-static void lib_ensure_group_cap(int need){
-    if(need > g_grp_cap){
-        char (*a)[MDB_STR] = realloc(g_gnames, (size_t)need * sizeof *a);
-        if(!a) return;
-        g_gnames = a;
-        char (*b)[MDB_STR] = realloc(g_gartists, (size_t)need * sizeof *b);
-        if(!b) return;
-        g_gartists = b;
-        int *c = realloc(g_gcounts, (size_t)need * sizeof *c);
-        if(!c) return;
-        g_gcounts = c;
-        g_grp_cap = need;
-    }
-    lib_ensure_first_cap(need);
 }
 static void lib_ensure_fav_cap(int need){
     if(need > g_fav_cap){

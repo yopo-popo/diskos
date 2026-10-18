@@ -140,10 +140,26 @@ typedef struct {
 int  ldb_read_songs(ldb_list *out);                                    /* every song, by title, then artist */
 int  ldb_read_albums(ldb_list *out);                                   /* every album, by title, then album artist */
 int  ldb_read_album_songs(const char *album_artist, const char *album, ldb_list *out);   /* disc and track order */
+/* The Artists view's names: every credited artist, or (by_album_artist) every album artist, plus the first artist of
+ * songs without an album. "" = Unknown artist (songs without one), last. */
+int  ldb_read_artists(int by_album_artist, ldb_list *out);
+int  ldb_read_genres(ldb_list *out);                                   /* the files' genres; count = their songs */
+/* An artist's or a genre's songs ("scope"): LDB_SCOPE_ARTIST = the songs crediting key ("" = songs with no artist),
+ * LDB_SCOPE_GROUP = the songs under key in Artists by album artist, LDB_SCOPE_GENRE = the songs with genre key. */
+enum { LDB_SCOPE_ARTIST, LDB_SCOPE_GROUP, LDB_SCOPE_GENRE };
+/* the scope's albums (artist = the album artist, path = its first song, count = the scope's songs in it); a genre's are
+ * only those whose every song has the genre */
+int  ldb_read_scope_albums(int kind, const char *key, ldb_list *out);
+int  ldb_read_scope_songs(int kind, const char *key, ldb_list *out);  /* by title, then artist */
+int  ldb_read_scope_album_songs(int kind, const char *key, const char *album_artist, const char *album, ldb_list *out);
+int  ldb_scope_count(int kind, const char *key);                       /* its songs, -1 = can't read */
 int  ldb_list_current(const ldb_list *l);   /* 1 = library.db is still the file l was read from */
 void ldb_list_free(ldb_list *l);
 /* The album's first songs' files, at most max, distinct (cover lookups). Returns the count, 0 on any failure. */
 int  ldb_album_paths(const char *album_artist, const char *album, char (*paths)[512], int max);
+/* The Artists-view name of the song at path (start_ms < 0 = its first song in the file): its first artist, or its
+ * ldb_read_artists(1) name. 1 = found and not "". */
+int  ldb_song_artist(const char *path, long long start_ms, int by_album_artist, char *out, int cap);
 /* The album of the song at path (start_ms < 0 = its first song in the file). 1 = found. */
 int  ldb_song_album(const char *path, long long start_ms, char *album_artist, int aacap, char *album, int acap);
 

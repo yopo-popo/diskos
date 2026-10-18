@@ -22,8 +22,6 @@ int ui_label_set_changed(lv_obj_t *obj, const char *txt);   /* ui.c: a label's t
 
 
 /* ---- shared current-track context (set from main.c) --------------------- */
-static char g_album[160];
-static char g_artist[160];
 static char g_path[256];
 static int  g_fav, g_have, g_pos_id;
 static lv_obj_t *g_fav_lbl;
@@ -34,19 +32,10 @@ static void fav_refresh(void){   /* every playback update: the text only when it
 void npmenu_set(const track_state_t *st, int playing, const void *thumb_src){
     (void)playing; (void)thumb_src;
     g_have = st && st->have_track;
-    snprintf(g_album,  sizeof g_album,  "%s", g_have ? st->album  : "");
-    snprintf(g_artist, sizeof g_artist, "%s", g_have ? st->artist : "");
     snprintf(g_path,   sizeof g_path,   "%s", g_have ? st->path   : "");
     g_pos_id = g_have ? st->pos_id : 0;
     g_fav = g_have ? st->is_favorite : 0;
     fav_refresh();
-}
-
-/* first artist token (so "A, B" -> "A" matches the split Artists browse) */
-static void first_artist(const char *raw, char *out, int n){
-    int i=0; while(raw[i] && raw[i]!=',' && raw[i]!=';' && i<n-1){ out[i]=raw[i]; i++; }
-    out[i]=0;
-    while(i>0 && out[i-1]==' ') out[--i]=0;
 }
 
 /* ---- generic list row --------------------------------------------------- */
@@ -100,11 +89,9 @@ static void ctx_album_cb(lv_event_t *e){
 }
 static void ctx_artist_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    char dbal[160], dbar[160];
-    const char *src = g_artist;
-    if(mdb_song_meta_by_path(g_path, dbal, sizeof dbal, dbar, sizeof dbar) && dbar[0]) src = dbar;
-    if(!src[0]){ ui_toast("No artist info"); return; }
-    char a[160]; first_artist(src, a, sizeof a);
+    /* the library's artist for this track (its path), as the Artists list names it in its grouping */
+    char a[LDB_NAME];
+    if(!ldb_song_artist(g_path, -1, mdb_artist_mode(), a, sizeof a)){ ui_toast("No artist info"); return; }
     library_open_artist(a); screen_show(SCR_LIBRARY);
 }
 static void plpick_reload(void);
