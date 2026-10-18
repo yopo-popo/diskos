@@ -5,6 +5,7 @@
 #include "theme_kit.h"
 #include "screens.h"
 #include "ipc.h"
+#include "favourites.h"
 #include "config.h"
 #include "i18n.h"
 #include <stdint.h>
@@ -98,7 +99,7 @@ static int qtile_is_on(int id){
         case QT_GAIN:    return fw_gain_tag() && cfg_get_int("audio_gain", 0) == 1;   /* unmapped firmware: never lit */
         case QT_DRE:     return cfg_get_int("audio_dre", 1) == 1;
         case QT_OUTDOOR: return theme_outdoor();
-        case QT_FAV:   { track_state_t st; ipc_get_state(&st); return st.path[0] && st.is_favorite; }
+        case QT_FAV:   { track_state_t st; ipc_get_state(&st); return fav_current(&st); }
         default:         return 0;   /* action tiles (Search/Rescan/Source/Screen off/Lyrics/Timer/RG) never lit */
     }
 }
@@ -170,7 +171,8 @@ static void tile_short_cb(lv_event_t *e){
         case QT_FAV: {
             track_state_t st; ipc_get_state(&st);
             if(!st.path[0] || ui_book_active()){ ui_toast("No track playing"); break; }
-            int nv = !st.is_favorite; ui_set_favorite(nv);
+            int nv = !fav_current(&st);
+            if(!fav_current_set(&st, nv)){ ui_toast("Couldn't save the favourite"); break; }
             tile_recolor(QT_FAV, nv); ui_toast(nv ? "Loved" : "Unloved");
         } break;
         case QT_LYRICS: lyrics_open(); break;

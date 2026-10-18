@@ -171,5 +171,8 @@ int  ldb_track_start(const char *path, const char *title, long long *start_ms);
 /* Most Played (by_recent 0: most plays first) or Recent (1: last played first): the songs listening.db counted that
  * are in the library. The caller opens listening.db first (lsdb_ready). 0 = nothing played yet, -1 = can't read. */
 int  ldb_read_history(int by_recent, ldb_list *out);
+/* Favourites, newest first. A song that isn't in the library is listed from shelves.db's snapshot of it, with count 1
+ * and no artist. The caller opens shelves.db first (shdb_ready). 0 = none, -1 = can't read. */
+int  ldb_read_favourites(ldb_list *out);
 
 #endif

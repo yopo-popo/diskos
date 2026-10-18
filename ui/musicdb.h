@@ -33,7 +33,6 @@ typedef struct {
     char genre[MDB_STR];    /* GENRE field - used here as user mood/tag */
     int  dur_ms;
     int  track;             /* SONG.TRACK (0 = none) - shown in album lists with Track Numbers on */
-    int  love_id;           /* MY_LOVE.ID - set only by mdb_favorites (the V2.57 type-6 start index), else unset */
     /* The stock sort codes stored on the row (mdb_load only; 0 when the schema has none): the Artists/Albums/Genres lists
      * order by these exactly as the player's own queries do, so non-Latin names land where stock puts them. */
     int  code_artist, code_album, code_genre, code_group;   /* ARTIST_CODE / ALBUM_CODE / GENRE_CODE / album-artist-or-artist code */
@@ -168,11 +167,8 @@ int  mdb_genre_songs(const char *genre, const mdb_song_t **out, int cap);
 /* Case-insensitive substring match on title/artist/album. Returns count. */
 int  mdb_search(const char *q, const mdb_song_t **out, int cap);
 
-/* Favourites (MY_LOVE) and playlists (PLAY_LIST). Both may be empty. */
-int  mdb_favorites(mdb_song_t *out, int cap, int stock_order);   /* stock_order: the player's type-6 queue order */
-int  mdb_favorite_count(void);                                   /* MY_LOVE music rows (may exceed SONG); -1 = error */
+/* Playlists (PLAY_LIST); may be empty. Favourites live in shelves.db (shelvesdb.h). */
 int  mdb_love_path(int love_id, char *out, int cap);              /* MY_LOVE.PATH for a MY_LOVE.ID; 1 = found */
-int  mdb_unfavorite(int love_id);                   /* remove by MY_LOVE.ID */
 int  mdb_playlist_sync_registry(void);   /* reconcile PLAYLIST_INFO with stock's CUSTOM_PLAYLIST_INDEX; 2 = synced, 1 = no index, 0 = failed */
 int  mdb_playlist_num(void);   /* count of playlists (to size a dynamic buffer, no fixed cap) */
 int  mdb_playlists(char names[][MDB_STR], long *ids, int cap);

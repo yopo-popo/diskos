@@ -9,6 +9,7 @@
 #include "ipc.h"
 #include "musicdb.h"   /* persistent per-song accent cache */
 #include "listeningdb.h"   /* play counts */
+#include "favourites.h"   /* the heart (shelves.db) */
 #include "playcount.h"
 #include "scanner.h"   /* scan_read_chapters: Now Playing shows a book's current chapter */
 #include "artcache.h"   /* persistent decoded-cover cache on SD */
@@ -70,14 +71,7 @@ static lv_obj_t *fav_icon;
 static lv_obj_t *btn_sleep;    /* audiobook sleep-timer moon (occupies the heart slot for books) */
 static lv_obj_t *sleep_icon;
 static int g_np_fav, g_np_have, g_fav_px, g_fav_py;
-/* Optimistic-favourite hold: a heart tap flips the widget + sends 0104 before the player
- * confirms via a2. Position (a1) frames trigger a full NP refresh from the OLD is_favorite,
- * which would flip the heart back. We hold the tapped value for this exact track until the
- * player confirms it, the track changes, or a timeout - so the heart doesn't visibly bounce. */
-static char g_np_curpath[520];
-static int  g_favp_active = 0, g_favp_val = 0;
-static uint32_t g_favp_set = 0;
-static char g_favp_path[520];
+static char g_np_curpath[520];   /* the track the last update showed (the seek scrub latches it) */
 static lv_obj_t *btn_mode;
 static lv_obj_t *mode_icon;
 static lv_obj_t *mode_one;
@@ -766,7 +760,7 @@ lv_obj_t *kit_edge_header(lv_obj_t *root, const char *title, lv_event_cb_t back_
 
 /* Favorites heart on Now Playing: filled+accent when the current track is a
  * favorite, outline+grey otherwise. Tap toggles it (movement-guarded so a swipe
- * doesn't accidentally favorite). The 0104 command is sent via ui_set_favorite. */
+ * doesn't accidentally favorite); it is saved in shelves.db (favourites.h). */
 static void fav_refresh(int on, int have)
 {
     g_np_fav = on; g_np_have = have;
@@ -794,12 +788,11 @@ static void fav_click_cb(lv_event_t *e)
             int dx = p.x - g_fav_px, dy = p.y - g_fav_py;
             if((dx<0?-dx:dx) > 18 || (dy<0?-dy:dy) > 18) return;   /* was a swipe (cst816t wobble tolerance) */
         }
-        fav_refresh(!g_np_fav, 1);      /* g_np_fav now holds the NEW (toggled) value */
-        ui_set_favorite(g_np_fav);
-        /* hold this value for the current track until the player confirms via a2 */
-        g_favp_active = 1; g_favp_val = g_np_fav; g_favp_set = lv_tick_get();
-        snprintf(g_favp_path, sizeof g_favp_path, "%s", g_np_curpath);
-        ui_toast(g_np_fav ? "Added to Favourites" : "Removed from Favourites");
+        track_state_t st; ipc_get_state(&st);   /* the song playing now, not the one shown at the last update */
+        int on = !fav_current(&st);
+        if(!fav_current_set(&st, on)){ ui_toast("Couldn't save the favourite"); return; }
+        fav_refresh(on, 1);
+        ui_toast(on ? "Added to Favourites" : "Removed from Favourites");
     }
 }
 
@@ -2416,7 +2409,7 @@ void ui_update(const track_state_t *st)
         ui_pp_glyph(btn_pp, 0);
         if(theme_kit()->np_state) theme_kit()->np_state(0, 0);
         art_request_clear();   /* clear art + invalidate any in-flight decode (was a bare fallback) */
-        g_np_curpath[0] = '\0'; g_favp_active = 0;   /* no track -> drop any optimistic-favourite hold */
+        g_np_curpath[0] = '\0';
         fav_refresh(0, 0);
         if(btn_sleep) lv_obj_add_flag(btn_sleep, LV_OBJ_FLAG_HIDDEN);   /* no track -> hide the sleep moon too */
         ui_np_close_overlays();   /* no track -> dismiss any open sleep popover */
@@ -2461,16 +2454,8 @@ void ui_update(const track_state_t *st)
         set_label_text_changed(album, ab);
         if(pos_own_line) set_label_text_changed(album_pos, pos_text);
     }
-    /* honour an optimistic-favourite hold so a1 position frames don't bounce the heart back */
     snprintf(g_np_curpath, sizeof g_np_curpath, "%s", st->path);
-    int fav_show = st->is_favorite;
-    if(g_favp_active){
-        if(strcmp(g_favp_path, st->path) != 0)          g_favp_active = 0;   /* different track -> drop hold */
-        else if(st->is_favorite == g_favp_val)          g_favp_active = 0;   /* player confirmed the value */
-        else if(lv_tick_elaps(g_favp_set) > 4000)       g_favp_active = 0;   /* no confirm in 4s -> give up */
-        else                                            fav_show = g_favp_val;
-    }
-    fav_refresh(fav_show, 1);
+    fav_refresh(fav_current(st), 1);
 
     /* Audiobook transport: -15/+30 skips instead of track prev/next, and no shuffle or favourite
      * (they make no sense for a book; the freed space is reserved for the sleep control later). */

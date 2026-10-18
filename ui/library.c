@@ -7,7 +7,8 @@
 #include "books.h"
 #include "musicdb.h"
 #include "listeningdb.h"   /* Most Played / Recent */
-#include "fwcaps.h"
+#include "shelvesdb.h"     /* Favourites */
+#include "sdio.h"
 #include "artcache.h"
 #include "fonts_hebrew.h"
 #include "fonts_icons.h"
@@ -17,6 +18,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include "config.h"
 #include "i18n.h"
 
@@ -53,15 +56,12 @@ static int g_hdr_extra_px = 0; /* extra leading height above the rows (the album
 static char g_drill[LDB_NAME];   /* the open album's title, or the artist / genre */
 static library_song_click_cb_t g_song_cb;
 
-/* Scratch grows on entry, independently for copied rows and A-Z. */
-static int  g_fav_cap = 0;
+/* A-Z scratch, grown on entry. */
 static int  g_first_cap = 0;
-static unsigned char *g_first = NULL;   /* per-row jump-letter code (first_letter) for the A-Z scrubber */
+static unsigned char *g_first = NULL;   /* per-row jump-letter code (az_code) for the A-Z scrubber */
 static int  g_count;
 
 static void lib_ensure_first_cap(int need);
-static void lib_ensure_fav_cap(int need);     /* copied rows can outnumber songs */
-static mdb_song_t *g_favs = NULL;
 static char (*g_plnames)[MDB_STR] = NULL;   /* dynamic: grown to the real playlist count (no 64 cap) */
 static long *g_plids = NULL;
 static int  *g_plcounts = NULL;
@@ -84,6 +84,7 @@ static int g_vrows;
 static ldb_list g_lsongs, g_lalbums, g_lalbum;
 static ldb_list g_lartists, g_lgenres;  /* the Artists and Genres views */
 static ldb_list g_lhist;                /* Most Played / Recent */
+static ldb_list g_lfavs;                /* Favourites (shelves.db); count 1 = not in the library, 2 = its file is gone */
 static int g_lartists_by_aa = -1;       /* the Artists grouping g_lartists was read in (mdb_artist_mode) */
 static ldb_list g_lscope, g_lscope_songs;   /* an artist's / a genre's albums (level 1) and songs (level 0 or 2) */
 static const ldb_list *g_lcur;          /* the song list on screen (Songs, an album, an artist's or a genre's songs) */
@@ -102,13 +103,6 @@ static void library_reload(void);
 #define HEB_LETTERS 27            /* alef..tav, the 5 finals included */
 #define HEB_FINALS  0x28A400u     /* bit n: alef+n is a final form (kaf, mem, nun, pe, tsadi sofit = n 10 13 15 19 21) */
 static int heb_is_final(int n){ return (HEB_FINALS >> n) & 1; }
-static unsigned char first_letter(const char *s){
-    const unsigned char *p = (const unsigned char *)s;
-    while(*p==' ') p++;
-    if(p[0]==0xD7 && p[1]>=0x90 && p[1]<=0xAA){ int n = p[1] - 0x90; return (unsigned char)(AZ_HEB + n + heb_is_final(n)); }
-    unsigned char c = (unsigned char)toupper(p[0]);
-    return (c>='A'&&c<='Z') ? c : '#';
-}
 static void az_code_text(unsigned char code, char b[3]){   /* a code's letter as a UTF-8 string */
     if(code >= AZ_HEB){ b[0] = (char)0xD7; b[1] = (char)(0x90 + code - AZ_HEB); b[2] = 0; }
     else { b[0] = (char)code; b[1] = 0; }
@@ -192,14 +186,16 @@ static int lplay(const ldb_list *l, const int *ids, int i){
     mdb_plan_free(&plan);
     return ok;
 }
-static void lsong_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    int i = (int)(uintptr_t)lv_event_get_user_data(e);
+static void lsong_play(int i){
     if(!g_lcur || i < 0 || i >= g_lcur->n) return;
     const int *ids = lcur_ids();
     if(ids && ids[i] <= 0){ ui_toast("Rescan to play this song"); return; }   /* never start a different song */
     if(!lplay(g_lcur, ids, i)) return;                      /* refused / not sent: already toasted, stay on the list */
     screen_show(SCR_NOWPLAYING);
+}
+static void lsong_cb(lv_event_t *e){
+    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
+    lsong_play((int)(uintptr_t)lv_event_get_user_data(e));
 }
 /* Play list l (n = its read's result, freed here) from its first song. */
 static int lplay_once(ldb_list *l, int n, const char *fail){
@@ -238,14 +234,15 @@ static void lalbum_play_cb(lv_event_t *e){   /* long-press an album: play it now
 /* ---- "Remove from Favourites?" confirm (long-press is easy to trigger by
  * accident, so removal needs an explicit confirm). ------------------------ */
 static lv_obj_t *g_fav_modal;
-static int       g_fav_pending_id;
+static char      g_fav_pending_path[1024];   /* the song to remove, by its file and start */
+static long long g_fav_pending_start;
 static void fav_modal_close(void){
     if(g_fav_modal){ lv_obj_delete_async(g_fav_modal); g_fav_modal = NULL; }
 }
 static void fav_cancel_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) fav_modal_close(); }
 static void fav_confirm_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    mdb_unfavorite(g_fav_pending_id);
+    if(!shdb_fav_set(g_fav_pending_path, g_fav_pending_start, 0, NULL, NULL, NULL)) ui_toast("Couldn't remove it");
     fav_modal_close();
     lv_async_call(reload_async, NULL);
 }
@@ -263,9 +260,10 @@ static void fav_modal_pill(lv_obj_t *card, int x, const char *txt, theme_color_r
     lv_obj_set_style_text_color(l, theme_color(col), 0);
     lv_obj_center(l);
 }
-static void fav_confirm(int i){   /* i = the row's index into g_favs */
-    g_fav_pending_id = g_favs[i].love_id;   /* MY_LOVE.ID: removes exactly this row, even if its song left SONG */
-    const char *title = g_favs[i].title[0] ? g_favs[i].title : "this song";
+static void fav_confirm(int i){   /* i = the row's index into g_lfavs */
+    snprintf(g_fav_pending_path, sizeof g_fav_pending_path, "%s", g_lfavs.v[i].path);
+    g_fav_pending_start = g_lfavs.v[i].start_ms;
+    const char *title = g_lfavs.v[i].title[0] ? g_lfavs.v[i].title : "this song";
     fav_modal_close();
     g_fav_modal = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(g_fav_modal);
@@ -299,18 +297,15 @@ static void fav_confirm(int i){   /* i = the row's index into g_favs */
     fav_modal_pill(card,  58, "Remove", THEME_CLR_STATUS_DANGER, fav_confirm_cb);
 }
 
-/* Favourites rows: short tap plays, long-press asks to remove. (SHORT_CLICKED
- * so a long-press doesn't also fire a play on release.) */
-/* Rows carry their index into g_favs: the MY_LOVE.ID removes it and (with the row) starts the V2.57 favourites
- * queue; the SONG.ID plays it on firmware without the stock favourites queue. */
+/* Favourites rows: short tap plays the list from that song, long-press asks to remove it. (SHORT_CLICKED so a
+ * long-press doesn't also fire a play on release.) */
 static void fav_row_cb(lv_event_t *e){
     lv_event_code_t c = lv_event_get_code(e);
     int i = (int)(uintptr_t)lv_event_get_user_data(e);
-    if(g_view != VIEW_FAVS || i < 0 || i >= g_count) return;
+    if(g_view != VIEW_FAVS || g_lcur != &g_lfavs || i < 0 || i >= g_lfavs.n) return;
     if(c == LV_EVENT_SHORT_CLICKED){
-        int ok = fw_fav_play_by_love_id() ? ui_play_favorite(g_favs[i].love_id, i + 1)
-                                          : (g_song_cb && g_song_cb(g_favs[i].id));
-        if(ok) screen_show(SCR_NOWPLAYING);   /* refused / not sent: already toasted, stay on the list */
+        if(g_lfavs.v[i].count == 2) ui_toast("This song's file is gone");
+        else lsong_play(i);
     } else if(c == LV_EVENT_LONG_PRESSED){
         fav_confirm(i);
     }
@@ -441,8 +436,16 @@ static lv_obj_t *add_row(lv_obj_t *parent, int i){
     }
     if(g_lcur){                                                         /* a song list (library.db) */
         const ldb_item *it = &g_lcur->v[i];
-        ui_on(r, lsong_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)i, "library.song", UI_CORE);
         fmt_dur(dur,sizeof dur,it->duration_ms);
+        if(g_lcur == &g_lfavs){
+            ui_on(r, fav_row_cb, LV_EVENT_SHORT_CLICKED, (void*)(uintptr_t)i, "library.fav_row", UI_CORE);
+            ui_on(r, fav_row_cb, LV_EVENT_LONG_PRESSED, (void*)(uintptr_t)i, "library.fav_row.long", UI_CORE);
+            row_two(r, it->title, it->count == 2 ? tr("Missing") : it->count ? tr("Not in the library") : it->artist,
+                    dur, KIT_VALUE_DURATION);
+            theme_list_row(r);
+            return r;
+        }
+        ui_on(r, lsong_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)i, "library.song", UI_CORE);
         if(g_view==VIEW_GROUP && (g_drill_kind==1 || g_scope_lvl==2) && it->track > 0 && cfg_get_int("track_numbers", 0)){
             char num[LDB_NAME + 16];                       /* album list + Track Numbers on: "3 Title" (stock "%d %s") */
             snprintf(num, sizeof num, "%d %s", it->track, it->title);
@@ -470,12 +473,6 @@ static lv_obj_t *add_row(lv_obj_t *parent, int i){
             char cnt[12]; snprintf(cnt,sizeof cnt,"%d",g_lgenres.v[i].count);
             row_two(r, g_lgenres.v[i].title, NULL, cnt, KIT_VALUE_COUNT);
             break; }
-        case VIEW_FAVS:
-            ui_on(r, fav_row_cb, LV_EVENT_SHORT_CLICKED, (void*)(uintptr_t)i, "library.fav_row", UI_CORE);
-            ui_on(r, fav_row_cb, LV_EVENT_LONG_PRESSED, (void*)(uintptr_t)i, "library.fav_row.long", UI_CORE);
-            fmt_dur(dur,sizeof dur,g_favs[i].dur_ms);
-            row_two(r, g_favs[i].title, g_favs[i].artist, dur, KIT_VALUE_DURATION);
-            break;
     }
     theme_list_row(r);
     return r;
@@ -662,10 +659,9 @@ static void empty_scan(const char *txt){
 
 /* ---- Play All / Shuffle All header for song lists ----------------------- */
 /* list_type + filter name for the current song view (0100 jump-table types:
- * 1=all, 2=artist, 3=album, 6=favourites, 10=genre). Returns 1 if playable. */
+ * 1=all, 2=artist, 3=album, 10=genre). Returns 1 if playable. */
 static int current_list_context(int *lt, char *name, int cap){
     if(g_view==VIEW_SONGS){ if(lt)*lt=1; if(name&&cap>0)name[0]=0; return 1; }
-    if(g_view==VIEW_FAVS){  if(lt)*lt=6; if(name&&cap>0)name[0]=0; return 1; }
     if(g_view==VIEW_GROUP)  return library_drill_context(lt, name, cap);
     return 0;
 }
@@ -682,9 +678,7 @@ static void play_list_mode(int mode){
     cfg_set_int("work_mode", mode); ui_set_workmode(mode);
     int pos = 1;
     if(mode == 1 && g_count > 1) pos = 1 + (rand() % g_count);   /* shuffle: start on a random track (not always the first) */
-    /* V2.57 favourites start from a MY_LOVE.ID, not a position (index 0 is refused) */
-    if(lt == 6 && fw_fav_play_by_love_id()){ if(pos > g_count || !ui_play_favorite(g_favs[pos-1].love_id, pos)) return; }
-    else if(!ui_play_list(lt, nm, pos)) return;
+    if(!ui_play_list(lt, nm, pos)) return;
     screen_show(SCR_NOWPLAYING);
 }
 static void play_all_cb(lv_event_t *e){    if(lv_event_get_code(e)==LV_EVENT_CLICKED) play_list_mode(0); } /* sequential */
@@ -942,19 +936,21 @@ static void library_reload(void){
         if(n<=0){ empty_scan(tr("No genres found")); return; }
         for(int i=0;i<n;i++) g_first[i]=az_code(g_lgenres.v[i].letter);
         g_count=n; fill_start(n); az_show(1);
-    } else if(g_view==VIEW_FAVS){
-        /* favourites can outnumber SONG (a favourite whose song left the library stays in MY_LOVE - and in the V2.57
-         * queue), so the song-sized buffers must grow to show every one. The rows were cleaned above. */
-        int need = mdb_favorite_count();
-        if(need < 0) need = mdb_total_song_count();
-        if(need < 0) need = mdb_song_count() > 256 ? mdb_song_count() : 256;
-        lib_ensure_fav_cap(need);
-        lib_ensure_first_cap(need);
-        int n=mdb_favorites(g_favs, g_fav_cap < g_first_cap ? g_fav_cap : g_first_cap, fw_fav_play_by_love_id());
-        if(n<=0){ empty_label(tr("No Favourites yet")); return; }
+    } else if(g_view==VIEW_FAVS){                                      /* shelves.db, library.db's songs */
+        ldb_list_free(&g_lfavs);                                       /* the heart changes it: read it every time */
+        int n = shdb_ready() ? ldb_read_favourites(&g_lfavs) : -1;
+        lib_ensure_first_cap(n);
+        if(n > g_first_cap) n = g_first_cap;
+        if(n<=0){ empty_label(tr(n < 0 ? "Can't read Favourites" : "No Favourites yet")); return; }
+        if(sd_io_begin()){                                             /* not in the library: is its file still there? */
+            struct stat fs;
+            for(int i=0;i<n;i++)
+                if(g_lfavs.v[i].count == 1 && stat(g_lfavs.v[i].path, &fs) != 0 && errno == ENOENT) g_lfavs.v[i].count = 2;
+            sd_io_end();
+        }
+        lcur_set(&g_lfavs);
         add_play_header(0);
-        for(int i=0;i<n;i++) g_first[i]=first_letter(g_favs[i].title);
-        g_count=n; fill_start(n); az_show(1);
+        g_count=n; fill_start(n);   /* newest first -> no A-Z */
     } else if(g_view==VIEW_MOSTPLAYED || g_view==VIEW_RECENT){         /* listening.db's play counts, library.db's songs */
         ldb_list_free(&g_lhist);                                       /* plays change it: read it every time */
         int n = lsdb_ready() ? ldb_read_history(g_view==VIEW_RECENT, &g_lhist) : -1;
@@ -1052,10 +1048,10 @@ static void lhint_timer_cb(lv_timer_t *t){
 void library_scroll_letter_tick(void){
     if(!g_list || !g_lhint || g_count <= 0) return;
     /* Only the views that actually fill g_first[] (alphabetical lists) get the A-Z scrubber hint.
-     * MostPlayed/Recent/History (and Menu/Playlists) never populate g_first, so reading it there
+     * MostPlayed/Recent/Favourites/History (and Menu/Playlists) never populate g_first, so reading it there
      * showed stale letters from a prior view. Allowlist, so any new view defaults to no hint. */
     if(!(g_view==VIEW_SONGS || g_view==VIEW_GROUP || g_view==VIEW_ALBUMS ||
-         g_view==VIEW_ARTISTS || g_view==VIEW_GENRES || g_view==VIEW_FAVS)) return;
+         g_view==VIEW_ARTISTS || g_view==VIEW_GENRES)) return;
     unsigned char ch = g_first[row_at_scroll()];
     if(ch && ch != g_lhint_ch){
         const lv_font_t *cur = lv_obj_get_style_text_font(g_lhint_lbl, 0);
@@ -1078,12 +1074,6 @@ static void lib_ensure_first_cap(int need){
     if(need <= g_first_cap) return;
     unsigned char *f = realloc(g_first, (size_t)need);
     if(f){ g_first = f; g_first_cap = need; }
-}
-static void lib_ensure_fav_cap(int need){
-    if(need > g_fav_cap){
-        mdb_song_t *f = realloc(g_favs, (size_t)need * sizeof *f);
-        if(f){ g_favs = f; g_fav_cap = need; }
-    }
 }
 
 void library_create(lv_obj_t *root){

@@ -452,7 +452,7 @@ int mdb_artist_class_type(void){
 }
 
 int mdb_play_pos(int id, int list_type, const char *name){
-    /* The title-code ordering the player uses for non-album lists (kept in step with MDB_FAV_ORDER). */
+    /* The title-code ordering the player uses for non-album lists. */
     static const char *ORDER_TAIL =
         "CASE WHEN IS_CUE=0 AND IS_ISO=0 THEN 1 WHEN IS_CUE=1 OR IS_ISO=1 THEN 2 END,"
         "CASE WHEN (IS_CUE=0 AND IS_ISO=0) THEN CASE WHEN TITLE IS NOT NULL THEN TITLE_CODE ELSE NAME_CODE END END,"
@@ -1212,7 +1212,7 @@ int mdb_artist_plan(const char *key, mdb_plan_t *plan){
     int m = -1;
     sqlite3 *d = db();
     sqlite3_stmt *st;
-    /* the player's artist-queue order: the same title-code ORDER BY as mdb_play_pos's ORDER_TAIL / MDB_FAV_ORDER */
+    /* the player's artist-queue order: the same title-code ORDER BY as mdb_play_pos's ORDER_TAIL */
     if(d && sqlite3_prepare_v2(d, "SELECT ID FROM SONG WHERE COALESCE(ALBUM_ARTIST,ARTIST)=?1 ORDER BY "
         "CASE WHEN IS_CUE=0 AND IS_ISO=0 THEN 1 WHEN IS_CUE=1 OR IS_ISO=1 THEN 2 END,"
         "CASE WHEN (IS_CUE=0 AND IS_ISO=0) THEN CASE WHEN TITLE IS NOT NULL THEN TITLE_CODE ELSE NAME_CODE END END,"
@@ -1370,57 +1370,6 @@ int mdb_scope_album_plan(int kind, const char *key, const char *album, mdb_plan_
     return 1;
 }
 
-/* The V2.57 favourites queue order: the same title-code ORDER BY as mdb_play_pos's ORDER_TAIL, on MY_LOVE
- * (device-checked 2026-09-27: LIST_SONG_0 rows came out in exactly this order). Keep the two in step. */
-#define MDB_FAV_ORDER \
-    "CASE WHEN IS_CUE=0 AND IS_ISO=0 THEN 1 WHEN IS_CUE=1 OR IS_ISO=1 THEN 2 END," \
-    "CASE WHEN (IS_CUE=0 AND IS_ISO=0) THEN CASE WHEN TITLE IS NOT NULL THEN TITLE_CODE ELSE NAME_CODE END END," \
-    "CASE WHEN (IS_CUE=1 OR IS_ISO=1) THEN NAME_CODE END," \
-    "CASE WHEN (IS_CUE=1 OR IS_ISO=1) THEN ID END," \
-    "CASE WHEN (IS_CUE=1 OR IS_ISO=1) THEN TRACK END"
-int mdb_favorites(mdb_song_t *out, int cap, int stock_order){
-    sqlite3 *d = db(); if(!d) return 0;
-    sqlite3_stmt *st;
-    /* MY_LOVE.ID is its OWN autoincrement, NOT a SONG.ID. Rows carry both: the SONG.ID (resolved by PATH,
-     * 0 if the song left the library) for the all-songs play, and the MY_LOVE.ID for removal and the V2.57
-     * favourites queue. With stock_order the rows follow that queue, so row N is queue position N. */
-    char sql[1400];
-    snprintf(sql, sizeof sql,
-        "SELECT IFNULL(TITLE,IFNULL(NAME,'Untitled')),IFNULL(ARTIST,''),IFNULL(ALBUM,''),"
-        /* the song row: the same track of the same file (a CUE track is PATH + TRACK), else the file's whole-file row,
-         * else its first CUE track - never an arbitrary track of a sheet. (SQLite does not let a subquery's ORDER BY
-         * see the outer row, so each choice is its own correlated WHERE.) */
-        "IFNULL(DURATION,0),COALESCE("
-        "(SELECT S.ID FROM SONG S WHERE S.PATH=MY_LOVE.PATH AND COALESCE(S.IS_CUE,0)=COALESCE(MY_LOVE.IS_CUE,0) "
-        "AND COALESCE(S.IS_ISO,0)=COALESCE(MY_LOVE.IS_ISO,0) AND COALESCE(S.TRACK,0)=COALESCE(MY_LOVE.TRACK,0) LIMIT 1),"
-        "(SELECT S.ID FROM SONG S WHERE S.PATH=MY_LOVE.PATH AND COALESCE(S.IS_CUE,0)=0 AND COALESCE(S.IS_ISO,0)=0 LIMIT 1),"
-        "(SELECT S.ID FROM SONG S WHERE S.PATH=MY_LOVE.PATH ORDER BY S.TRACK, S.ID LIMIT 1)),ID "
-        "FROM MY_LOVE WHERE lower(PATH) NOT LIKE '%%.m4b' ORDER BY %s;",   /* books have their own view */
-        stock_order ? MDB_FAV_ORDER : "1 COLLATE NOCASE");
-    if(sqlite3_prepare_v2(d, sql, -1, &st, NULL) != SQLITE_OK) return 0;
-    int n=0;
-    while(n<cap && sqlite3_step(st) == SQLITE_ROW){
-        mdb_song_t *s = &out[n++];
-        snprintf(s->title,  MDB_STR, "%s", colt(st,0));
-        snprintf(s->artist, MDB_STR, "%s", colt(st,1));
-        snprintf(s->album,  MDB_STR, "%s", colt(st,2));
-        s->album_h = album_hash(colt(st,2));
-        s->dur_ms = sqlite3_column_int(st,3);
-        s->id     = sqlite3_column_int(st,4);
-        s->love_id = sqlite3_column_int(st,5);
-        s->genre[0] = 0;
-        trim(s->title); trim(s->artist); trim(s->album);
-    }
-    sqlite3_finalize(st); return n;
-}
-
-int mdb_favorite_count(void){
-    sqlite3 *d = db(); if(!d) return -1;
-    sqlite3_stmt *st; int n = -1;
-    if(sqlite3_prepare_v2(d, "SELECT COUNT(*) FROM MY_LOVE WHERE lower(PATH) NOT LIKE '%.m4b';", -1, &st, NULL) != SQLITE_OK) return -1;
-    if(sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
-    sqlite3_finalize(st); return n;
-}
 int mdb_love_path(int love_id, char *out, int cap){
     if(cap > 0) out[0] = 0;
     sqlite3 *d = db(); if(!d || love_id <= 0 || cap <= 0) return 0;
@@ -1682,19 +1631,6 @@ int mdb_migrate_books(void){
     if(ok && sqlite3_exec(d, "COMMIT;", 0, 0, 0) == SQLITE_OK) return 1;
     sqlite3_exec(d, "ROLLBACK;", 0, 0, 0);   /* a failed COMMIT (reader BUSY) must not leave the txn open on the persistent connection */
     return 0;
-}
-
-/* Remove one favourite by its MY_LOVE.ID (mdb_favorites love_id): exact, and works for a favourite whose song
- * has left SONG. Direct DB delete - the player re-reads MY_LOVE on demand, so refreshing the list reflects it. */
-int mdb_unfavorite(int love_id){
-    sqlite3 *d = db(); if(!d) return 0;
-    sqlite3_stmt *st;
-    if(sqlite3_prepare_v2(d, "DELETE FROM MY_LOVE WHERE ID=?1;", -1, &st, NULL) != SQLITE_OK) return 0;
-    sqlite3_bind_int(st, 1, love_id);
-    int rc = sqlite3_step(st);
-    int changed = sqlite3_changes(d);
-    sqlite3_finalize(st);
-    return rc == SQLITE_DONE && changed > 0;   /* true only if a MY_LOVE row was removed */
 }
 
 /* ---- custom playlists (PLAYLIST_INFO + CUSTOM_PLAYLIST) ------------------ */

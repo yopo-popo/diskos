@@ -8,6 +8,7 @@
 #include "i18n.h"
 #include "musicdb.h"
 #include "ipc.h"
+#include "favourites.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,7 +35,7 @@ void npmenu_set(const track_state_t *st, int playing, const void *thumb_src){
     g_have = st && st->have_track;
     snprintf(g_path,   sizeof g_path,   "%s", g_have ? st->path   : "");
     g_pos_id = g_have ? st->pos_id : 0;
-    g_fav = g_have ? st->is_favorite : 0;
+    g_fav = g_have ? fav_current(st) : 0;
     fav_refresh();
 }
 
@@ -107,8 +108,11 @@ static void ctx_addpl_cb(lv_event_t *e){
 }
 static void ctx_fav_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    g_fav = !g_fav;                   /* optimistic; player confirms on next a2 */
-    ui_set_favorite(g_fav);
+    track_state_t now; ipc_get_state(&now);   /* the song playing now */
+    if(!now.have_track){ ui_toast("No track playing"); return; }
+    int on = !fav_current(&now);
+    if(!fav_current_set(&now, on)){ ui_toast("Couldn't save the favourite"); return; }
+    g_fav = on;
     fav_refresh();
     ui_toast(g_fav ? "Added to Favourites" : "Removed from Favourites");   /* match Now Playing */
 }

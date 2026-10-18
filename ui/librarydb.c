@@ -21,6 +21,7 @@
 #include <sys/statvfs.h>
 #include "librarydb.h"
 #include "listeningdb.h"   /* only its path: the history lists attach it */
+#include "shelvesdb.h"     /* only its path: the Favourites list attaches it */
 
 #define NEW_PATH LIBRARYDB_PATH ".new"
 
@@ -904,6 +905,15 @@ static const char *READ_GENRE_ALBUMS = SCOPE_ALBUMS("SELECT t.album_artist AS aa
 static const char *const READ_HISTORY[2] = {
     "SELECT " SONG_COLS " " HISTORY_FROM " ORDER BY h.play_count DESC, h.last_play_seq DESC;",
     "SELECT " SONG_COLS " " HISTORY_FROM " ORDER BY h.last_play_seq DESC;" };
+/* Favourites, newest first, from shelves.db (attached as sh). A song not in the library comes from its snapshot (its
+ * title, else its file name; no artist) with count 1. */
+static const char *READ_FAVOURITES =
+    "SELECT COALESCE(t.title, r.title, replace(r.path, rtrim(r.path, replace(r.path, '/', '')), '')),"
+    " CASE WHEN t.id IS NULL THEN NULL ELSE " TRACK_ARTISTS " END,"
+    " r.path, COALESCE(t.album_title, r.album_title), CASE WHEN t.id IS NULL THEN IFNULL(r.album_artist, '') ELSE t.album_artist END,"
+    " r.start_ms, IFNULL(t.source, 0), IFNULL(t.disc, 0), IFNULL(t.track, 0), IFNULL(t.duration_ms, 0), t.id IS NULL, NULL"
+    " FROM sh.favourites f JOIN sh.track_refs r ON r.id=f.track_ref_id"
+    " LEFT JOIN tracks t ON t.path=r.path AND t.start_ms=r.start_ms ORDER BY f.id DESC;";
 static const char *scope_cond(int kind, const char *key){
     switch(kind){
     case LDB_SCOPE_GENRE: return "t.id IN (SELECT g.track_id FROM track_file_genres g WHERE g.genre=?1)";
@@ -1139,21 +1149,23 @@ int ldb_track_start(const char *path, const char *title, long long *start_ms){
     sqlite3_close(db);
     return found;
 }
-int ldb_read_history(int by_recent, ldb_list *out){
+/* A list of library.db's songs joined with the user file at file (attached by attach_sql): 0 rows when file doesn't
+ * exist yet. */
+static int read_with(const char *file, const char *attach_sql, const char *sql, ldb_list *out){
     memset(out, 0, sizeof *out);
-    if(access(LISTENINGDB_PATH, F_OK) != 0) return errno == ENOENT ? 0 : -1;   /* no file: nothing played yet */
+    if(access(file, F_OK) != 0) return errno == ENOENT ? 0 : -1;
     long long stamp[4];
     file_stamp(stamp);
     sqlite3 *db = reader_open();
     if(!db) return -1;
     sqlite3_stmt *st = NULL;
     int n = -1;
-    if(sqlite3_prepare_v2(db, "ATTACH DATABASE ?1 AS ls;", -1, &st, NULL) == SQLITE_OK){   /* read-only, like the library */
-        sqlite3_bind_text(st, 1, LISTENINGDB_PATH, -1, SQLITE_STATIC);
+    if(sqlite3_prepare_v2(db, attach_sql, -1, &st, NULL) == SQLITE_OK){   /* read-only, like the library */
+        sqlite3_bind_text(st, 1, file, -1, SQLITE_STATIC);
         int rc = sqlite3_step(st);
         sqlite3_finalize(st);
         st = NULL;
-        if(rc == SQLITE_DONE && sqlite3_prepare_v2(db, READ_HISTORY[by_recent != 0], -1, &st, NULL) == SQLITE_OK)
+        if(rc == SQLITE_DONE && sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK)
             n = read_list(st, out);
     }
     sqlite3_finalize(st);
@@ -1161,4 +1173,10 @@ int ldb_read_history(int by_recent, ldb_list *out){
     if(n < 0){ ldb_list_free(out); return -1; }
     memcpy(out->stamp, stamp, sizeof stamp);
     return n;
+}
+int ldb_read_history(int by_recent, ldb_list *out){
+    return read_with(LISTENINGDB_PATH, "ATTACH DATABASE ?1 AS ls;", READ_HISTORY[by_recent != 0], out);
+}
+int ldb_read_favourites(ldb_list *out){
+    return read_with(SHELVESDB_PATH, "ATTACH DATABASE ?1 AS sh;", READ_FAVOURITES, out);
 }
