@@ -2572,28 +2572,13 @@ static void walk(const char *dir, int depth){
                                                 * (g_scan_err also blocks the commit, keeping the library) */
         if(e->d_name[0]=='.'){
             if(e->d_name[1]==0 || (e->d_name[1]=='.'&&e->d_name[2]==0)) continue;   /* . / .. */
-            /* Our OWN app-owned art-cache dir (SCAN_ROOT/.diskos) holds no indexed audio, so it must NOT
-             * block the prune. Without this skip EVERY scan sets g_prune_blocked and neither vanished songs
-             * NOR vanished/renamed books are ever pruned. Restrict to depth 0 (the real cache dir at the SD
-             * root): a user's ".diskos" deeper in the tree may hold indexed songs and must still block. */
-            if(depth == 0 && strcmp(e->d_name, ".diskos") == 0) continue;
-            /* The folders macOS keeps at the root of every card it mounts (search index, file-event log, trash,
-             * temporary and version stores) hold no music the library could have, so they don't block it either. */
-            static const char *const MAC_ROOT[] = { ".Spotlight-V100", ".fseventsd", ".Trashes", ".TemporaryItems",
-                                                    ".DocumentRevisions-V100" };
-            int mac = 0;
-            for(int k = 0; depth == 0 && k < (int)(sizeof MAC_ROOT / sizeof *MAC_ROOT) && !mac; k++) mac = !strcmp(e->d_name, MAC_ROOT[k]);
-            if(mac) continue;
-            /* other dotfile/dotdir: don't index it, but a skipped dot-DIRECTORY may hold songs already
-             * in the DB that this walk won't re-see, so block the vanished-row prune to avoid deleting them. */
+            /* Hidden files and folders are never scanned, and they don't block the vanished-row prune (yopo,
+             * 2026-10-18): song.db only serves the stock player until diskOS plays by itself, so a song indexed inside
+             * a hidden folder long ago may simply drop out of it. The report lists the hidden folders it skipped. */
             int wl = snprintf(path,sizeof path,"%s/%s",dir,e->d_name);
             struct stat ds;
-            /* block the prune if this skipped dot-entry is a directory (may hold indexed songs) OR we
-             * could not stat it (unknown type -> stay safe, never risk deleting its subtree's rows). */
-            if(wl<=0 || wl>=(int)sizeof path || lstat(path,&ds)!=0 || S_ISDIR(ds.st_mode)){
-                g_prune_blocked = 1;
-                rep_add(REP_HIDDEN, "  %s/", wl > 0 && wl < (int)sizeof path ? rel_path(path) : e->d_name);
-            }
+            if(wl > 0 && wl < (int)sizeof path && lstat(path,&ds) == 0 && S_ISDIR(ds.st_mode))
+                rep_add(REP_HIDDEN, "  %s/", rel_path(path));
             continue;
         }
         int w = snprintf(path,sizeof path,"%s/%s",dir,e->d_name);
@@ -2715,7 +2700,7 @@ static void report_write(long secs, int published){
     report_list(f, REP_SPLIT, "Artists split into several names (on ';' or \"feat.\")");
     report_list(f, REP_NOMEDIA, "Folders left out of the library (.nomedia)");
     report_list(f, REP_KEPT, "Couldn't read this scan (their songs from the previous scan stay)");
-    report_list(f, REP_HIDDEN, "Hidden folders not scanned (while one is on the card, songs removed from it stay in song.db)");
+    report_list(f, REP_HIDDEN, "Hidden folders not scanned (their songs are not in the library)");
     int bad = fflush(f) != 0 || ferror(f);
     if(!bad) fsync(fileno(f));
     if(fclose(f) != 0) bad = 1;
