@@ -185,26 +185,6 @@ static void np_text_rows(const np_parts_t *p, int title_y, int artist_y, int alb
     lv_obj_set_y(p->artist, artist_y);
     lv_obj_set_y(p->album, album_y);
 }
-/* Keep saver song blocks below the rendered date, including a larger user font. */
-static int saver_song_y(lv_obj_t *date, int base){
-    if(date && !lv_obj_has_flag(date, LV_OBJ_FLAG_HIDDEN)){
-        lv_obj_update_layout(date);
-        int below = lv_obj_get_y(date) + lv_obj_get_height(date) + 8;
-        if(below > base) base = below;
-    }
-    return base;
-}
-/* A rectangular song block needs room at its lower corners on the round glass. */
-static int saver_song_width(lv_obj_t *bottom_row, int width){
-    lv_obj_update_layout(bottom_row);
-    int bottom = lv_obj_get_y(bottom_row) + lv_obj_get_height(bottom_row);
-    int dy = bottom - 180;
-    if((width / 2) * (width / 2) + dy * dy > 176 * 176){
-        int fit = ui_round_width(bottom, 10);
-        if(fit < width) width = fit;
-    }
-    return width;
-}
 /* the unique themes keep their own backgrounds: no blurred cover behind Home and Now Playing */
 static void own_backgrounds(void){ home_set_backdrop_enabled(0); ui_np_backdrop_enabled(0); }
 
@@ -387,7 +367,6 @@ static void hifi_home(const home_parts_t *p){
     lv_obj_set_pos(p->date, 0, 162);
     lv_obj_set_style_text_letter_space(p->date, 4, 0);
     lv_obj_set_style_text_color(p->date, TC(TEXT_SECONDARY), 0);
-    lv_obj_set_pos(p->weather, 0, 186);
     /* Library + Search side by side on plates */
     /* Library + Search share the now-playing plate's edges (60..300) */
     lv_obj_set_pos(p->library, 60, 220); lv_obj_set_size(p->library, 184, 40);
@@ -456,46 +435,6 @@ static void hifi_qs_tile(lv_obj_t *c, lv_obj_t *g, lv_obj_t *cap, int on, int to
     if(cap){ lv_obj_set_style_text_color(cap, on ? TC(ACCENT_PRIMARY) : TC(TEXT_MUTED), 0);
              lv_obj_set_style_text_letter_space(cap, 1, 0); }
 }
-static void hifi_saver(const saver_parts_t *p){
-    if(p->clock) lv_obj_set_style_text_color(p->clock, TC(ACCENT_PRIMARY), 0);
-    if(p->date){ lv_obj_set_style_text_letter_space(p->date, 3, 0); lv_obj_set_style_text_color(p->date, TC(TEXT_SECONDARY), 0); }
-    if(p->track && p->artist){
-        lv_obj_t *well = lv_obj_get_parent(p->track);
-        if(well == p->root){
-            well = lv_obj_create(p->root);
-            lv_obj_remove_style_all(well);
-            kit_keep(well);
-            lv_obj_clear_flag(well, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_set_size(well, 204, 49);
-            lv_obj_set_style_radius(well, 6, 0);
-            lv_obj_set_style_bg_color(well, TC(SURFACE), 0);
-            lv_obj_set_style_bg_opa(well, LV_OPA_COVER, 0);
-            lv_obj_set_style_border_width(well, 1, 0);
-            lv_obj_set_style_border_color(well, TC(BORDER_STRONG), 0);
-            lv_obj_set_style_border_opa(well, LV_OPA_COVER, 0);
-            lv_obj_set_parent(p->track, well);
-            lv_obj_set_parent(p->artist, well);
-        }
-        int well_y = saver_song_y(p->date, p->style == 4 ? 272 : 278);
-        /* Keep the full text width; shorten the well at the lower arc instead. */
-        int well_h = 49;
-        while(well_h > 1){
-            int dy = well_y + well_h - 180;
-            if(102 * 102 + dy * dy <= 176 * 176) break;
-            well_h--;
-        }
-        lv_obj_set_size(well, 204, well_h);
-        lv_obj_align(well, LV_ALIGN_TOP_MID, 0, well_y);
-        lv_obj_set_width(p->track, 192);
-        lv_obj_set_width(p->artist, 192);
-        lv_obj_set_style_text_font(p->track, TF(USER_16), 0);
-        lv_obj_set_style_text_font(p->artist, TF(USER_14), 0);
-        lv_obj_set_style_text_color(p->track, TC(ACCENT_PRIMARY), 0);
-        lv_obj_set_style_text_color(p->artist, TC(TEXT_SECONDARY), 0);
-        lv_obj_align(p->track, LV_ALIGN_TOP_MID, 0, well_h < 45 ? 3 : 5);
-        lv_obj_align(p->artist, LV_ALIGN_TOP_MID, 0, well_h < 45 ? 24 : 26);
-    }
-}
 static void hifi_empty(kit_empty_kind_t kind, lv_obj_t *message){
     (void)kind;
     if(!message) return;
@@ -519,9 +458,8 @@ static void hifi_cover(lv_obj_t *cover, lv_obj_t *note, int show, int loading){
 }
 const theme_kit_t theme_kit_hifi = { .id = "hi-fi", .header = kit_edge_header, .style = hifi_style, .home = hifi_home,
                                      .home_clock = hifi_clock,
-                                     .nowplaying = hifi_np, .qs_tile = hifi_qs_tile, .saver = hifi_saver,
-                                     .empty_state = hifi_empty, .np_cover_state = hifi_cover,
-                                     .saver_mer_apart = 1 };   /* the segment face draws "PM" as "PN" */
+                                     .nowplaying = hifi_np, .qs_tile = hifi_qs_tile,
+                                     .empty_state = hifi_empty, .np_cover_state = hifi_cover };
 
 /* ================================================================ terminal
  * A command line: one monospace face, square corners, ~/path titles, rows that highlight with a cursor bar, bracketed
@@ -774,8 +712,6 @@ static void term_home(const home_parts_t *p){
     lv_obj_set_style_text_align(p->date, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_pos(p->date, 62, 164); lv_obj_set_width(p->date, 240);
     lv_obj_set_style_text_color(p->date, TC(TEXT_PRIMARY), 0);
-    lv_obj_set_style_text_align(p->weather, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_set_pos(p->weather, 62, 182); lv_obj_set_width(p->weather, 240);
     term_text(p->root, "$ now", TC(TEXT_MUTED), 62, 208);
     /* $ now: the now-playing line, with its play key. Everything hangs from x 62 and ends at 298 (mirrored) */
     lv_obj_set_pos(p->np, 54, 224); lv_obj_set_size(p->np, 252, 44);
@@ -922,23 +858,6 @@ static void term_qs_tile(lv_obj_t *c, lv_obj_t *g, lv_obj_t *cap, int on, int to
         lv_obj_set_style_text_color(cap, on ? TC(ACCENT_PRIMARY) : TC(TEXT_PRIMARY), 0);
     }
 }
-static void term_saver(const saver_parts_t *p){
-    if(p->date) lv_obj_set_style_text_color(p->date, TC(TEXT_SECONDARY), 0);
-    if(p->track && p->artist){
-        int y = saver_song_y(p->date, p->style == 4 ? 274 : 280);
-        lv_obj_set_width(p->track, 230); lv_obj_set_width(p->artist, 230);
-        lv_obj_set_style_text_font(p->track, TF(USER_16), 0);
-        lv_obj_set_style_text_font(p->artist, TF(USER_14), 0);
-        lv_obj_set_style_text_color(p->track, TC(ACCENT_PRIMARY), 0);
-        lv_obj_set_style_text_color(p->artist, TC(TEXT_MUTED), 0);
-        lv_obj_set_style_text_align(p->track, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_align(p->artist, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_align(p->track, LV_ALIGN_TOP_MID, 0, y);
-        lv_obj_align(p->artist, LV_ALIGN_TOP_MID, 0, y + 22);
-        int width = saver_song_width(p->artist, 230);
-        lv_obj_set_width(p->track, width); lv_obj_set_width(p->artist, width);
-    }
-}
 #define TERM_PROMPT LV_OBJ_FLAG_USER_1
 static void term_prompt_deleted(lv_event_t *e){ free(lv_obj_get_user_data(lv_event_get_target(e))); }
 static void term_prompt_draw(lv_event_t *e){
@@ -979,7 +898,7 @@ static void term_empty(kit_empty_kind_t kind, lv_obj_t *message){
 const theme_kit_t theme_kit_term = { .id = "terminal", .header = term_header, .style = term_style, .home = term_home,
                                      .home_clock = term_clock,
                                      .nowplaying = term_np, .quicksettings = term_qs, .qs_tile = term_qs_tile,
-                                     .saver = term_saver, .empty_state = term_empty, .row_value = term_row_value,
+                                     .empty_state = term_empty, .row_value = term_row_value,
                                      .title = term_title, .np_state = term_np_state, .back_text = "<" };
 
 /* ================================================================ blueprint
@@ -1330,8 +1249,7 @@ static void blue_home(const home_parts_t *p){
     lv_obj_set_pos(p->date, 0, 160);
     lv_obj_set_style_text_letter_space(p->date, 2, 0);
     lv_obj_set_style_text_color(p->date, TC(ACCENT_PRIMARY), 0);
-    lv_obj_set_pos(p->weather, 0, 180);
-    /* Library and Search as outlined callouts (clear of the weather line's touch area). Every edge on a grid line:
+    /* Library and Search as outlined callouts. Every edge on a grid line:
      * Library 72..228, Search 240..288 (the row centred), y 216..256; now playing 60..300, y 264..312 */
     lv_obj_set_pos(p->library, 72, 216); lv_obj_set_size(p->library, 156, 40);
     blue_outline(p->library, TC(ACCENT_PRIMARY));
@@ -1495,45 +1413,12 @@ static void blue_qs_tile(lv_obj_t *c, lv_obj_t *g, lv_obj_t *cap, int on, int to
         lv_obj_set_style_text_color(cap, on ? TC(DECOR_1) : TC(TEXT_SECONDARY), 0);
     }
 }
-static void blue_saver(const saver_parts_t *p){
-    static lv_obj_t *bar[9];
-    if(p->date){ lv_obj_set_style_text_letter_space(p->date, 2, 0); lv_obj_set_style_text_color(p->date, TC(ACCENT_PRIMARY), 0); }
-    if(!bar[0]){
-        for(int i = 0; i < 8; i++) bar[i] = blue_line(p->root, 0, 0, 16, 8,
-                                                       i % 2 ? TC(CANVAS) : TC(ACCENT_PRIMARY));
-        bar[8] = blue_line(p->root, 0, 0, 128, 1, TC(ACCENT_PRIMARY));
-    }
-    int bottom = 0;
-    lv_obj_t *above[] = {p->date, p->weather};
-    for(int i = 0; i < 2; i++) if(above[i] && !lv_obj_has_flag(above[i], LV_OBJ_FLAG_HIDDEN)){
-        lv_obj_update_layout(above[i]);
-        int edge = lv_obj_get_y(above[i]) + lv_obj_get_height(above[i]);
-        if(edge > bottom) bottom = edge;
-    }
-    int y = bottom + 8;
-    if(y < (p->style == 1 ? 282 : 252)) y = p->style == 1 ? 282 : 252;
-    if(p->track && p->artist){
-        lv_obj_set_style_text_font(p->track, TF(UI_14), 0);
-        lv_obj_set_style_text_font(p->artist, TF(UI_12), 0);
-        lv_obj_set_style_text_color(p->track, TC(ACCENT_PRIMARY), 0);
-        lv_obj_set_style_text_color(p->artist, TC(TEXT_MUTED), 0);
-        lv_obj_set_style_text_align(p->track, LV_TEXT_ALIGN_LEFT, 0);
-        lv_obj_set_style_text_align(p->artist, LV_TEXT_ALIGN_LEFT, 0);
-        lv_obj_set_width(p->track, 160); lv_obj_set_width(p->artist, 160);
-        lv_obj_align(p->track, LV_ALIGN_TOP_LEFT, 100, y);
-        int ay = y + lv_font_get_line_height(TF(UI_14)) + 3;
-        lv_obj_align(p->artist, LV_ALIGN_TOP_LEFT, 100, ay);
-        y = ay + lv_font_get_line_height(TF(UI_12)) + 9;
-    }
-    for(int i = 0; i < 8; i++) lv_obj_set_pos(bar[i], 116 + 16 * i, y);
-    lv_obj_set_pos(bar[8], 116, y + 8);
-}
 const theme_kit_t theme_kit_blue = { .id = "blueprint", .header = kit_edge_header, .style = blue_style, .home = blue_home,
                                      .title_fit = blue_title_fit,
                                      .home_clock = blue_clock,
                                      .nowplaying = blue_np, .np_cover_state = blue_cover, .empty_state = blue_empty,
                                      .row_decor = blue_row_decor, .title = blue_title,
-                                     .qs_tile = blue_qs_tile, .saver = blue_saver,
+                                     .qs_tile = blue_qs_tile,
                                      .pass_end = blue_pass_end };
 
 /* ================================================================ stone
@@ -1782,7 +1667,6 @@ static void stone_home(const home_parts_t *p){
     stone_clock(lv_label_get_text(p->clock));
     lv_obj_set_pos(p->date, 0, 168);
     lv_obj_set_style_text_color(p->date, TC(TEXT_SECONDARY), 0);
-    lv_obj_set_pos(p->weather, 0, 188);
     /* Library + 8 + Search share the now-playing pill's edges (62..298) */
     lv_obj_set_pos(p->library, 62, 222); lv_obj_set_size(p->library, 186, 42);
     stone_pill(p->library, TC(SURFACE));
@@ -1831,76 +1715,8 @@ static void stone_qs_tile(lv_obj_t *c, lv_obj_t *g, lv_obj_t *cap, int on, int t
     if(g) lv_obj_set_style_text_color(g, on ? TC(ON_ACCENT) : TC(TEXT_PRIMARY), 0);
     if(cap) lv_obj_set_style_text_color(cap, TC(TEXT_SECONDARY), 0);
 }
-/* the screensaver keeps Home's two-pill clock (in every style that shows a clock); the date and weather sit under it */
-static lv_obj_t *g_stone_shh, *g_stone_smm, *g_stone_smer;
-static lv_obj_t *g_stone_song_track, *g_stone_song_artist, *g_stone_song_pebble;
-static void stone_song_draw(lv_event_t *e){
-    if(!g_stone_song_track || !g_stone_song_artist ||
-       lv_obj_has_flag(g_stone_song_track, LV_OBJ_FLAG_HIDDEN) ||
-       lv_obj_has_flag(g_stone_song_artist, LV_OBJ_FLAG_HIDDEN)) return;
-    lv_area_t a; lv_obj_get_coords(lv_event_get_target(e), &a);
-    stone_blob(lv_event_get_layer(e), &a, TC(ACCENT_PRIMARY), LV_OPA_COVER);
-}
-static void stone_song_layout(const saver_parts_t *p){
-    if(!p->track || !p->artist) return;
-    int y = saver_song_y(p->date, p->style == 1 ? 278 : 270);
-    if(p->weather && !lv_obj_has_flag(p->weather, LV_OBJ_FLAG_HIDDEN)){
-        lv_obj_update_layout(p->weather);
-        int below = lv_obj_get_y(p->weather) + lv_obj_get_height(p->weather) + 8;
-        if(below > y) y = below;
-    }
-    lv_obj_align(p->track, LV_ALIGN_TOP_MID, 0, y);
-    lv_obj_update_layout(p->track);
-    lv_obj_align(p->artist, LV_ALIGN_TOP_MID, 0, y + lv_obj_get_height(p->track) + 2);
-    int width = saver_song_width(p->artist, 218);
-    int pebble_fit = ui_round_width(lv_obj_get_y(p->artist) + lv_obj_get_height(p->artist) + 7, 10);
-    if(pebble_fit < width) width = pebble_fit;
-    if(width < 120) width = 120;
-    lv_obj_set_width(p->track, width - 24);
-    lv_obj_set_width(p->artist, width - 24);
-    lv_obj_set_style_text_color(p->track, TC(ON_ACCENT), 0);
-    lv_obj_set_style_text_color(p->artist, TC(ON_ACCENT), 0);
-    g_stone_song_track = p->track; g_stone_song_artist = p->artist;
-    if(!g_stone_song_pebble){
-        g_stone_song_pebble = lv_obj_create(p->root);
-        lv_obj_remove_style_all(g_stone_song_pebble);
-        lv_obj_clear_flag(g_stone_song_pebble, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_event_cb(g_stone_song_pebble, stone_song_draw, LV_EVENT_DRAW_MAIN_BEGIN, NULL);
-        lv_obj_move_to_index(g_stone_song_pebble, lv_obj_get_index(p->track));
-    }
-    lv_obj_set_size(g_stone_song_pebble, width, lv_obj_get_y(p->artist) + lv_obj_get_height(p->artist) - y + 14);
-    lv_obj_align(g_stone_song_pebble, LV_ALIGN_TOP_MID, 0, y - 7);
-}
-static void stone_saver_clock(const char *t){
-    split_clock(t, g_stone_shh, g_stone_smm);
-    char hm[16], mer[8]; clock_parts(t, hm, sizeof hm, mer, sizeof mer);
-    char low[8]; if(g_stone_smer) lv_label_set_text(g_stone_smer, theme_lower(low, sizeof low, mer));
-}
-static void stone_saver(const saver_parts_t *p){
-    int shown = p->style != 1 && p->style != 4;               /* analog and vinyl have no digital clock */
-    if(!g_stone_shh && shown){
-        g_stone_shh = stone_clock_pill(p->root, TC(SURFACE_RAISED), TC(TEXT_PRIMARY), 62, 0);
-        g_stone_smm = stone_clock_pill(p->root, TC(ACCENT_PRIMARY), TC(ON_ACCENT), 168, 0);
-        g_stone_smer = mer_label(p->root, TF(UI_16), TC(TEXT_SECONDARY));
-        stone_saver_clock(lv_label_get_text(p->clock));
-    }
-    if(!g_stone_shh){ stone_song_layout(p); return; }
-    lv_obj_t *ph = lv_obj_get_parent(g_stone_shh), *pm = lv_obj_get_parent(g_stone_smm);
-    if(!shown){ lv_obj_add_flag(ph, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(pm, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(g_stone_smer, LV_OBJ_FLAG_HIDDEN); stone_song_layout(p); return; }
-    int y = p->style == 2 ? 112 : 78;                         /* Minimal: lower, nothing under the date */
-    lv_obj_remove_flag(ph, LV_OBJ_FLAG_HIDDEN); lv_obj_remove_flag(pm, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(g_stone_smer, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_y(ph, y); lv_obj_set_y(pm, y + 28);            /* Home's step between the pills */
-    lv_obj_align_to(g_stone_smer, pm, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -6);
-    lv_obj_add_flag(p->clock, LV_OBJ_FLAG_HIDDEN);
-    if(p->date){ lv_obj_align(p->date, LV_ALIGN_TOP_MID, 0, y + 28 + 76 + 10); lv_obj_update_layout(p->date); }
-    if(p->weather && p->date) lv_obj_align(p->weather, LV_ALIGN_TOP_MID, 0, lv_obj_get_y(p->date) + 26);
-    stone_song_layout(p);
-}
 const theme_kit_t theme_kit_stone = { .id = "stone", .style = stone_style, .home = stone_home, .home_clock = stone_clock,
-                                      .nowplaying = stone_np, .qs_tile = stone_qs_tile, .saver = stone_saver,
-                                      .saver_clock = stone_saver_clock, .np_progress = stone_progress,
+                                      .nowplaying = stone_np, .qs_tile = stone_qs_tile, .np_progress = stone_progress,
                                       .empty_state = stone_empty, .np_cover_state = stone_cover };
 
 /* ================================================================ bauhaus
@@ -2065,16 +1881,15 @@ static void bauh_style(lv_obj_t *o, kit_role_t r){
     }
 }
 static lv_obj_t *g_bauh_hh, *g_bauh_mm, *g_bauh_mer;
-static lv_obj_t *g_bauh_date, *g_bauh_wx;   /* the right column under the square */
+static lv_obj_t *g_bauh_date;   /* the right column under the square */
 static void bauh_clock(const char *t){
     split_clock(t, g_bauh_hh, g_bauh_mm);
     char hm[16], mer[8]; clock_parts(t, hm, sizeof hm, mer, sizeof mer);
     if(g_bauh_mer) lv_label_set_text(g_bauh_mer, mer);
-    /* 12-hour: PM takes the top of the column (right under the square, which ends at 195), and the date and weather step
-     * down to clear it (they collided by 7 px); the weather line keeps its full 20 px (a 28 px tap target with its reach) */
+    /* 12-hour: PM takes the top of the column (right under the square, which ends at 195), and the date steps
+     * down to clear it (they collided by 7 px) */
     if(g_bauh_mer) lv_obj_set_y(g_bauh_mer, mer[0] ? 196 : 200);
     if(g_bauh_date) lv_obj_set_y(g_bauh_date, mer[0] ? 222 : 218);
-    if(g_bauh_wx) lv_obj_set_y(g_bauh_wx, mer[0] ? 240 : 236);
 }
 static lv_obj_t *bauh_numeral(lv_obj_t *root, lv_color_t c, int x, int y){
     lv_obj_t *l = lv_label_create(root);
@@ -2118,13 +1933,8 @@ static void bauh_home(const home_parts_t *p){
     home_search_glyph(p->search, TC(ON_ACCENT));
     lv_obj_set_style_text_align(p->date, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_pos(p->date, 197, 218); lv_obj_set_width(p->date, 100);         /* right edge = the square's (297) */
-    g_bauh_date = p->date; g_bauh_wx = p->weather;                               /* bauh_clock moves them in 12-hour */
+    g_bauh_date = p->date;                                                       /* bauh_clock moves it in 12-hour */
     lv_obj_set_style_text_font(p->date, TF(UI_16), 0);
-    lv_obj_set_style_text_align(p->weather, LV_TEXT_ALIGN_RIGHT, 0);
-    /* the column's own 100 px: wider would run under the minutes (a round "00" reaches x ~193 at these rows). A forecast
-     * too long for it drops its icon first (home_set_weather), then ends in "..." */
-    lv_obj_set_pos(p->weather, 197, 236); lv_obj_set_size(p->weather, 100, 20);
-    lv_obj_set_ext_click_area(p->weather, 4);                                   /* tight column: no reach into the band */
     bauh_clock(lv_label_get_text(p->clock));                                     /* 12-hour: step the column clear of PM */
     /* now playing: an ink band with a red play disc */
     lv_obj_set_pos(p->np, 54, 262); lv_obj_set_size(p->np, 252, 46);   /* its corners inside the round glass */
@@ -2268,39 +2078,10 @@ static void bauh_qs_tile(lv_obj_t *c, lv_obj_t *g, lv_obj_t *cap, int on, int to
     if(cap){ char up[32]; lv_label_set_text(cap, theme_upper(up, sizeof up, lv_label_get_text(cap)));
              lv_obj_set_style_text_color(cap, on ? TC(ACCENT_PRIMARY) : TC(TEXT_SECONDARY), 0); }
 }
-static void bauh_saver(const saver_parts_t *p){
-    if(p->clock) lv_obj_set_style_text_color(p->clock, TC(ACCENT_PRIMARY), 0);
-    if(!p->track || !p->artist) return;
-    int panel_y = 270;
-    if(p->date && !lv_obj_has_flag(p->date, LV_OBJ_FLAG_HIDDEN)){
-        lv_obj_update_layout(p->date);
-        int below_date = lv_obj_get_y(p->date) + lv_obj_get_height(p->date) + 3;
-        if(below_date > panel_y) panel_y = below_date;
-    }
-    lv_obj_t *panel = lv_obj_get_parent(p->track);
-    if(panel == p->root){
-        lv_obj_t *bar = bauh_shape(p->root, 24, 95, 26, 135, 1, TC(DECOR_1));
-        lv_obj_move_background(bar);
-        panel = bauh_shape(p->root, 84, panel_y, 192, 52, 1, TC(DECOR_2));
-        bauh_shape(panel, 0, 0, 40, 5, 1, TC(DECOR_1));
-        bauh_shape(panel, 180, 0, 12, 12, 0, TC(ACCENT_PRIMARY));
-        lv_obj_set_parent(p->track, panel); lv_obj_set_parent(p->artist, panel);
-    }
-    lv_obj_set_pos(panel, 84, panel_y);
-    lv_obj_set_width(p->track, 176); lv_obj_set_width(p->artist, 176);
-    lv_obj_set_style_text_font(p->track, TF(USER_16), 0);
-    lv_obj_set_style_text_font(p->artist, TF(USER_14), 0);
-    lv_obj_set_style_text_color(p->track, TC(DOT_GRID), 0);
-    lv_obj_set_style_text_color(p->artist, TC(DOT_GRID), 0);
-    lv_obj_align(p->track, LV_ALIGN_TOP_MID, 0, 8);
-    lv_obj_align(p->artist, LV_ALIGN_TOP_MID, 0, 29);
-    lv_obj_move_foreground(panel);
-}
 const theme_kit_t theme_kit_bauh = { .id = "bauhaus", .header = bauh_header, .style = bauh_style, .home = bauh_home,
                                      .home_clock = bauh_clock, .nowplaying = bauh_np, .qs_tile = bauh_qs_tile,
-                                     .saver = bauh_saver, .title = bauh_title, .row_decor = bauh_row_decor,
-                                     .np_cover_state = bauh_cover, .empty_state = bauh_empty,
-                                     .saver_mer_apart = 2 };   /* the saver's PM beside the numerals, as on Home */
+                                     .title = bauh_title, .row_decor = bauh_row_decor,
+                                     .np_cover_state = bauh_cover, .empty_state = bauh_empty };
 
 /* ================================================================ zine
  * A photocopied music zine: paper grain, typewriter text, glitch-face titles in magenta, a yellow highlighter
@@ -2577,7 +2358,6 @@ static void zine_home(const home_parts_t *p){
     lv_obj_set_style_pad_ver(p->date, 2, 0);
     lv_obj_set_width(p->date, LV_SIZE_CONTENT);
     lv_obj_align(p->date, LV_ALIGN_TOP_MID, -6, 146);
-    lv_obj_set_pos(p->weather, 0, 176);
     lv_obj_set_pos(p->library, 66, 210); lv_obj_set_size(p->library, 150, 42);
     zine_scrap(p->library, zine_paper());
     home_library_fit(p->library);
@@ -2736,64 +2516,9 @@ static void zine_cover(lv_obj_t *cover, lv_obj_t *note, int show, int loading){
     lv_obj_remove_event_cb(cover, zine_cover_draw);
     lv_obj_add_event_cb(cover, zine_cover_draw, LV_EVENT_DRAW_MAIN_BEGIN, note);
 }
-static lv_obj_t *g_zine_song_tape;
-void kit_zine_song_visibility(int show){
-    if(g_zine_song_tape){
-        if(show) lv_obj_remove_flag(g_zine_song_tape, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_add_flag(g_zine_song_tape, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-static void zine_song_layout(const saver_parts_t *p){
-    if(!p->track || !p->artist) return;
-    int y = saver_song_y(p->date, p->style == 1 ? 278 : 270);
-    if(p->weather && !lv_obj_has_flag(p->weather, LV_OBJ_FLAG_HIDDEN)){
-        lv_obj_update_layout(p->weather);
-        int below = lv_obj_get_y(p->weather) + lv_obj_get_height(p->weather) + 8;
-        if(below > y) y = below;
-    }
-    y += 2; /* the tape starts two pixels above the song's text */
-    /* one line each, so a long title ends in "..." on the tape instead of wrapping past it */
-    int track_h = lv_font_get_line_height(lv_obj_get_style_text_font(p->track, 0));
-    int artist_h = lv_font_get_line_height(lv_obj_get_style_text_font(p->artist, 0));
-    lv_obj_set_height(p->track, track_h);
-    lv_obj_set_height(p->artist, artist_h);
-    int bottom = y + track_h + 2 + artist_h + 8;
-    int dy = bottom - 180;
-    int width = dy < 170 ? 2 * (int)sqrtf((float)(170*170 - dy*dy)) - 2 : 0;
-    if(width > 204) width = 204;
-    if(width < 70) width = 70;
-    lv_obj_set_width(p->track, width - 20);
-    lv_obj_set_width(p->artist, width - 20);
-    lv_obj_align(p->track, LV_ALIGN_TOP_MID, 0, y);
-    lv_obj_align(p->artist, LV_ALIGN_TOP_MID, 0, y + track_h + 2);
-    lv_obj_set_style_text_color(p->track, TC(DECOR_2), 0);
-    lv_obj_set_style_text_color(p->artist, TC(DECOR_2), 0);
-    if(!g_zine_song_tape){
-        g_zine_song_tape = lv_obj_create(p->root);
-        lv_obj_remove_style_all(g_zine_song_tape);
-        lv_obj_clear_flag(g_zine_song_tape, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_style_bg_color(g_zine_song_tape, TC(DECOR_1), 0);
-        lv_obj_set_style_bg_opa(g_zine_song_tape, LV_OPA_COVER, 0);
-        kit_keep(g_zine_song_tape);
-        lv_obj_move_to_index(g_zine_song_tape, lv_obj_get_index(p->track));
-    }
-    lv_obj_set_size(g_zine_song_tape, width, bottom - y + 1);
-    lv_obj_align(g_zine_song_tape, LV_ALIGN_TOP_MID, 0, y - 2);
-}
-static void zine_saver(const saver_parts_t *p){
-    if(p->date){
-        lv_obj_set_style_bg_color(p->date, TC(DECOR_1), 0);
-        lv_obj_set_style_bg_opa(p->date, LV_OPA_COVER, 0);
-        lv_obj_set_style_text_color(p->date, TC(DECOR_2), 0);
-        lv_obj_set_style_pad_hor(p->date, 12, 0);
-        lv_obj_set_width(p->date, LV_SIZE_CONTENT);              /* the stroke hugs the words, as on Home */
-    }
-    if(p->clock) lv_obj_set_style_text_color(p->clock, TC(ACCENT_PRIMARY), 0);
-    zine_song_layout(p);
-}
 const theme_kit_t theme_kit_zine = { .id = "zine", .header = kit_edge_header, .style = zine_style, .home = zine_home,
                                      .home_clock = zine_clock, .nowplaying = zine_np, .qs_tile = zine_qs_tile,
-                                     .saver = zine_saver, .empty_state = zine_empty, .np_cover_state = zine_cover,
+                                     .empty_state = zine_empty, .np_cover_state = zine_cover,
                                      .row_decor = zine_row_decor, .title = zine_title, .back_text = "<<" };
 
 /* ================================================================ something
@@ -2901,32 +2626,5 @@ static void some_cover(lv_obj_t *cover, lv_obj_t *note, int show, int loading){
     else { lv_obj_add_flag(pattern, LV_OBJ_FLAG_HIDDEN); if(show) lv_obj_remove_flag(note, LV_OBJ_FLAG_HIDDEN); }
 }
 static void some_np(const np_parts_t *p){ np_sides_on_cover(p, 0); }   /* times stay: the play circle ends at 316 */
-/* the screensaver keeps Home's block-matrix clock (in every style that shows a clock) */
-static int g_some_smc = -1;
-static void some_saver_clock(const char *t){ if(g_some_smc == 0) mclock_set(1, t); }
-static void some_saver(const saver_parts_t *p){
-    int song_y = saver_song_y(p->date, p->style == 1 ? 278 : 260);
-    lv_obj_set_style_text_font(p->track, TF(DATE), 0);
-    lv_obj_set_style_text_font(p->artist, TF(UI_16), 0);
-    lv_obj_set_style_text_color(p->track, TC(TEXT_PRIMARY), 0);
-    lv_obj_set_style_text_color(p->artist, TC(TEXT_MUTED), 0);
-    lv_obj_set_width(p->track, 230); lv_obj_set_width(p->artist, 230);
-    lv_obj_align(p->track, LV_ALIGN_TOP_MID, 0, song_y);
-    lv_obj_align(p->artist, LV_ALIGN_TOP_MID, 0, song_y + 25);
-    if(p->style == 1){
-        int width = saver_song_width(p->artist, 230);
-        lv_obj_set_width(p->track, width); lv_obj_set_width(p->artist, width);
-    }
-    int shown = p->style != 1 && p->style != 4;               /* analog and vinyl have no digital clock */
-    if(g_some_smc < 0 && shown){ g_some_smc = mclock_new(1, p->root, 0); some_saver_clock(lv_label_get_text(p->clock)); }
-    if(g_some_smc != 0) return;
-    int y = p->style == 2 ? 120 : 92;                         /* Minimal: lower, nothing under the date */
-    mclock_place(1, y, shown);
-    if(!shown) return;
-    lv_obj_add_flag(p->clock, LV_OBJ_FLAG_HIDDEN);
-    if(p->date){ lv_obj_align(p->date, LV_ALIGN_TOP_MID, 0, y + 63 + 12); lv_obj_update_layout(p->date); }
-    if(p->weather && p->date) lv_obj_align(p->weather, LV_ALIGN_TOP_MID, 0, lv_obj_get_y(p->date) + 28);
-}
 const theme_kit_t theme_kit_something = { .id = "something", .style = some_style, .nowplaying = some_np,
-                                          .empty_state = some_empty, .np_cover_state = some_cover,
-                                          .saver = some_saver, .saver_clock = some_saver_clock };
+                                          .empty_state = some_empty, .np_cover_state = some_cover };

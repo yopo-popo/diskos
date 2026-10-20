@@ -27,6 +27,7 @@ void anim_press(lv_obj_t *o);  /* quick 100%->94%->100% tactile feedback */
 void anim_panel_shadow(lv_obj_t *root);
 /* iOS-style ease-in-out page slide (gentle start + stop). */
 void anim_page_slide(lv_obj_t *o, int from, int to, uint32_t ms, lv_anim_completed_cb_t done);
+void anim_page_slide_y(lv_obj_t *o, int from, int to, uint32_t ms, lv_anim_completed_cb_t done);
 /* Fade the depth scrim in (over the covered screen) on push / out on back. */
 void anim_scrim_fade(lv_obj_t *scrim, int in, uint32_t ms);
 /* Zoom (scale+fade) transition - no moving edge, no seam. in=1 appear, in=0 recede. */

@@ -105,6 +105,10 @@ static void start_expo(lv_obj_t *o, lv_anim_exec_xcb_t xcb, int from, int to,
 void anim_page_slide(lv_obj_t *o, int from, int to, uint32_t ms, lv_anim_completed_cb_t done){
     start_expo(o, exec_x, from, to, ms, done);
 }
+/* The same curve vertically: switching between the Library / Now Playing / Queue sections. */
+void anim_page_slide_y(lv_obj_t *o, int from, int to, uint32_t ms, lv_anim_completed_cb_t done){
+    start_expo(o, exec_y, from, to, ms, done);
+}
 
 /* Depth scrim: a reusable full-screen translucent-black overlay that dims the screen BENEATH the
  * incoming panel during a push (0 -> ~14%) and lifts on back, so the covered screen reads as

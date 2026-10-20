@@ -87,7 +87,6 @@ void apps_reload(void){
     if(!g_list) return;
     lv_obj_clean(g_list);
     scan_apps();
-    /* Weather is not a tile here anymore - it opens by tapping the home weather glance (glance->detail). */
     /* built-in: Last.fm scrobbling (the FA lastfm brand glyph) */
     make_tile(LFM_ICON, TF(ICON_28), "Last.fm", lastfm_row_cb, NULL);
     /* homebrew apps from /usr/data/apps */

@@ -3,7 +3,7 @@ are licensed under the SIL Open Font License, Version 1.1 (copied below):
 
   * Font Awesome 4.7.0 - Copyright (c) Dave Gandy (https://fontawesome.io),
     with Reserved Font Name "FontAwesome". diskOS's own icon fonts
-    (font_icons_20.c, font_icons_28.c, font_weather16.c, font_icon_globe_20.c) embed glyphs
+    (font_icons_20.c, font_icons_28.c, font_icon_globe_20.c) embed glyphs
     generated from the 4.7.0 desktop font file (fontawesome-webfont.ttf).
 
   * Font Awesome 5 Free 5.9.0 - Copyright (c) Fonticons, Inc.

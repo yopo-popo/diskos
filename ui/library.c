@@ -33,6 +33,7 @@ enum { VIEW_MENU, VIEW_SONGS, VIEW_ALBUMS, VIEW_ARTISTS, VIEW_PLAYLISTS, VIEW_FA
 
 static lv_obj_t *g_list;
 static lv_obj_t *g_title;
+static lv_obj_t *g_status;   /* the clock and battery line: shown on the Library root only */
 static lv_obj_t *g_az_btn;    /* "A-Z" button -> opens the letter grid */
 static lv_obj_t *g_grid;      /* full alphabet grid overlay */
 static lv_obj_t *g_az_page[2];  /* the grid's letter pages: 0 English, 1 Hebrew */
@@ -50,7 +51,7 @@ static int  g_scope_lvl = 0;
 static int  g_scope_from_albums = 0;   /* the flat list was opened from the albums list ("All Songs"): Back returns there */
 static char g_scope_album_artist[LDB_NAME], g_scope_album[LDB_NAME];   /* level 2: the open album's key */
 static int  g_scope_total = 0;   /* songs in the whole scope (the "All Songs" row's count) */
-static int g_deeplink = 0;    /* drill opened from the NP hub -> back leaves the Library */
+static int g_deeplink = 0;    /* drill opened from the NP hub -> back returns to where Library was (g_prelink) */
 static int g_has_header = 0;   /* a Play All / Shuffle row is the first list child */
 static int g_hdr_extra_px = 0; /* extra leading height above the rows (the album cover header), for scroll math */
 static char g_drill[LDB_NAME];   /* the open album's title, or the artist / genre */
@@ -91,6 +92,15 @@ static const ldb_list *g_lcur;          /* the song list on screen (Songs, an al
 static int *g_lids;                     /* SONG.IDs of g_lcur's songs, found when it is first played */
 static int  g_lids_ok;
 static char g_alb_artist[LDB_NAME], g_alb_title[LDB_NAME];   /* the open album (g_drill_kind 1): its exact key */
+/* The cover flow over Library (Album View = cover flow): Albums opens it on every album, the Artists list on one artist's.
+ * Its covers open their songs here (library_wall_open / library_wall_open_album); Back from those returns to the wall,
+ * and Back from the wall to the view it was opened from, where it was. */
+static int     g_from_wall = 0;      /* the open drill came from the cover flow: Back returns to it */
+static int     g_wall_kind = 0;      /* an artist's wall: the LDB_SCOPE_* its albums were read in (the Artists grouping then) */
+static int     g_wall_view = -1;     /* the view the wall was opened from (-1 = none) */
+static int     g_wall_pending = 0;   /* left a drill for the wall: the view is rebuilt on the next entry */
+static int32_t g_wall_y = -1;        /* that view's scroll when the wall opened */
+static void wall_opened(void){ g_from_wall = 0; g_wall_view = g_view; g_wall_y = g_list ? lv_obj_get_scroll_y(g_list) : 0; }
 
 static void library_reload(void);
 
@@ -221,6 +231,7 @@ static void lalbum_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_SHORT_CLICKED) return;
     int i = (int)(uintptr_t)lv_event_get_user_data(e);
     if(g_view!=VIEW_ALBUMS || i < 0 || i >= g_lalbums.n) return;
+    g_from_wall = 0;
     open_album(g_lalbums.v[i].artist, g_lalbums.v[i].title, 0);   /* back returns to Albums */
 }
 static void lalbum_play_cb(lv_event_t *e){   /* long-press an album: play it now */
@@ -324,6 +335,7 @@ static void pl_new_cb(lv_event_t *e){
 }
 /* an artist's (drill kind 2) or a genre's (3) library.db scope: an artist follows the Artists grouping (Settings) */
 static int scope_of(int drill_kind){
+    if(drill_kind==2 && g_from_wall) return g_wall_kind;   /* from an artist's cover flow: the grouping it was read in */
     return drill_kind==3 ? LDB_SCOPE_GENRE : mdb_artist_mode() ? LDB_SCOPE_GROUP : LDB_SCOPE_ARTIST;
 }
 /* an Artists / Genres row: index gi of the view's list, NULL if it is gone */
@@ -335,6 +347,12 @@ static void group_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_SHORT_CLICKED) return;
     const char *name = group_name((int)(uintptr_t)lv_event_get_user_data(e));
     if(!name) return;
+    g_from_wall = 0;
+    if(g_view==VIEW_ARTISTS && cfg_get_int("album_view", 0)==1 && albumwall_open_artist(scope_of(2), name) > 0){
+        wall_opened();   /* Album View = cover flow: the artist's albums as a cover flow */
+        screen_show(SCR_ALBUMWALL);
+        return;
+    }                                             /* (an artist without albums opens on their songs, as in the list) */
     g_drill_kind = g_view==VIEW_GENRES ? 3 : 2;
     snprintf(g_drill, sizeof g_drill, "%s", name);
     g_scope_from_albums = 0;
@@ -354,29 +372,39 @@ static void group_play_cb(lv_event_t *e){
     int n = ldb_read_scope_songs(scope_of(g_view==VIEW_GENRES ? 3 : 2), name, &l);
     if(lplay_once(&l, n, "Couldn't play that list")) screen_show(SCR_NOWPLAYING);
 }
+static void settings_row_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) screen_show(SCR_SETTINGS); }
 static void menu_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
     int v=(int)(uintptr_t)lv_event_get_user_data(e);
     if(v==CAT_FOLDERS){ folderbrowser_open(); return; }   /* opens a screen, not a library view */
     if(v==CAT_BOOKS){ books_open(); return; }             /* audiobooks: a screen, not a library view */
-    if(v==VIEW_ALBUMS && cfg_get_int("album_view", 0)==1){ screen_show(SCR_ALBUMWALL); return; }  /* cover flow */
+    if(v==VIEW_ALBUMS && cfg_get_int("album_view", 0)==1){ albumwall_open_all(); wall_opened(); screen_show(SCR_ALBUMWALL); return; }  /* cover flow */
     g_view=v;
     g_drill_kind=0; library_reload();
 }
 /* Step one level back WITHIN the library (drill-in -> its category list -> the
  * category menu). Returns 1 if it handled an internal step, 0 if already at the
  * top menu (so the caller should leave the Library screen). */
+static int prelink_restore(void);
+static int prelink_reenter(void);
 int library_back(void){
     if(g_view==VIEW_GROUP){
+        if(g_from_wall && !g_deeplink && g_wall_view >= 0){   /* opened from the cover flow: back to the wall */
+            g_from_wall = 0; g_view = g_wall_view; g_drill_kind = 0;
+            g_wall_pending = 1;   /* rebuilt when Library is shown again (library_enter), not while it slides away */
+            return 0;
+        }
         if(g_drill_kind!=1 && g_scope_lvl==2){ g_scope_lvl=1; library_reload(); return 1; }   /* album songs -> that scope's albums */
         if(g_drill_kind!=1 && g_scope_lvl==0 && g_scope_from_albums){ g_scope_from_albums=0; g_scope_lvl=1; library_reload(); return 1; }   /* All Songs -> albums */
-        if(g_deeplink){  /* opened from the hub -> leave Library entirely (back to hub) */
+        if(g_deeplink){  /* opened from the hub -> back to where Library was before the link */
+            int r = prelink_restore(); if(r >= 0) return r;
             g_deeplink=0; g_view=VIEW_MENU; g_drill_kind=0; library_reload(); return 0;
         }
         g_view=(g_drill_kind==1)?VIEW_ALBUMS:(g_drill_kind==3)?VIEW_GENRES:VIEW_ARTISTS;
         g_drill_kind=0; library_reload(); return 1;
     }
-    if(g_deeplink && g_view==VIEW_ARTISTS){   /* a deep-linked artist drill moved to Artists by the Artist setting: Back still leaves to the hub */
+    if(g_deeplink && g_view==VIEW_ARTISTS){   /* a deep-linked artist drill moved to Artists by the Artist setting: Back still leaves the link */
+        int r = prelink_restore(); if(r >= 0) return r;
         g_deeplink=0; g_view=VIEW_MENU; g_drill_kind=0; library_reload(); return 0;
     }
     if(g_view==VIEW_MOSTPLAYED || g_view==VIEW_RECENT){ g_view=VIEW_HISTORY; library_reload(); return 1; }  /* stats -> History */
@@ -400,6 +428,31 @@ static void scope_album_cb(lv_event_t *e){
     snprintf(g_scope_album_artist, sizeof g_scope_album_artist, "%s", g_lscope.v[ai].artist);
     snprintf(g_scope_album, sizeof g_scope_album, "%s", g_lscope.v[ai].title);
     g_scope_lvl = 2; library_reload();
+}
+/* From an artist's cover flow (kind = its LDB_SCOPE_*): open the artist's songs on one album (album_artist + album), or
+ * all of them (album NULL). library_enter shows them when the wall opens Library; Back returns to the wall. */
+void library_wall_open(int kind, const char *artist, const char *album_artist, const char *album){
+    g_wall_kind = kind;
+    snprintf(g_drill, sizeof g_drill, "%s", artist ? artist : "");
+    if(album){
+        snprintf(g_scope_album_artist, sizeof g_scope_album_artist, "%s", album_artist ? album_artist : "");
+        snprintf(g_scope_album, sizeof g_scope_album, "%s", album);
+    }
+    g_view = VIEW_GROUP; g_drill_kind = 2; g_scope_lvl = album ? 2 : 0; g_scope_from_albums = 0; g_deeplink = 0;
+    g_from_wall = 1; g_wall_pending = 0;
+}
+/* From an artist's cover flow: play the artist's songs on that album (the list's long-press). 1 = sent. */
+int library_wall_play(int kind, const char *artist, const char *album_artist, const char *album){
+    ldb_list l;
+    return lplay_once(&l, ldb_read_scope_album_songs(kind, artist, album_artist, album, &l), "Couldn't play that list");
+}
+/* From the cover flow of every album: open one album's songs. Back returns to the wall. */
+void library_wall_open_album(const char *album_artist, const char *album){
+    snprintf(g_alb_artist, sizeof g_alb_artist, "%s", album_artist ? album_artist : "");
+    snprintf(g_alb_title, sizeof g_alb_title, "%s", album ? album : "");
+    snprintf(g_drill, sizeof g_drill, "%s", g_alb_title);   /* library_drill_context's album name (stock queues) */
+    g_view = VIEW_GROUP; g_drill_kind = 1; g_scope_lvl = 0; g_scope_from_albums = 0; g_deeplink = 0;
+    g_from_wall = 1; g_wall_pending = 0;
 }
 static void scope_album_play_cb(lv_event_t *e){   /* long-press an album row: play it now (as the Albums list does) */
     if(lv_event_get_code(e)!=LV_EVENT_LONG_PRESSED) return;
@@ -429,6 +482,12 @@ static lv_obj_t *add_row(lv_obj_t *parent, int i){
             ui_on(r, scope_album_play_cb, LV_EVENT_LONG_PRESSED, (void*)(uintptr_t)(i-1), "library.scope_album_play.long", UI_CORE);
             /* the album artist under the title, unless it's the artist open here */
             const char *sub = g_drill_kind!=3 && !strcmp(a->artist, g_drill) ? NULL : mdb_artist_missing(a->artist) ? "Unknown artist" : a->artist;
+            char ysub[LDB_NAME + 16];
+            if(g_drill_kind!=3 && a->year > 0){                     /* an artist's albums are by year: the year first */
+                if(sub) snprintf(ysub, sizeof ysub, "%d \u00B7 %s", a->year, sub);
+                else snprintf(ysub, sizeof ysub, "%d", a->year);
+                sub = ysub;
+            }
             row_two(r, a->title, sub, cnt, KIT_VALUE_COUNT);
         }
         theme_list_row(r);
@@ -460,7 +519,10 @@ static lv_obj_t *add_row(lv_obj_t *parent, int i){
             ui_on(r, lalbum_cb, LV_EVENT_SHORT_CLICKED, (void*)(uintptr_t)i, "library.album", UI_CORE);
             ui_on(r, lalbum_play_cb, LV_EVENT_LONG_PRESSED, (void*)(uintptr_t)i, "library.album_play.long", UI_CORE);
             char cnt[12]; snprintf(cnt,sizeof cnt,"%d",a->count);
-            row_two(r, a->title, mdb_artist_missing(a->artist) ? "Unknown artist" : a->artist, cnt, KIT_VALUE_COUNT);
+            const char *aa = mdb_artist_missing(a->artist) ? "Unknown artist" : a->artist;
+            char ysub[LDB_NAME + 16];
+            if(a->year > 0){ snprintf(ysub, sizeof ysub, "%d \u00B7 %s", a->year, aa); aa = ysub; }   /* the year first */
+            row_two(r, a->title, aa, cnt, KIT_VALUE_COUNT);
             break; }
         case VIEW_ARTISTS:                                             /* library.db */
             ui_on(r, group_cb, LV_EVENT_SHORT_CLICKED, (void*)(uintptr_t)i, "library.group", UI_CORE);
@@ -823,6 +885,7 @@ static void library_reload(void){
     const char *ttl = (g_view==VIEW_GROUP) ? ((g_drill_kind!=1 && g_scope_lvl==2) ? g_scope_album : g_drill_kind==1 ? g_alb_title : g_drill) : VIEW_TITLE[g_view];
     if(g_view==VIEW_GROUP && g_drill_kind==2 && g_scope_lvl!=2 && !g_drill[0]) ttl = "Unknown artist";
     theme_title_text(g_title, (g_view==VIEW_GROUP) ? ttl : tr(ttl));
+    if(g_status){ if(g_view==VIEW_MENU) lv_obj_remove_flag(g_status, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN); }
     az_show(0);
 
     /* one-time discoverability hints for the invisible long-press actions */
@@ -850,6 +913,11 @@ static void library_reload(void){
             lv_obj_set_style_text_color(ch, TC(TEXT_DISABLED), 0);
             theme_list_row(r);
         }
+        /* Settings: with Home and Quick settings gone, the Library root is the way in */
+        lv_obj_t *r = base_row();
+        ui_on(r, settings_row_cb, LV_EVENT_CLICKED, NULL, "library.settings", UI_CORE);
+        row_two(r, tr_sym(LV_SYMBOL_SETTINGS, "Settings"), NULL, NULL, KIT_VALUE_COUNT);
+        theme_list_row(r);
         return;
     }
     if(g_view==VIEW_HISTORY){          /* sub-menu: the two play-stats views */
@@ -880,7 +948,7 @@ static void library_reload(void){
             g_first[0] = '#';
             for(int i=0;i<n;i++) g_first[i+1]=az_code(g_lscope.v[i].letter);
             g_count = n + 1; fill_start(n + 1);
-            if(n > 12) az_show(1);
+            if(n > 12 && g_drill_kind==3) az_show(1);                 /* an artist's albums are by year: no A-Z */
             return;
         }
     }
@@ -1001,6 +1069,15 @@ void library_refresh(void){ if(g_list) library_reload(); }
  * DB-backed views can change elsewhere while hidden; drills also re-resolve their
  * album cover after NP has populated the artwork cache. */
 void library_enter(void){
+    if(prelink_reenter()) return;
+    if(g_wall_pending || (g_wall_view >= 0 && g_view == g_wall_view)){   /* back from the cover flow */
+        int32_t y = g_view == g_wall_view ? g_wall_y : -1;
+        g_wall_view = -1; g_wall_y = -1;
+        if(g_wall_pending){ g_wall_pending = 0; library_reload(); }   /* the rows still show the songs it opened */
+        else if(g_lhint){ lv_obj_add_flag(g_lhint, LV_OBJ_FLAG_HIDDEN); g_lhint_ch = 0; if(g_lhint_timer) lv_timer_pause(g_lhint_timer); }
+        if(g_list && y >= 0) lv_obj_scroll_to_y(g_list, y, LV_ANIM_OFF);   /* the view where it was */
+        return;
+    }
     if(g_view == VIEW_GROUP || g_view == VIEW_PLAYLISTS || g_view == VIEW_FAVS ||
        g_view == VIEW_MOSTPLAYED || g_view == VIEW_RECENT) library_refresh();
     else {
@@ -1013,6 +1090,7 @@ void library_enter(void){
  * to the Artists list; whatever Library shows is rebuilt from the new keys. */
 void library_artist_mode_changed(void){
     if(g_view == VIEW_GROUP && g_drill_kind == 2){ g_view = VIEW_ARTISTS; g_drill_kind = 0; }
+    g_from_wall = g_wall_pending = 0; g_wall_view = g_wall_y = -1;
     if(g_list) library_reload();
 }
 lv_obj_t *library_scroller(void){ return g_list; }
@@ -1030,8 +1108,69 @@ int library_drill_context(int *list_type, char *name, int cap){
 }
 
 /* deep-link from the Now Playing 3-dot menu or the cover flow: jump straight to an album (its library.db key) / artist */
-void library_open_album(const char *album_artist, const char *album){ open_album(album_artist, album, 1); }
+/* Where Library was before a Now Playing "Go to Album / Go to Artist" link, so Back from the link returns there
+ * instead of to the Library menu (each section keeps its place). */
+static struct {
+    int valid, pushed, pending, view, drill_kind, scope_lvl, from_albums;
+    int32_t scroll_y;
+    char scope_aa[LDB_NAME], scope_album[LDB_NAME], drill[LDB_NAME], alb_artist[LDB_NAME], alb_title[LDB_NAME];
+} g_prelink;
+static void prelink_save(void){
+    if(g_deeplink) return;   /* already inside a link: keep the spot from before the first one */
+    /* The link pushes Library over the screen on top of Library's stack (the cover flow): Back pops to it. Called
+     * before screen_show, so the top is still the old one. A restore not shown yet keeps its scroll: the rows are stale. */
+    g_prelink.pushed = screen_section_top(SCR_LIBRARY) != SCR_LIBRARY;
+    if(!g_prelink.pending) g_prelink.scroll_y = g_list ? lv_obj_get_scroll_y(g_list) : 0;
+    g_prelink.valid = 1; g_prelink.pending = 0;
+    g_prelink.view = g_view; g_prelink.drill_kind = g_drill_kind;
+    g_prelink.scope_lvl = g_scope_lvl; g_prelink.from_albums = g_scope_from_albums;
+    snprintf(g_prelink.scope_aa, sizeof g_prelink.scope_aa, "%s", g_scope_album_artist);
+    snprintf(g_prelink.scope_album, sizeof g_prelink.scope_album, "%s", g_scope_album);
+    snprintf(g_prelink.drill, sizeof g_prelink.drill, "%s", g_drill);
+    snprintf(g_prelink.alb_artist, sizeof g_prelink.alb_artist, "%s", g_alb_artist);
+    snprintf(g_prelink.alb_title, sizeof g_prelink.alb_title, "%s", g_alb_title);
+}
+/* Back out of a link. -1: no saved spot. 1: Library shows it again. 0: the link was pushed over another Library
+ * screen, so the caller pops back to that screen and the saved view is rebuilt when Library is next entered. */
+static int prelink_restore(void){
+    if(!g_prelink.valid) return -1;
+    g_prelink.valid = 0; g_deeplink = 0;
+    g_view = g_prelink.view; g_drill_kind = g_prelink.drill_kind;
+    g_scope_lvl = g_prelink.scope_lvl; g_scope_from_albums = g_prelink.from_albums;
+    snprintf(g_scope_album_artist, sizeof g_scope_album_artist, "%s", g_prelink.scope_aa);
+    snprintf(g_scope_album, sizeof g_scope_album, "%s", g_prelink.scope_album);
+    snprintf(g_drill, sizeof g_drill, "%s", g_prelink.drill);
+    snprintf(g_alb_artist, sizeof g_alb_artist, "%s", g_prelink.alb_artist);
+    snprintf(g_alb_title, sizeof g_alb_title, "%s", g_prelink.alb_title);
+    if(g_prelink.pushed){   /* not rebuilt while it slides away */
+        if(g_wall_view >= 0 && g_view == g_wall_view) g_wall_pending = 1;   /* under a cover flow: its own re-entry */
+        else g_prelink.pending = 1;
+        return 0;
+    }
+    library_reload();
+    if(g_list) lv_obj_scroll_to_y(g_list, g_prelink.scroll_y, LV_ANIM_OFF);
+    return 1;
+}
+static int prelink_reenter(void){
+    if(!g_prelink.pending) return 0;
+    g_prelink.pending = 0;
+    library_reload();
+    if(g_list) lv_obj_scroll_to_y(g_list, g_prelink.scroll_y, LV_ANIM_OFF);
+    return 1;
+}
+/* Back from another section (an edge pull): keep the list where it was. Only the views whose rows can change
+ * elsewhere (favourites from the Now Playing heart, playlists, play stats) are rebuilt, at the same scroll. */
+void library_return(void){
+    if(!g_list) return;
+    if(g_view == VIEW_PLAYLISTS || g_view == VIEW_FAVS || g_view == VIEW_MOSTPLAYED || g_view == VIEW_RECENT){
+        int32_t y = lv_obj_get_scroll_y(g_list);
+        library_refresh();
+        lv_obj_scroll_to_y(g_list, y, LV_ANIM_OFF);
+    }
+}
+void library_open_album(const char *album_artist, const char *album){ prelink_save(); open_album(album_artist, album, 1); }
 void library_open_artist(const char *name){
+    prelink_save();
     g_view=VIEW_GROUP; g_drill_kind=2; g_scope_lvl=0; g_scope_from_albums=0; g_deeplink=1; snprintf(g_drill, sizeof g_drill, "%s", name); library_reload();
 }
 
@@ -1052,6 +1191,7 @@ void library_scroll_letter_tick(void){
      * showed stale letters from a prior view. Allowlist, so any new view defaults to no hint. */
     if(!(g_view==VIEW_SONGS || g_view==VIEW_GROUP || g_view==VIEW_ALBUMS ||
          g_view==VIEW_ARTISTS || g_view==VIEW_GENRES)) return;
+    if(g_view==VIEW_GROUP && g_drill_kind==2 && g_scope_lvl==1) return;   /* an artist's albums are by year: no letters */
     unsigned char ch = g_first[row_at_scroll()];
     if(ch && ch != g_lhint_ch){
         const lv_font_t *cur = lv_obj_get_style_text_font(g_lhint_lbl, 0);
@@ -1082,6 +1222,7 @@ void library_create(lv_obj_t *root){
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
 
     g_title = ui_header_cb(root, "Library", back_cb);   /* shared header; back_cb pops the internal view stack */
+    g_status = ui_status_line(root);
 
     g_list = lv_obj_create(root);
     lv_obj_remove_style_all(g_list);

@@ -7,8 +7,7 @@
 void ui_create(lv_obj_t *root);
 void ui_update(const track_state_t *st);
 const char *ui_current_cover_src(void);
-void ui_set_np_style(int vinyl);
-void ui_vinyl_spin(int want);
+void ui_np_spin(int want);
 
 /* Now Playing seek recognizer - fed raw touch from main.c (ring is display-only).
  * press/move arm/own the gesture; release returns 1 if it committed a seek

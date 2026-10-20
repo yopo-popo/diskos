@@ -312,16 +312,8 @@ void plpick_create(lv_obj_t *root){
  * the current track (play-mode & favorite live on the Now Playing screen). - */
 static void hub_eq_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED){ screen_show(SCR_TUNE); } }
 
-static void fsart_deferred_cb(lv_timer_t *t){ lv_timer_delete(t); ui_np_fsart_open(); }
-static void hub_fsart_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    screen_show(SCR_NOWPLAYING);   /* fsart lives on the NP root -> make NP the active screen first */
-    /* open after the NP slide-in settles so the transition can't stomp the overlay's z-order/opacity */
-    lv_timer_t *t = lv_timer_create(fsart_deferred_cb, 360, NULL);
-    lv_timer_set_repeat_count(t, 1);
-}
+static void hub_sleep_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) ui_sleep_popover(); }
 static void hub_chapters_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) chapters_open(); }
-static void hub_upnext_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) upnext_open(); }
 
 static lv_obj_t *g_hub_list;
 /* (Re)populate the hub for the current track. Books get Chapters and drop the music-only entries
@@ -335,11 +327,9 @@ static void nphub_populate(void){
         /* navigate, understand the book, then the rest - the order the listener reaches for most first */
         menu_row(g_hub_list, "Chapters",        hub_chapters_cb, NULL);
         menu_row(g_hub_list, "Book details",    ctx_info_cb,     NULL);   /* Song Info screen, relabelled for books */
+        menu_row(g_hub_list, "Sleep Timer",     hub_sleep_cb,    NULL);
         menu_row(g_hub_list, "Equalizer",       hub_eq_cb,       NULL);
-        menu_row(g_hub_list, "Full-screen Art", hub_fsart_cb,    NULL);
     } else {
-        menu_row(g_hub_list, "Up Next",         hub_upnext_cb, NULL);
-        menu_row(g_hub_list, "Full-screen Art", hub_fsart_cb,  NULL);
         menu_row(g_hub_list, "Equalizer",       hub_eq_cb,     NULL);
         menu_row(g_hub_list, "Song Info",       ctx_info_cb,   NULL);
         menu_row(g_hub_list, "Lyrics",          ctx_lyrics_cb, NULL);

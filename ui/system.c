@@ -263,9 +263,9 @@ int sys_fetch_latest(char *tag, size_t n){
  * config without changing the player, or drop an account. Wi-Fi/Bluetooth pairings and the SD card are outside
  * diskos.conf entirely. */
 static const char *const RESET_KEYS[] = {
-    "brightness", "swipe_thresh", "saver_idx", "saver_style", "screenoff_idx",
+    "brightness", "swipe_thresh", "screenoff_idx",
     "anim", "time_24h", "accent_mode", "accent_color", "np_style", "theme_preset", "theme_variant",
-    "outdoor", "boot_default", "weather_on", "weather_loc", "artcache", "sleep_idx", "sleep_action", "idle_off_idx",
+    "outdoor", "boot_default", "artcache", "sleep_idx", "sleep_action", "idle_off_idx",
     "qs_transport", "track_numbers", "album_view", "online_art", "online_lyrics", NULL
 };
 int sys_reset_match(const char *key){

@@ -5,15 +5,21 @@
 #include "lvgl/lvgl.h"
 #include "ipc.h"
 #include <stdbool.h>
-enum { SCR_HOME, SCR_LIBRARY, SCR_NOWPLAYING, SCR_SETTINGS, SCR_SETTING_DETAIL, SCR_SEARCH, SCR_SAVER, SCR_QUICK, SCR_SONGINFO, SCR_NPMENU, SCR_TUNE, SCR_EQ, SCR_APPS, SCR_NPHUB, SCR_PLPICK, SCR_PLVIEW, SCR_WIFI, SCR_WIFI_INFO, SCR_BT, SCR_BT_INFO, SCR_WEATHER, SCR_LYRICS, SCR_COLORPICK, SCR_LASTFM, SCR_WORKMODE, SCR_DEBUG, SCR_FOLDER, SCR_BOOKS, SCR_CHAPTERS, SCR_SETLIST, SCR_QSCONFIG, SCR_ALBUMWALL, SCR_UPNEXT, SCR_DATETIME, SCR_COUNT };
+enum { SCR_HOME, SCR_LIBRARY, SCR_NOWPLAYING, SCR_SETTINGS, SCR_SETTING_DETAIL, SCR_SEARCH, SCR_QUICK, SCR_SONGINFO, SCR_NPMENU, SCR_TUNE, SCR_EQ, SCR_APPS, SCR_NPHUB, SCR_PLPICK, SCR_PLVIEW, SCR_WIFI, SCR_WIFI_INFO, SCR_BT, SCR_BT_INFO, SCR_LYRICS, SCR_COLORPICK, SCR_LASTFM, SCR_WORKMODE, SCR_DEBUG, SCR_FOLDER, SCR_BOOKS, SCR_CHAPTERS, SCR_SETLIST, SCR_QSCONFIG, SCR_ALBUMWALL, SCR_UPNEXT, SCR_DATETIME, SCR_COUNT };
 void screens_init(void);
 void screen_show(int which);
 void screen_back(void);
 void screen_set_anim(int on);
 int  screen_current(void);
+/* Library, Now Playing and Queue (SCR_UPNEXT) are the three main sections, in a loop: Library above Now Playing,
+ * Queue below, wrapping. Each keeps its own back stack; screen_show() of a section root switches section. */
+void screen_section_step(int dir);               /* edge pull: -1 = the section above, +1 = the one below */
+void screen_section_jump(int root, int animate);  /* switch to a section's root screen, keeping its place */
+int  screen_pull_ok(int which);                   /* can an edge pull switch sections from this screen? */
+int  screen_section_top(int root);                /* the screen the section with this root shows (its stack top) */
 void ui_toast(const char *msg);
 void splash_start(void);
-/* the "something" block-matrix clock (home.c): handle 0 = Home, 1 = screensaver */
+/* the "something" block-matrix clock (home.c): handle 0 = Home */
 int  mclock_new(int h, lv_obj_t *parent, int y);
 void mclock_set(int h, const char *time_text);
 void mclock_place(int h, int y, int shown);   /* the boot splash (splash.c): the Disc loads a disc, then hands off to Home */
@@ -23,11 +29,6 @@ void ui_back_glyph(lv_obj_t *label);   /* style an edge Back's label the theme's
 int  ui_toast_hint(const char *msg); /* show nonessential help only when no toast is active */   /* transient completion-feedback message */
 void ui_status_refresh(void);     /* re-poll the home status row (battery/wifi/bt) now, e.g. after a radio toggle */
 lv_obj_t *screen_get_root(int which);
-/* screensaver (saver.c) */
-void saver_create(lv_obj_t *root);
-void saver_set_clock(const char *t, const char *date);
-void saver_set_weather(const char *text);
-void saver_set_track(const char *title, const char *artist, const void *backdrop_src, const char *path);
 const char *ui_current_backdrop_src(void);
 /* quick settings (quicksettings.c) */
 void quicksettings_create(lv_obj_t *root);
@@ -54,9 +55,15 @@ void ui_art_redo(void);                /* re-request the cover without same-albu
 void sharp_cover_set_source(const char *path);
 void sharp_cover_request(void);
 const lv_image_dsc_t *sharp_cover_get(void);
+void sharp_rotate(const uint32_t *src, uint32_t *out, int32_t tenths);   /* turn a 360x360 BGRA picture (sharpart.c) */
+void sharp_spin_start(void *var, int32_t from, lv_anim_exec_xcb_t cb);  /* an endless 27 s turn (0.1 degree) */
+int  sharp_spin_due(uint32_t *last);                                     /* in its exec callback: 1 = draw this frame */
 void sharp_cover_invalidate(void);
 void ui_np_cover_changed(void);        /* rebind before shared pixels are freed */
 void ui_np_enter(void);                /* refresh on forward and back entry */
+void ui_status_clock(const char *hm);          /* the clock and battery line: the clock */
+void ui_status_batt(int batt, int charging);    /* the clock and battery line: battery %, -1 = unknown */
+lv_obj_t *ui_status_line(lv_obj_t *parent);     /* that line, at the top of parent (the Library root) */
 void ui_art_retry(void);               /* re-request the current song's cover (after the SD gate opens) */
 int  ui_take_art_force(void);          /* 1 once when a cover redo is pending (main loop runs ui_update) */
 void chapters_open(void);            /* load the current book's chapters + show SCR_CHAPTERS (books.c) */
@@ -116,8 +123,13 @@ int  ui_player_settling(void);         /* 1 while the player is still in its pos
 void library_open_album(const char *album_artist, const char *album);   /* an album by its library.db key */
 int  library_play_album(const char *album_artist, const char *album);   /* play it from the start; 1 = sent */
 void library_open_artist(const char *name);
+void library_wall_open(int kind, const char *artist, const char *album_artist, const char *album);   /* from an artist's cover flow (its LDB_SCOPE_*): their songs on the album (NULL = all); Back returns to it */
+int  library_wall_play(int kind, const char *artist, const char *album_artist, const char *album);   /* play the artist's songs on that album; 1 = sent */
+void library_wall_open_album(const char *album_artist, const char *album);   /* from the cover flow of every album: its songs; Back returns to it */
 void albumwall_create(lv_obj_t *root);     /* SCR_ALBUMWALL: cover-flow album browser */
 void albumwall_refresh(void);              /* rebuilt per entry from the album list */
+int  albumwall_open_artist(int kind, const char *key);   /* next entry shows an artist's albums (LDB_SCOPE_ARTIST/GROUP); their count, wall unchanged if <= 0 */
+void albumwall_open_all(void);             /* next entry shows every album again, at the full wall's own centre album */
 void albumwall_prewarm_seed(void);         /* MAIN thread: (re)start the incremental album-cover prewarm enqueue */
 void albumwall_step(int dir);              /* +1 next / -1 prev album (discrete: keys / demo) */
 void albumwall_drag_begin(int px);         /* finger down: start a continuous drag from press x */
@@ -150,9 +162,6 @@ lv_color_t ui_current_accent(void);
 lv_obj_t *ui_header(lv_obj_t *root, const char *title);
 lv_obj_t *ui_header_cb(lv_obj_t *root, const char *title, lv_event_cb_t back_cb);  /* header with custom back */
 void home_set_accent(lv_color_t accent);
-void saver_set_accent(lv_color_t accent);
-void saver_show_sync(void);   /* apply saver-style + accent immediately on saver show */
-int  saver_wants_bright(void);/* 1 = keep full brightness (vinyl art showcase), don't dim */
 int  ui_run_bounded(char *const argv[], int timeout_ms);  /* external cmd as a killable child w/ hard timeout */
 void ui_decode_lock(void);    /* serialize an ffmpeg artwork decode against the other decoders (OOM guard) */
 void ui_decode_unlock(void);
@@ -171,7 +180,7 @@ void ui_set_memory(int mode);
 void ui_set_maxvol(int v);
 void ui_set_balance(int v);
 void ui_reapply_audio(void);  /* resend managed audio settings (DRE/filter/etc.) on player-ready / reconnect */
-void ui_request_sleep(void);  /* Quick Settings "Sleep": manual screen-off request (works with saver Off) */
+void ui_request_sleep(void);  /* Quick Settings "Sleep": turn the screen off now */
 void ui_set_brightness(int v);   /* persist + apply */
 int  ui_get_brightness(void);
 int  ui_effective_brightness(void);   /* what the backlight runs at (Outdoor mode = full) */
@@ -185,7 +194,8 @@ void ui_set_sleep_eoc(long target_ms, const char *path, int at_book_end);  /* pa
 void ui_disarm_book_eoc(void);  /* disarm any end-of-chapter sleep; call on explicit track navigation */
 int  ui_book_active(void);      /* 1 if an audiobook is the active playback context (suppress play-mode changes) */
 int  ui_sleep_state(int *secs_left);    /* 0 off, 1 duration (fills secs_left), 2 end-of-chapter */
-void ui_np_close_overlays(void);        /* dismiss the Now Playing sleep-timer popover (on screen change) */
+void ui_np_close_overlays(void);        /* dismiss the sleep-timer popover (on screen change) */
+void ui_sleep_popover(void);            /* the sleep-timer chooser (Now Playing options, for a book) */
 int  ui_np_overlay_active(void);        /* 1 while the sleep popover is up (suppress ring seek/nav) */
 long ui_smart_rewind_ms(long idle_seconds);  /* how far to back up on resume, by idle time */
 void ui_defer_sleep(void);                    /* hold the sleep pause off briefly after a transport tap */
@@ -250,22 +260,15 @@ int  ui_main_is_idle(void);               /* main.c: 1 when the screen is dimmed
 const lv_font_t *ui_font_cjk(int size);   /* shared montserrat + Source Han Sans fallback user-text font (14/16/20) */
 int  ui_take_art_applied(void);           /* 1 once after art (re)applied -> re-push surfaces */
 int  ui_np_seek_press(int x, int y);
-int  ui_np_cover_hit(int x, int y);      /* 1 = (x,y) is on the visible NP cover */
+int  ui_np_cover_hit(int x, int y);      /* 1 = a press there is a tap on the art (the controls are hidden), not a seek */
 void ui_np_seek_line(lv_obj_t *bar);     /* theme: seek on this straight bar/slider instead of the ring */
 void ui_np_pp_filled(int on);            /* theme: the play key is filled with the accent (recolour its fill) */
 void ui_np_backdrop_enabled(int on);     /* theme: 0 = no blurred cover behind Now Playing */
 int  ui_np_seek_move(int x, int y);
 int  ui_np_seek_release(int x, int y);
-/* full-screen album-art view (stock cover.png reuse): tap the NP cover to open */
-void ui_np_fsart_open(void);
-void ui_np_fsart_close(void);
-int  ui_np_fsart_active(void);   /* 1 while the full-screen art is up (suppress NP seek/nav) */
 const char *ui_current_cover_src(void);
-const void *ui_current_cover_dsc(void);   /* rotatable cover for vinyl saver */
-void saver_vinyl_spin(int want);          /* drive saver vinyl spin (from main loop) */
 const char *ui_current_thumb_src(void);
-void ui_set_np_style(int vinyl);   /* 0 = cover (rounded square), 1 = vinyl (disc) */
-void ui_vinyl_spin(int want);      /* drive the vinyl spin from the main loop */
+void ui_np_spin(int want);         /* turn the Now Playing art (main loop: playing, on screen, lit) */
 void ui_show_volume(int vol);      /* show the on-screen volume bar (auto-hides) */
 /* home */
 void home_create(lv_obj_t *root);
@@ -273,13 +276,6 @@ void home_set_clock(const char *t, const char *s);
 void home_set_art_enabled(int on);   /* 0 = the theme's Home pill shows no album art */
 void home_set_backdrop_enabled(int on);   /* 0 = no blurred cover behind Home (the theme's own background) */
 void home_set_status(int batt, int charging, int wifi, int bt);
-void home_set_weather(const char *text);
-/* weather.c */
-void weather_fetch_async(void);
-void weather_poll(lv_timer_t *t);
-void weather_set_enabled(int on);   /* Settings: on/off passive weather + background fetch */
-void weather_app_create(lv_obj_t *root);   /* Weather app: set location */
-void weather_app_open(void);               /* refresh + show the weather app */
 /* lyrics.c */
 void lyrics_create(lv_obj_t *root);
 void lyrics_open(void);                     /* fetch current track lyrics + show */
@@ -295,6 +291,7 @@ typedef int (*library_song_click_cb_t)(int index);   /* index = song id; returns
 void library_set_song_click_cb(library_song_click_cb_t cb);
 void library_refresh(void);   /* rebuild the current Library view (after external DB changes) */
 void library_enter(void);     /* retain catalog rows; refresh mutable DB views */
+void library_return(void);    /* back from another section: like library_enter, but keep the scroll position */
 void library_artist_mode_changed(void);   /* Settings changed the Artists grouping: leave an artist drill + rebuild */
 void library_ensure_capacity(void);  /* grow row buffers to fit the library (after a rescan adds tracks) */
 /* primary scrollable list per long-list screen (for rim-scroll); NULL if none */

@@ -245,7 +245,7 @@ static void theme_fonts_install(void){
         g_tfp[r] = &g_tf[r];
     }
     /* a text size the theme's set lacks takes the theme's nearest own face: otherwise Default's face shows through
-     * (the weather's "Fetching..." in Montserrat on a monospace theme) */
+     * (a Montserrat label on a monospace theme) */
     static const theme_font_role_t GAP[][3] = { { THEME_FONT_UI_22, THEME_FONT_UI_24, THEME_FONT_UI_20 },
                                                 { THEME_FONT_UI_10, THEME_FONT_UI_12, THEME_FONT_UI_14 } };
     if(g_def) for(unsigned i = 0; i < sizeof GAP / sizeof GAP[0]; i++)

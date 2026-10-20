@@ -59,13 +59,10 @@ static int         g_touch_raw = -1;   /* a 2nd, RAW read-only fd on the touch e
                                           final RELEASED (no press edge -> no wake), so we watch the
                                           raw stream where ANY event means "a finger touched". */
 
-/* Manual "Sleep" (Quick Settings tile): a deliberate screen-off request. It must dim+power
- * the panel even when the auto-screensaver is Off, so it can't ride the saver_timeout>0 path.
- * g_manual_sleep is armed by ui_request_sleep(); the saver block below honours it and clears
- * it once the panel is woken (touch takes us off SCR_SAVER). */
+/* Manual "Sleep" (Quick Settings tile): turn the screen off now, whatever the Screen Off setting.
+ * g_manual_sleep is armed by ui_request_sleep(); the main loop's screen-off block consumes it. */
 static volatile int g_manual_sleep = 0;
-static uint32_t g_manual_sleep_at = 0;
-void ui_request_sleep(void){ g_manual_sleep = 1; g_manual_sleep_at = lv_tick_get(); }
+void ui_request_sleep(void){ g_manual_sleep = 1; }
 int ui_screen_backlight_on(void){ return !g_screen_off; }
 void ui_backlight_hold(void);              /* settings.c: positive levels wait for the release */
 void ui_backlight_release(int fallback);   /* settings.c: light the latest held level (else fallback) */
@@ -78,7 +75,7 @@ static void draw_set_dark(int dark){
     if(!d) return;
     g_draw_dark = dark;
     if(dark){
-        /* Discard pending redraws before disabling the queue, including a saver pop. */
+        /* Discard pending redraws before disabling the queue. */
         lv_inv_area(d, NULL);
         lv_display_enable_invalidation(d, 0);
         lv_timer_pause(lv_display_get_refr_timer(d));
@@ -99,6 +96,8 @@ static lv_obj_t   *g_dbgdot = NULL;
 static int         g_dbg = 0;          /* show tap dot (only if /usr/data/touch_dbg) */
 
 #define SWIPE_THRESH_DEFAULT 60
+#define PULL_EDGE 40           /* a section-switch pull must START this close to the top or bottom edge */
+#define BOOT_PICK_MS 5000      /* boot shows Now Playing; with no track reported by then, Library instead */
 /* The back-swipe must START on the left side of the 360px screen (and travel
  * rightwards), so a horizontal swipe on the right side never goes back. */
 #define BACK_START_MAX_X 64    /* back-swipe must START near the left edge (iOS-style) so it
@@ -113,8 +112,8 @@ static int g_swipe_thresh = SWIPE_THRESH_DEFAULT;   /* cached for the hot loop *
 
 int ui_get_swipe_thresh(void){ return g_swipe_thresh; }
 /* How far the current / last touch travelled from where it went down (px, the larger axis). LVGL still reports a
- * CLICKED on release after a swipe that didn't scroll anything, so a tap target a swipe happens to start on (Home's
- * full-width weather line) fired alongside the swipe - Weather opened over the page swiped to. Tap handlers that sit
+ * CLICKED on release after a swipe that didn't scroll anything, so a tap target a swipe happens to start on (a
+ * full-width line) fired alongside the swipe - its page opened over the page swiped to. Tap handlers that sit
  * under swipe gestures check this and ignore a press that was really a swipe. */
 static int g_press_sx, g_press_sy, g_press_lx, g_press_ly;
 int ui_press_travel(void){
@@ -128,7 +127,7 @@ int ui_press_travel(void){
     return dx > dy ? dx : dy;
 }
 
-/* idle mirror for the prewarm worker: 1 once the screen has dimmed/off (saver), i.e.
+/* idle mirror for the prewarm worker: 1 once the screen has dimmed/off, i.e.
  * the user isn't actively looking. Updated each main-loop iteration from bl_state.
  * _Atomic: written here (main thread), read by the prewarm worker thread. */
 static _Atomic int g_bl_idle = 0;
@@ -240,12 +239,14 @@ static int power_key_inject(void){
     }
     return 0;
 }
-/* the dimmed level: the vinyl art-showcase saver keeps the user's brightness, everything else crushes to 6 */
+/* the dimmed level, for the last seconds before the screen turns off */
 static int dim_level(void){
     int dim = ui_effective_brightness();
-    if(dim > 6 && !(screen_current() == SCR_SAVER && saver_wants_bright())) dim = 6;
+    if(dim > 6) dim = 6;
     return dim;
 }
+#define SCREEN_DIM_MS    10000   /* the screen dims this long before Screen Off turns it off */
+#define WAKE_SWALLOW_MS  400     /* a press edge this soon after a touch woke the screen belongs to that touch */
 
 static void clock_tick(lv_timer_t *t){
     (void)t;
@@ -261,7 +262,7 @@ static void clock_tick(lv_timer_t *t){
     }
     strftime(date, sizeof date, "%a %d %b", &lt);
     home_set_clock(hm, date);
-    saver_set_clock(hm, date);
+    ui_status_clock(hm);
 }
 void ui_clock_refresh(void){ clock_tick(NULL); }
 
@@ -310,6 +311,7 @@ static void status_poll_cb(lv_timer_t *t){
     bt = bt_radio_on();
 
     home_set_status(batt, charging, wifi, bt);
+    ui_status_batt(batt, charging);
 }
 void ui_status_refresh(void){ status_poll_cb(NULL); }
 
@@ -2251,9 +2253,9 @@ static int run_bounded(char *const argv[], int timeout_ms){
     return rc;
 }
 
-/* the frequent polls (album-art 120ms, lyrics 500ms, weather 1s); paused while the
+/* the frequent polls (album-art 120ms, lyrics 500ms); paused while the
  * screen is fully off so the main loop can deep-idle instead of waking ~8x/s. */
-static lv_timer_t *g_t_art, *g_t_lyr, *g_t_wx, *g_t_status;
+static lv_timer_t *g_t_art, *g_t_lyr, *g_t_status;
 static void polls_set_paused(int paused){
     if(!g_t_art) return;
     /* IMPORTANT: g_t_status (battery/wifi/BT, 3s) is DELIBERATELY left running at screen-off. Its
@@ -2262,9 +2264,9 @@ static void polls_set_paused(int paused){
      * the CS43131 (I2C bus 3) half-powered and a later transaction NOACKs, wedging the Ingenic I2C
      * controller and the whole SoC (device-verified 2026-08-26: stock never sleeps the screen and
      * never freezes; pausing this poll at screen-off is what introduced the freeze). Only the visual
-     * polls (art/lyrics/weather) pause - they wake nothing useful behind a dark screen. */
-    if(paused){ lv_timer_pause(g_t_art);  lv_timer_pause(g_t_lyr);  lv_timer_pause(g_t_wx);  }
-    else      { lv_timer_resume(g_t_art); lv_timer_resume(g_t_lyr); lv_timer_resume(g_t_wx); }
+     * polls (art/lyrics) pause - they wake nothing useful behind a dark screen. */
+    if(paused){ lv_timer_pause(g_t_art);  lv_timer_pause(g_t_lyr);  }
+    else      { lv_timer_resume(g_t_art); lv_timer_resume(g_t_lyr); }
 }
 
 /* Periodic RTC save WITHOUT blocking the UI thread. It used to run `hwclock -w` through run_bounded, which
@@ -2318,7 +2320,7 @@ static void hwclock_save_tick(lv_timer_t *t){
 
 void ui_rtc_save_now(void){ hwclock_save_tick(NULL); }   /* Date & Time: persist a hand-set clock right away */
 
-/* Bounded external command, exposed so saver.c can decode the vinyl cover without an unbounded popen. */
+/* Bounded external command, exposed for other modules (Debug Mode) instead of an unbounded popen. */
 int ui_run_bounded(char *const argv[], int timeout_ms){ return run_bounded(argv, timeout_ms); }
 
 /* ---- rim (circumference) scroll -------------------------------------------
@@ -3261,8 +3263,6 @@ int main(int argc, char **argv){
     g_t_status = lv_timer_create(status_poll_cb, 3000, NULL); /* charging/battery/wifi every 3s (BT every ~12s inside); paused at screen-off */
     status_poll_cb(NULL);                        /* populate immediately */
     bt_boot_restore();                           /* re-enable BT + arm auto-route if it was on (persist like WiFi) */
-    g_t_wx  = lv_timer_create(weather_poll, 1000, NULL);  /* apply weather + retry/refresh */
-    if(cfg_get_int("weather_on", 1)) weather_fetch_async();   /* first fetch - only with Weather on (Settings off = no network use) */
     g_t_lyr = lv_timer_create(lyrics_poll, 500, NULL);    /* apply finished lyrics fetch */
     lastfm_init();                                        /* load Last.fm config + offline queue */
     lv_timer_create(lastfm_tick, 1000, NULL);            /* watch play-state + drive scrobbles */
@@ -3321,9 +3321,9 @@ int main(int argc, char **argv){
     } else fprintf(stderr,"touch OFF (no /usr/data/touch_on)\n");
     fflush(stderr);
 
-    int start = SCR_HOME;   /* no-arg default = home (boot supervisor launches with no args) */
+    int start = SCR_NOWPLAYING;   /* no-arg default (boot supervisor launches with no args); see boot_pick */
     if(argc>1){
-        if(!strcmp(argv[1],"home"))    start = SCR_HOME;
+        if(!strcmp(argv[1],"home"))    start = SCR_NOWPLAYING;   /* Home is gone */
         else if(!strcmp(argv[1],"library")) start = SCR_LIBRARY;
         else if(!strcmp(argv[1],"nowplaying")) start = SCR_NOWPLAYING;
         else if(!strcmp(argv[1],"settings")) start = SCR_SETTINGS;
@@ -3335,14 +3335,19 @@ int main(int argc, char **argv){
         else if(!strcmp(argv[1],"ctx")) start = SCR_NPMENU;
         else if(!strcmp(argv[1],"eq")) start = SCR_EQ;
         else if(!strcmp(argv[1],"apps")) start = SCR_APPS;
-        else if(!strcmp(argv[1],"weather")) start = SCR_WEATHER;
         else if(!strcmp(argv[1],"lyrics")) start = SCR_LYRICS;
-        else if(!strcmp(argv[1],"saver")) start = SCR_SAVER;
         else if(!strcmp(argv[1],"hub")) start = SCR_NPHUB;
         else if(!strcmp(argv[1],"upnext")) start = SCR_UPNEXT;
         else if(!strcmp(argv[1],"datetime")) start = SCR_DATETIME;
     }
+    /* Now Playing's own pages open over Now Playing; anything else (Settings after a theme change, Search...)
+     * opens over Library, so Back lands in Library. */
+    if(!(start==SCR_NOWPLAYING || start==SCR_UPNEXT || start==SCR_NPHUB || start==SCR_NPMENU || start==SCR_EQ ||
+         start==SCR_SONGINFO || start==SCR_LYRICS || start==SCR_TUNE))
+        screen_section_jump(SCR_LIBRARY, 0);
     screen_show(start);
+    int boot_pick = (argc <= 1);   /* a plain boot: move to Library if nothing is queued (see BOOT_PICK_MS) */
+    uint32_t boot_tick = lv_tick_get();
     /* Force ONE full-screen repaint at startup. The framebuffer may still hold the stock
      * boot splash (switching stock->diskOS, or our own relaunch); the partial-render engine
      * only copies widget-dirty areas, so background regions would show stale splash pixels
@@ -3358,18 +3363,17 @@ int main(int argc, char **argv){
     track_state_t st; unsigned last=~0u;
     lv_indev_state_t prev_ts = LV_INDEV_STATE_RELEASED;
     int sx=0, sy=0, lastx=0, lasty=0; uint32_t sms=0; int s_press_scr=SCR_HOME;   /* swipe tracking + the screen the press began on */
-    int cover_tap=0;   /* press landed on the NP cover -> LVGL's cover click opens full-screen art (not a seek) */
-    int fsart_touch=0; /* press began while full-screen art was up -> LVGL's overlay click closes it; we only swallow */
+    int cover_tap=0;   /* press on Now Playing's art while its controls are hidden -> LVGL's tap shows them (not a seek) */
     int sleep_touch=0; /* press began while the sleep popover was up -> swallow the whole gesture (no ring seek) */
     playstate_t g_ps = { -1, 0 }; int last_playing=-1;   /* play/pause inference (playstate.c, host-tested) */
     char np_last_path[256] = "";   /* last track whose art/backdrop was pushed - so a mere position tick doesn't re-invalidate the 360px backdrop */
-    char np_last_title[sizeof st.title] = "", np_last_artist[sizeof st.artist] = "";
-    /* screensaver + screen-off timeouts come from the Settings cyclers (index ->
-     * seconds via TMAP), re-read each loop so changes apply live. */
+    /* the Screen Off time comes from the Settings cycler (index -> seconds via TMAP; 0 = never), re-read each
+     * loop so changes apply live */
     static const int TMAP[5] = {0,30,60,120,300};
     uint32_t last_activity = lv_tick_get();
-    int woke = 0;   /* a press that only wakes the saver is swallowed */
-    int bl_state = 0;   /* 0 = normal, 1 = saver-dim, 2 = off */
+    uint32_t wake_at = 0;   /* when a touch last woke the screen (see WAKE_SWALLOW_MS) */
+    int woke = 0;   /* a press that only wakes the screen is swallowed */
+    int bl_state = 0;   /* 0 = normal, 1 = dimmed (the last seconds before Screen Off), 2 = off */
     uint32_t last_blpoll = 0;   /* PW-10 backlight-rail poll cadence */
     /* A late fallback zero stays untouched until the player's wake. Early boot zeros are treated as startup,
      * not sleep: light promptly and follow the next player write without retaining a stale sleep flag. */
@@ -3469,7 +3473,6 @@ int main(int argc, char **argv){
             power_note_input();   /* a volume key press counts as input for idle power-off (last_activity only moves when the panel is off) */
             if(bl_state == 0){
                 last_activity = lv_tick_get();
-                if(screen_current()==SCR_SAVER) screen_back();
                 ui_show_volume(st.volume);
             }
         }
@@ -3478,6 +3481,15 @@ int main(int argc, char **argv){
          * original heuristic except a backward/rewind jump no longer counts as advancing. max_adv_ms=0
          * keeps "any forward change counts"; the paused-forward-seek bound is device-tunable. */
         int playing = playstate_playing(&g_ps, st.have_track, st.position_ms, lv_tick_get(), 1600, 0);
+        /* Boot lands on Now Playing. If the player reports no track within BOOT_PICK_MS (nothing queued) and nobody
+         * has touched the screen, move to Library. A stand-in until the queue module can tell us directly. */
+        if(boot_pick){
+            if(st.have_track) boot_pick = 0;
+            else if(lv_tick_elaps(boot_tick) > BOOT_PICK_MS){
+                boot_pick = 0;
+                if(screen_current()==SCR_NOWPLAYING) screen_section_jump(SCR_LIBRARY, 1);
+            }
+        }
         if(playing) ui_note_transport_sent();   /* playback observed this generation (any start, incl. hardware keys): its one-shot is moot */
         g_playing = playing;   /* publish for ui_route_bt/ui_route_analog (raw st.state is unreliable) */
         st.state = playing ? 2 : 1;
@@ -3500,26 +3512,16 @@ int main(int argc, char **argv){
                                  ui_current_accent(), playing);
             { void home_set_progress(int, int); int ui_np_progress(void);
               home_set_progress(ui_np_progress(), st.have_track); }
-            { void saver_set_playing(int); saver_set_playing(playing); }
             /* The art + backdrop surfaces only change on a TRACK change (or when a decode completes -
              * re-pushed below), NOT on every position tick. Re-setting the 360px backdrop image each
              * second re-invalidated the whole screen and defeated partial rendering. Track identity is
              * "" when nothing is playing (so stopping clears the art). */
             const char *idnow = st.have_track ? st.path : "";
-            const char *tnow = st.have_track ? ipc_display_title(&st) : "", *anow = st.have_track ? st.artist : "";
             int art_changed = strcmp(idnow, np_last_path) != 0;
-            int song_changed = strcmp(tnow, np_last_title) != 0 || strcmp(anow, np_last_artist) != 0;
             if(art_changed){
                 snprintf(np_last_path, sizeof np_last_path, "%s", idnow);
                 home_set_art_src(ui_current_thumb_src());
                 home_set_backdrop(ui_current_backdrop_src());
-            }
-            if(art_changed || song_changed){
-                snprintf(np_last_title, sizeof np_last_title, "%s", tnow);
-                snprintf(np_last_artist, sizeof np_last_artist, "%s", anow);
-                saver_set_track(st.have_track?ipc_display_title(&st):NULL,
-                                st.have_track?st.artist:NULL,
-                                ui_current_backdrop_src(), st.have_track?st.path:NULL);
             }
             quicksettings_refresh(playing);
             songinfo_set(&st);
@@ -3537,19 +3539,10 @@ int main(int argc, char **argv){
         if(bl_state != 2 && ui_take_art_applied()){
             home_set_art_src(ui_current_thumb_src());
             home_set_backdrop(ui_current_backdrop_src());
-            saver_set_track(st.have_track?ipc_display_title(&st):NULL,
-                            st.have_track?st.artist:NULL,
-                            ui_current_backdrop_src(), st.have_track?st.path:NULL);
             npmenu_set(st.have_track ? &st : NULL, playing, ui_current_thumb_src());
         }
-        /* spin the vinyl only while it's the visible, playing, lit Now Playing */
-        ui_vinyl_spin(playing && screen_current()==SCR_NOWPLAYING && bl_state==0);
-        /* spin while the saver is visible, the screen is on, AND audio is actually
-         * playing - a real platter stops when paused. `playing` (position advancing)
-         * is the reliable signal; it freezes the vinyl ~1.6s after pause/stop. The saver
-         * dims to bl_state==1 the moment it appears, so gate on !=2 (not ==0) for the
-         * lit test; a FULLY-off screen (bl_state==2) stops the spin anyway. */
-        saver_vinyl_spin(playing && screen_current()==SCR_SAVER && bl_state != 2);
+        /* turn Now Playing's art only while it's the visible, playing, lit screen */
+        ui_np_spin(playing && screen_current()==SCR_NOWPLAYING && bl_state==0);
 
         /* surface silent failures (sticky flags persist until the screen is on, so a
          * failure during screen-off is shown on wake rather than lost). */
@@ -3594,26 +3587,25 @@ int main(int argc, char **argv){
             } else if(ts==LV_INDEV_STATE_PRESSED && prev_ts==LV_INDEV_STATE_RELEASED){
                 /* press edge: start of a potential swipe */
                 last_activity = lv_tick_get();
-                if(screen_current()==SCR_SAVER){
-                    /* any touch wakes the saver; restore backlight, swallow gesture */
-                    if(bl_state && !pk.player_off){ wake_backlight(ui_effective_brightness()); bl_state = 0; g_screen_off = 0; }
-                    screen_back();
+                boot_pick = 0;   /* the user took over: don't move them at boot */
+                if(bl_state || lv_tick_elaps(wake_at) < WAKE_SWALLOW_MS){
+                    /* a touch on a dimmed or dark screen only wakes it (the player's own sleep: not even that);
+                     * the screen never sees it */
+                    if(bl_state && !pk.player_off){ wake_backlight(ui_effective_brightness()); bl_state = 0; g_screen_off = 0; wake_at = lv_tick_get(); }
+                    lv_indev_wait_release(g_touch);
                     woke = 1;
                 } else {
                     sx=p.x; sy=p.y; lastx=p.x; lasty=p.y; sms=lv_tick_get();
                     g_press_sx = g_press_lx = p.x; g_press_sy = g_press_ly = p.y;
                     s_press_scr=screen_current();   /* a gesture belongs to the screen it STARTED on */
                     cover_tap = 0;
-                    fsart_touch = ui_np_fsart_active();   /* latch: overlay owns this whole gesture */
                     sleep_touch = ui_np_overlay_active(); /* latch: the sleep popover owns this whole gesture */
-                    if(fsart_touch || sleep_touch){
+                    if(sleep_touch){
                         /* a modal overlay is up -> LVGL handles it; arm no ring seek / rim scroll here */
                     } else if(screen_current()==SCR_NOWPLAYING){
-                        /* A press within the album-cover square (centre 180,116; ~148px) is a
-                         * candidate to open full-screen art - DON'T arm a seek there, so the tap
-                         * can't be eaten by the ring (LVGL's cover click opens it). Presses
-                         * elsewhere on NP drive the seek. */
-                        if(ui_np_cover_hit(sx, sy)) cover_tap = 1;   /* wherever the theme put the cover */
+                        /* While only the art shows, a press is a tap on it (LVGL shows the controls) and
+                         * never arms a seek; with the controls up, a press on the ring may start one. */
+                        if(ui_np_cover_hit(sx, sy)) cover_tap = 1;
                         else ui_np_seek_press(sx, sy);
                     }
                     else {
@@ -3630,7 +3622,7 @@ int main(int argc, char **argv){
             } else if(ts==LV_INDEV_STATE_PRESSED){
                 last_activity = lv_tick_get();
                 lastx=p.x; lasty=p.y; g_press_lx=p.x; g_press_ly=p.y;
-                if(screen_current()==SCR_NOWPLAYING && !ui_np_fsart_active() && !sleep_touch) ui_np_seek_move(p.x, p.y);
+                if(screen_current()==SCR_NOWPLAYING && !sleep_touch) ui_np_seek_move(p.x, p.y);
                 else if(rim_move(p.x, p.y)){ /* rim drag owns the gesture (list or cover flow) */ }
                 else if(screen_current()==SCR_ALBUMWALL && rim_state==RIM_IDLE) albumwall_drag(p.x);  /* linear drag only when no rim gesture is armed */
             } else if(ts==LV_INDEV_STATE_RELEASED && prev_ts==LV_INDEV_STATE_PRESSED){
@@ -3640,7 +3632,7 @@ int main(int argc, char **argv){
                  * tap and open/play an album (cover flow) or misfire a seek/swipe. */
                 if(p.x >= 0 && p.x < 360 && p.y >= 0 && p.y < 360){ lastx = p.x; lasty = p.y; g_press_lx = p.x; g_press_ly = p.y; }
                 if(woke){
-                    woke = 0;   /* swallow the release that woke the saver */
+                    woke = 0;   /* swallow the release that woke the screen */
                 } else if(rim_release()){
                     /* rim-scroll owned this gesture -> no nav/tap classification */
                 } else {
@@ -3649,33 +3641,29 @@ int main(int argc, char **argv){
                     int adx=dx<0?-dx:dx, ady=dy<0?-dy:dy;
                     uint32_t dt=lv_tick_elaps(sms);
                     int cur=screen_current();
-                    /* fsart is owned entirely by LVGL (cover click opens, overlay click closes).
-                     * Swallow (never open/close/seek/nav) when the overlay is up / the press began
-                     * on it (fsart_touch), or when this is a genuine TAP that began on the cover
-                     * (cover_tap + small travel) - LVGL's cover click opens that one. A SWIPE that
-                     * merely started on the cover is NOT LVGL's (its cover click ignores slides), so
-                     * it must still fall through to nav (back/hub). Order-independent: only LVGL
-                     * mutates fsart state, so there's no open/close race. */
+                    /* Now Playing's controls are shown and hidden by LVGL alone (a still tap on the art).
+                     * Swallow a genuine TAP that began on the art (cover_tap + small travel). A SWIPE that
+                     * merely started there is not LVGL's (its tap ignores slides), so it still falls
+                     * through to nav (edge pull / options). */
                     int cover_tap_gesture = cover_tap && adx < 20 && ady < 20;
-                    int lvgl_owned = fsart_touch || cover_tap_gesture || sleep_touch;
+                    int lvgl_owned = cover_tap_gesture || sleep_touch;
                     /* a committed seek on Now Playing consumes the gesture. Replay the (fused) final
                      * position through the move handler first so the ring commits the release point, not
                      * the last PRESSED sample. */
                     int seek_consumed = 0;
-                    if(!lvgl_owned && cur==SCR_NOWPLAYING && !ui_np_fsart_active()){
+                    if(!lvgl_owned && cur==SCR_NOWPLAYING){
                         ui_np_seek_move(lastx, lasty);
                         seek_consumed = ui_np_seek_release(lastx, lasty);
                     }
                     int vert = ady > adx*2, horiz = adx > ady*2;
-                    if(lvgl_owned || ui_np_fsart_active()){
-                        /* swallow - LVGL handled (or will handle) the open/close */
+                    if(lvgl_owned){
+                        /* swallow - LVGL handled (or will handle) the tap */
                     } else if(!seek_consumed){
-                    if(cur==SCR_QUICK && vert && dy<0 && ady>=g_swipe_thresh && dt<700){
-                        screen_back();                       /* swipe up closes quick settings */
-                    } else if(cur!=SCR_QUICK && cur!=SCR_SAVER && sy<40 &&
-                              vert && dy>0 && dy>=g_swipe_thresh && dt<700){
-                        screen_show(SCR_QUICK);              /* pull down from top edge */
-                        quicksettings_refresh(playing);
+                    if(screen_pull_ok(cur) && vert && ady>=g_swipe_thresh && dt<700 &&
+                       ((sy < PULL_EDGE && dy > 0) || (sy >= 360 - PULL_EDGE && dy < 0))){
+                        /* edge pull: down from the top = the section above, up from the bottom = the one below */
+                        if(cur==SCR_ALBUMWALL) albumwall_drag_cancel();
+                        screen_section_step(dy > 0 ? -1 : +1);
                     } else if(cur==SCR_NOWPLAYING){
                         /* On Now Playing a nav swipe must be a LONG, STRAIGHT,
                          * horizontal slide (so it's not confused with a seek drag
@@ -3684,9 +3672,6 @@ int main(int argc, char **argv){
                             if(dx < 0) screen_show(SCR_NPHUB);
                             else       screen_back();
                         }
-                    } else if(cur==SCR_HOME && horiz && dx<0 && adx>=g_swipe_thresh && dt<700){
-                        apps_reload();
-                        screen_show(SCR_APPS);    /* slide in the Apps panel */
                     } else if(cur==SCR_ALBUMWALL && s_press_scr==SCR_ALBUMWALL){
                         /* gated on s_press_scr so the very tap that OPENED the cover flow (a click on the
                          * Library "Albums" row) is never re-read here as a cover tap that plays. */
@@ -3777,12 +3762,10 @@ int main(int argc, char **argv){
                     ui_backlight(0); bl_state = 2; g_screen_off = 1;
                     mclock_sync(0);
                     kit_cursor_sync(0);
-                    if(screen_current() == SCR_SAVER) screen_back();
                     break;
                 case SF_WAKE:     /* the player woke its panel: light it at the user's level */
                     wake_backlight(ui_effective_brightness());
                     bl_state = 0; g_screen_off = 0; last_activity = lv_tick_get();
-                    if(screen_current() == SCR_SAVER) screen_back();
                     break;
                 default: break;
                 }
@@ -3818,12 +3801,10 @@ int main(int argc, char **argv){
                     ui_backlight(0); bl_state = 2; g_screen_off = 1;
                     mclock_sync(0);
                     kit_cursor_sync(0);
-                    if(screen_current() == SCR_SAVER) screen_back();
                     break;
                 case PK_WAKE:     /* the player woke the panel: light it at the user's level (Outdoor: full), not the player's */
                     wake_backlight(ui_effective_brightness());
                     bl_state = 0; g_screen_off = 0; last_activity = lv_tick_get();
-                    if(screen_current() == SCR_SAVER) screen_back();
                     break;
                 case PK_RELEVEL:  /* the player rewrote a level on a showing screen: keep diskOS's (lit or dimmed) */
                     if(bl_state == 0) wake_backlight(ui_effective_brightness());
@@ -3834,14 +3815,13 @@ int main(int argc, char **argv){
             }
         }
 
-        /* screensaver + backlight power saving (the screen is the biggest drain):
-         * idle > saver_timeout       -> show saver, dim backlight
-         * idle > saver+screenoff      -> backlight off entirely */
-        int si = cfg_get_int("saver_idx", 2), oi = cfg_get_int("screenoff_idx", 3);
-        int saver_timeout   = (si>=0 && si<5) ? TMAP[si] : 60;
-        int screenoff_extra = (oi>=0 && oi<5) ? TMAP[oi] : 120;
+        /* backlight power saving (the screen is the biggest drain): idle past the Screen Off time -> backlight off;
+         * the last SCREEN_DIM_MS before that it dims, so a touch can keep it on. The screen stays on whatever it
+         * showed. */
+        int oi = cfg_get_int("screenoff_idx", 2);
+        int screen_off = (oi>=0 && oi<5) ? TMAP[oi] : 60;
         /* Never sleep while the on-screen keyboard is open: it owns all touch, so a
-         * dimmed/off saver couldn't be woken mid-typing (e.g. entering a Wi-Fi password). */
+         * dimmed/off screen couldn't be woken mid-typing (e.g. entering a Wi-Fi password). */
         /* Screen-off/dim wake on RAW touch: drain the raw evdev fd; ANY event means a finger touched,
          * so we wake even when LVGL coalesced the whole tap into a no-press-edge RELEASED (the reason
          * a dark panel needed many taps to wake). Drained every loop (even awake) so it never backs
@@ -3850,61 +3830,23 @@ int main(int argc, char **argv){
             char rb[512]; int any = 0;
             while(read(g_touch_raw, rb, sizeof rb) > 0) any = 1;
             if(any && bl_state && !pk.player_off){   /* the player's sleep (panel off): only its button wakes */
-                last_activity = lv_tick_get();
+                last_activity = wake_at = lv_tick_get();   /* its press edge, if LVGL sees one, is swallowed */
                 wake_backlight(ui_effective_brightness()); bl_state = 0; g_screen_off = 0;
-                if(screen_current() == SCR_SAVER) screen_back();
             }
         }
         if(kbinput_active()) last_activity = lv_tick_get();
         power_tick(last_activity, playing);   /* AFTER all input is consumed (a pending touch must win the race): SD-safe shutdown, diskOS idle power-off, temperature notice */
-        int in_saver = (screen_current()==SCR_SAVER);
-        /* a manual Sleep request ends the moment the panel is woken (we leave SCR_SAVER) */
-        if(g_manual_sleep && !in_saver) g_manual_sleep = 0;
-        int manual = g_manual_sleep;
-        /* Art-based savers (cover=0, vinyl=4) are a NOW-PLAYING display - only show them while
-         * something is playing; with nothing playing they're pointless (and were showing when
-         * they shouldn't). Time/info savers (analog=1, minim=2, weather=3) stay useful idle.
-         * A suppressed art saver still power-saves the backlight below. */
-        int sstyle    = cfg_get_int("saver_style", 0);
-        int art_saver = (sstyle == 0 || sstyle == 4);
-        int saver_ok  = (!art_saver || playing);
-        if(saver_timeout > 0 || manual){
-            /* manual sleep runs its dim/off countdown from the tile tap, independent of the
-             * (possibly disabled) auto-saver timer */
-            uint32_t idle = manual ? lv_tick_elaps(g_manual_sleep_at) : lv_tick_elaps(last_activity);
-            int past_dim = (saver_timeout > 0 && idle > (uint32_t)saver_timeout*1000);
-            /* auto-enter only in timeout mode AND only when the saver is appropriate now (art
-             * savers need playback). The Sleep tile already opened SCR_SAVER (manual).
-             * Gate on bl_state==0: enter ONLY from the fully-lit state. Once dimmed (1) or off (2)
-             * we never (re-)enter - after full-off we deliberately LEAVE the saver (below), and
-             * re-entering each loop would churn screen_show and revive saver animation behind a
-             * dark panel. */
-            if(past_dim && !in_saver && bl_state==0 && (saver_ok || manual)){
-                screen_show(SCR_SAVER); in_saver = 1;
-            }
-            /* dim once idle past the timeout (manual: immediately) - whether or not a saver
-             * screen is up, so a suppressed art saver still sleeps the screen normally. */
-            if((in_saver || past_dim || manual) && bl_state==0){
-                /* the vinyl art-showcase saver stays at the user's brightness; everything else
-                 * (incl. a suppressed art saver just dimming the current screen) crushes to a
-                 * low dim. bl_state still -> 1 so the screen-off timer powers the panel down. */
-                ui_backlight(dim_level()); bl_state = 1;
-            }
-            /* full off after the screen-off delay. Manual sleep uses the configured Screen Off
-             * delay when set, else a 10s default so the tile actually powers the panel down. */
-            uint32_t off_at = manual ? (uint32_t)(screenoff_extra > 0 ? screenoff_extra : 10)*1000
-                                     : (uint32_t)(saver_timeout+screenoff_extra)*1000;
-            if(bl_state==1 && (manual || screenoff_extra > 0) && idle > off_at){
+        if(g_manual_sleep){
+            g_manual_sleep = 0;
+            if(bl_state != 2){ ui_backlight(0); bl_state = 2; g_screen_off = 1; mclock_sync(0); kit_cursor_sync(0); }
+        }
+        if(screen_off > 0){
+            uint32_t idle = lv_tick_elaps(last_activity), off_ms = (uint32_t)screen_off * 1000;
+            if(bl_state == 0 && idle + SCREEN_DIM_MS > off_ms){ ui_backlight(dim_level()); bl_state = 1; }
+            if(bl_state == 1 && idle > off_ms){
                 ui_backlight(0); bl_state = 2; g_screen_off = 1;
                 mclock_sync(0);
                 kit_cursor_sync(0);
-                /* screen fully off -> STOP the screensaver. Leaving SCR_SAVER: (a) satisfies "the
-                 * saver stops when the screen turns off"; (b) pops back to the screen shown BEFORE
-                 * the saver, so a later wake lands there, not on the saver; (c) makes saver_anim_cb
-                 * a no-op (it self-gates on screen_current()==SCR_SAVER) so the analog seconds hand
-                 * stops. SAVER transitions are instant (no slide) - one cheap repaint behind a dark
-                 * panel. Guard on ==SCR_SAVER: a merely-dimmed non-saver screen has nothing to pop. */
-                if(screen_current()==SCR_SAVER) screen_back();
             }
         }
 
@@ -3925,8 +3867,7 @@ int main(int argc, char **argv){
         int busy = lv_anim_count_running() > 0 || prev_ts == LV_INDEV_STATE_PRESSED;
         if(bl_state == 2){
             /* deep idle (panel off): sleep ~5x/s REGARDLESS of any running animation. Nothing is
-             * visible, so a stray infinite anim (e.g. a Wi-Fi/BT scan glyph left spinning, or the
-             * saver's own motion) must NOT drop us to the 5ms 'busy' cap and spin the CPU at 200Hz -
+             * visible, so a stray infinite anim (e.g. a Wi-Fi/BT scan glyph left spinning) must NOT drop us to the 5ms 'busy' cap and spin the CPU at 200Hz -
              * that was the real reason "screen off" wasn't saving power. Wake stays reliable because
              * the raw evdev fd (drained every loop, above) holds a real finger-press in its kernel
              * queue across the 200ms sleep; we no longer rely on catching an LVGL press-edge. */

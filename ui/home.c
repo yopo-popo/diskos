@@ -13,11 +13,6 @@
 int ui_label_input_changed(lv_obj_t *obj, const char *txt);   /* ui.c: a label's text only when its input changes */
 int ui_label_set_changed(lv_obj_t *obj, const char *txt);
 
-LV_FONT_DECLARE(font_weather16)
-static lv_font_t s_wfont;   /* montserrat_14 with the weather-icon font as fallback */
-
-
-
 
 
 static lv_obj_t *g_clock;
@@ -26,7 +21,6 @@ static lv_obj_t *g_clock_sub;
 static lv_obj_t *g_home_bg;      /* full-screen blurred album backdrop (matches Now Playing) */
 static lv_obj_t *g_home_scrim;   /* dark overlay over the backdrop so text stays readable */
 static lv_obj_t *g_status;       /* top status row: wifi / bt / battery */
-static lv_obj_t *g_weather;      /* weather line under the date */
 static lv_obj_t *g_status_arc;
 static lv_obj_t *g_np_capsule;
 static lv_obj_t *g_np_thumb;
@@ -36,8 +30,8 @@ static lv_obj_t *g_np_thumb_glyph;
 static lv_obj_t *g_np_title;
 static lv_obj_t *g_np_artist;
 static lv_obj_t *g_np_state;
-/* "something" theme (THEME_TRAIT_MATRIX_CLOCK): a block-matrix clock drawn into one canvas. Two can exist: Home's
- * (handle 0) and the screensaver's (handle 1); each has its own canvas, buffer and AM/PM label. */
+/* "something" theme (THEME_TRAIT_MATRIX_CLOCK): a block-matrix clock drawn into one canvas. Home's is handle 0
+ * (handle 1 was the screensaver's); each has its own canvas, buffer and AM/PM label. */
 typedef struct { lv_obj_t *canvas, *ampm, *colon[2]; uint8_t *buf; int y; int drawn; char time[16]; } mclock_t;   /* time: drawn text */
 static mclock_t g_mc[2];
 static lv_timer_t *g_mc_blink;
@@ -95,7 +89,7 @@ static void mc_draw(mclock_t *m, const char *t, int ampm_w, int *ampm_x){
     lv_obj_invalidate(m->canvas);
 }
 static void mc_blink_cb(lv_timer_t *timer){
-    int h = screen_current() == SCR_HOME ? 0 : screen_current() == SCR_SAVER ? 1 : -1;
+    int h = screen_current() == SCR_HOME ? 0 : -1;
     if(h != g_mc_active || h < 0 || !g_mc[h].canvas || lv_obj_has_flag(g_mc[h].canvas, LV_OBJ_FLAG_HIDDEN)){
         lv_timer_pause(timer);
         g_mc_active = -1;
@@ -109,7 +103,7 @@ static void mc_blink_cb(lv_timer_t *timer){
 }
 /* Called after navigation and backlight changes, before the next timer pass. */
 void mclock_sync(int backlight_on){
-    int h = screen_current() == SCR_HOME ? 0 : screen_current() == SCR_SAVER ? 1 : -1;
+    int h = screen_current() == SCR_HOME ? 0 : -1;
     if(!backlight_on || h < 0 || !g_mc[h].canvas ||
        lv_obj_has_flag(g_mc[h].canvas, LV_OBJ_FLAG_HIDDEN)) h = -1;
     if(h < 0){
@@ -145,7 +139,7 @@ static void mc_colon_new(mclock_t *m, lv_obj_t *parent){
         }
     }
 }
-/* a matrix clock on parent at y (handle 0 = Home, 1 = screensaver); 0 on success */
+/* a matrix clock on parent at y (handle 0 = Home); 0 on success */
 int mclock_new(int h, lv_obj_t *parent, int y){
     if(h < 0 || h > 1 || g_mc[h].canvas) return g_mc[h].canvas ? 0 : -1;
     mclock_t *m = &g_mc[h];
@@ -219,16 +213,6 @@ static void nav_event_cb(lv_event_t *e)
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     if (ui_press_travel() > HOME_TAP_SLOP) return;
     screen_show((int)(uintptr_t)lv_event_get_user_data(e));
-}
-
-/* Tap the home weather glance -> open the full weather app (the natural glance->detail flow, so the
- * app no longer needs a buried Apps entry). No-op when the line is empty (weather off). */
-static void weather_event_cb(lv_event_t *e)
-{
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (ui_press_travel() > HOME_TAP_SLOP) return;   /* the line spans the screen: a swipe usually starts on it */
-    const char *t = g_weather ? lv_label_get_text(g_weather) : NULL;
-    if (t && t[0]) weather_app_open();
 }
 
 static void settings_event_cb(lv_event_t *e)
@@ -343,27 +327,6 @@ void home_set_clock(const char *time_text, const char *sub_text)
         theme_case_text(g_clock_sub, sub_text);            /* the theme's case (Default: as given) */
     }
     if (g_mclock) mclock_set(0, time_text);
-}
-
-void home_set_weather(const char *text)
-{
-    if (!g_weather) return;
-    const char *t = text ? text : "";
-    /* weather.c writes "<icon>  <temp>  <condition>". A line too narrow for all of it (a theme's side column) drops the
-     * icon before it cuts the words: "5 C Overcast" reads, "5 C Over..." does not. The icon is one private-use glyph
-     * (3-byte UTF-8, lead 0xEF). */
-    if ((unsigned char)t[0] == 0xEF && t[1] && t[2]) {
-        int32_t room = lv_obj_get_style_width(g_weather, 0);
-        if (room > 0 && room != LV_SIZE_CONTENT && !LV_COORD_IS_PCT(room)) {
-            room -= lv_obj_get_style_pad_left(g_weather, 0) + lv_obj_get_style_pad_right(g_weather, 0);
-            lv_point_t sz;
-            lv_text_get_size(&sz, t, lv_obj_get_style_text_font(g_weather, 0),
-                             lv_obj_get_style_text_letter_space(g_weather, 0), 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-            if (sz.x > room) { t += 3; while (*t == ' ') t++; }
-        }
-    }
-    if (!strcmp(lv_label_get_text(g_weather), t)) return;   /* unchanged fallback: no redraw every poll */
-    lv_label_set_text(g_weather, t);
 }
 
 /* Update the top status row. batt 0-100, charging/wifi/bt are booleans. */
@@ -553,18 +516,6 @@ void home_create(lv_obj_t *root)
     lv_obj_set_pos(g_clock_sub, 0, 88);
     lv_obj_set_width(g_clock_sub, 360);
 
-    /* Weather line (populated by weather.c via wttr.in). Uses montserrat_14 with
-     * the FA weather-icon font chained as fallback so the icon glyph renders. */
-    s_wfont = *TF(UI_14);
-    s_wfont.fallback = &font_weather16;
-    g_weather = make_label(root, "", &s_wfont, TC(TEXT_SECONDARY));
-    lv_obj_set_pos(g_weather, 0, 120);
-    lv_obj_set_width(g_weather, 360);
-    lv_label_set_long_mode(g_weather, LV_LABEL_LONG_DOT);
-    lv_obj_add_flag(g_weather, LV_OBJ_FLAG_CLICKABLE);       /* glance -> tap opens the weather app */
-    lv_obj_set_ext_click_area(g_weather, 12);                /* thin line: enlarge the touch target */
-    ui_on(g_weather, weather_event_cb, LV_EVENT_CLICKED, NULL, "home.weather", UI_CORE);
-
     /* search button (top-right) with a drawn magnifier glyph */
     lv_obj_t *sbtn = lv_button_create(root);
     lv_obj_remove_style_all(sbtn);
@@ -669,7 +620,7 @@ void home_create(lv_obj_t *root)
     lv_obj_center(g_np_state);
     if (theme_trait(THEME_TRAIT_MATRIX_CLOCK)) something_home(root, lib_pill, sbtn);
     if (theme_kit()->home){                            /* the active theme lays Home out its own way */
-        home_parts_t hp = { root, g_status, g_clock, g_clock_sub, g_weather, sbtn, lib_pill, hint, g_np_capsule,
+        home_parts_t hp = { root, g_status, g_clock, g_clock_sub, sbtn, lib_pill, hint, g_np_capsule,
                             g_np_thumb, g_np_art_img, g_np_thumb_glyph, g_np_title, g_np_artist, pp_btn, g_np_state };
         theme_kit()->home(&hp);
     }
@@ -685,7 +636,6 @@ static void something_home(lv_obj_t *root, lv_obj_t *lib_pill, lv_obj_t *search_
     lv_obj_set_pos(g_clock_sub, 0, 124);
     lv_obj_set_style_text_font(g_clock_sub, TF(DATE), 0);     /* dot-matrix face */
     lv_obj_set_style_text_color(g_clock_sub, TC(TEXT_SECONDARY), 0);
-    lv_obj_set_pos(g_weather, 0, 152);
     lv_obj_add_flag(lib_pill, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(search_btn, LV_OBJ_FLAG_HIDDEN);
     /* the pill: dark capsule with a hairline, accent ring + waveform instead of the art thumb, and its play key */

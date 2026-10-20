@@ -6,6 +6,8 @@
 #include "musicdb.h"
 #include "artcache.h"
 #include "config.h"
+#include "theme_kit.h"
+#include "i18n.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -20,7 +22,10 @@
  * and a 64px turned sprite, reflection included), kept in an LRU + prefetched in a window - so the flow
  * animation only translates + blends static bitmaps (no per-frame transforms) and stays smooth. Covers
  * come from the art cache (a track from the album must have been played); un-cached albums show a dark
- * placeholder. Tap the centre to play, long-press to open its tracks (dispatched from main.c). */
+ * placeholder. Tap the centre to play, long-press to open its tracks (dispatched from main.c).
+ * It shows every album (Library > Albums), or one artist's (the Artists list opens it when Album View is cover flow):
+ * that wall is titled with the artist, its covers open the artist's songs on the album, and an All Songs pill under
+ * the counter opens all of them. */
 
 #define AW_SRC    148      /* cached cover native size (must match artcache's c.bmp) */
 #define AW_REFL   32       /* reflection height */
@@ -42,6 +47,10 @@ static lv_obj_t *g_initial;
 static lv_obj_t *g_name, *g_artist, *g_counter;
 
 static ldb_list g_alb;            /* the albums, from library.db (title, album artist, first song's file) */
+/* What the wall shows: every album, or one artist's. The full wall keeps its own centre album while an artist's is up. */
+static int  g_scope = -1;         /* -1 = every album, else the artist's LDB_SCOPE_ARTIST / LDB_SCOPE_GROUP */
+static char g_scope_key[LDB_NAME];   /* that artist ("" = Unknown artist) */
+static int  g_cur_all;            /* the full wall's centre album while an artist's wall is shown */
 static int     g_aw_inited = 0;   /* one-time blank-sprite + LRU init done */
 static int     g_nalb;
 static int     g_cur;
@@ -207,6 +216,16 @@ static sprite_t *aw_sprite(int idx){
 
 /* ---- flow geometry ------------------------------------------------------------------------------ */
 static int aw_wrap(int idx){ return ((idx % g_nalb) + g_nalb) % g_nalb; }
+/* Up to 7 cards show at once (|position| < 2.75). A wall with fewer albums (an artist's, usually) would repeat its covers
+ * if it wrapped around, so it has two ends instead: the position stops at the first and last album. */
+#define AW_WRAP_MIN 7
+static int aw_wraps(void){ return g_nalb >= AW_WRAP_MIN; }
+static float aw_clamp(float p){
+    if(aw_wraps()) return p;
+    if(p < 0) return 0;
+    if(p > (float)(g_nalb - 1)) return (float)(g_nalb - 1);
+    return p;
+}
 static float aw_xmap(float p){
     if(p <= -2) return SLOT_X[0] + (p + 2) * (SLOT_X[1]-SLOT_X[0]);
     if(p >=  2) return SLOT_X[4] + (p - 2) * (SLOT_X[4]-SLOT_X[3]);
@@ -221,7 +240,9 @@ static void aw_render_card(int c){
     float a = fabsf(epos);
     if(a > 2.75f){ lv_obj_add_flag(fi, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(si, LV_OBJ_FLAG_HIDDEN); return; }
 
-    int album = aw_wrap(g_cur + (c - AW_CARDS/2));
+    int k = g_cur + (c - AW_CARDS/2);
+    if(!aw_wraps() && (k < 0 || k >= g_nalb)){ lv_obj_add_flag(fi, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(si, LV_OBJ_FLAG_HIDDEN); return; }
+    int album = aw_wrap(k);
     sprite_t *sp = aw_sprite(album); if(!sp || !sp->has_cover) sp = &g_blank;
     if(lv_image_get_src(fi) != &sp->fdsc) lv_image_set_src(fi, &sp->fdsc);
     if(lv_image_get_src(si) != &sp->sdsc) lv_image_set_src(si, &sp->sdsc);
@@ -254,7 +275,16 @@ static void aw_labels(void){
         lv_label_set_text(g_initial, in); lv_obj_clear_flag(g_initial, LV_OBJ_FLAG_HIDDEN);
     }else lv_obj_add_flag(g_initial, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(g_name, g_alb.v[g_cur].title);
-    lv_label_set_text(g_artist, mdb_artist_missing(g_alb.v[g_cur].artist) ? "Unknown artist" : g_alb.v[g_cur].artist);
+    const char *aa = g_alb.v[g_cur].artist;
+    if(g_scope >= 0 && !strcmp(aa, g_scope_key)) aa = "";   /* the artist this wall is for: the title says it */
+    else if(mdb_artist_missing(aa)) aa = "Unknown artist";
+    int year = g_alb.v[g_cur].year;                         /* the year first (an artist's wall is sorted by it) */
+    if(year > 0){
+        char yl[LDB_NAME + 16];
+        if(aa[0]) snprintf(yl, sizeof yl, "%d \u00B7 %s", year, aa);
+        else snprintf(yl, sizeof yl, "%d", year);
+        lv_label_set_text(g_artist, yl);
+    } else lv_label_set_text(g_artist, aa);
     char cc[24]; snprintf(cc,sizeof cc,"%d / %d", g_cur+1, g_nalb); lv_label_set_text(g_counter, cc);
 }
 static void aw_render_all(void){ for(int c=0;c<AW_CARDS;c++) aw_render_card(c); }
@@ -266,6 +296,7 @@ static void aw_render_all(void){ for(int c=0;c<AW_CARDS;c++) aw_render_card(c); 
 static float g_posf;                     /* continuous album position; g_cur=round(g_posf), g_off=g_cur-g_posf */
 static void aw_apply_pos(float P){
     if(g_nalb<=0) return;
+    P = aw_clamp(P);                                     /* a short wall stops at its ends */
     while(P < 0)          P += g_nalb;
     while(P >= g_nalb)    P -= g_nalb;
     g_posf = P;
@@ -281,6 +312,7 @@ static void aw_anim_exec(void *v, int32_t val){ (void)v; float k=val/1000.0f; aw
 static void aw_anim_done(lv_anim_t *a){ (void)a; aw_apply_pos(g_anim_to); g_animating = 0; }
 static void aw_anim_to(float to, uint32_t dur){          /* glide g_posf -> to (ease-out), then snap exact */
     lv_anim_delete(&g_anim_tag, NULL);
+    to = aw_clamp(to);
     g_anim_from = g_posf; g_anim_to = to; g_animating = 1;
     lv_anim_t a; lv_anim_init(&a); lv_anim_set_var(&a, &g_anim_tag);
     lv_anim_set_values(&a, 0, 1000); lv_anim_set_duration(&a, dur);
@@ -327,7 +359,7 @@ void albumwall_drag_end(void){                           /* release: throw a few
     g_drag_on = 0;
     float thr = g_drag_vel * 220.0f;                     /* coast ~220ms of the release velocity */
     if(thr >  8) thr =  8; else if(thr < -8) thr = -8;   /* cap the throw so a hard flick stays controllable */
-    float target = roundf(g_posf + thr);
+    float target = aw_clamp(roundf(g_posf + thr));
     float dist = target - g_posf; if(dist<0) dist=-dist;
     uint32_t dur = (uint32_t)(dist*120.0f) + 130; if(dur > 700) dur = 700;
     aw_anim_to(target, dur);
@@ -335,9 +367,18 @@ void albumwall_drag_end(void){                           /* release: throw a few
 void albumwall_play(void){
     if(g_nalb<=0) return;
     cfg_set_int("work_mode",0); ui_set_workmode(0);
-    if(library_play_album(g_alb.v[g_cur].artist, g_alb.v[g_cur].title)) screen_show(SCR_NOWPLAYING);
+    const ldb_item *a = &g_alb.v[g_cur];
+    int ok = g_scope < 0 ? library_play_album(a->artist, a->title)
+                         : library_wall_play(g_scope, g_scope_key, a->artist, a->title);   /* an artist's wall: their songs on it */
+    if(ok) screen_show(SCR_NOWPLAYING);
 }
-void albumwall_open(void){ if(g_nalb<=0) return; library_open_album(g_alb.v[g_cur].artist, g_alb.v[g_cur].title); screen_show(SCR_LIBRARY); }
+void albumwall_open(void){
+    if(g_nalb<=0) return;
+    const ldb_item *a = &g_alb.v[g_cur];
+    if(g_scope < 0) library_wall_open_album(a->artist, a->title);              /* Back returns here */
+    else library_wall_open(g_scope, g_scope_key, a->artist, a->title);   /* the artist's songs on it; Back returns here */
+    screen_show(SCR_LIBRARY);
+}
 
 /* ---- prefetch ----------------------------------------------------------------------------------- */
 /* When the background prewarm lands a new cover, drop any placeholder sprites so they re-bake with the
@@ -477,6 +518,52 @@ void albumwall_poll_sync(int lit){
 static void aw_back_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) screen_back(); }
 static lv_obj_t *aw_img(void){ lv_obj_t *im = lv_image_create(g_root); lv_obj_add_flag(im, LV_OBJ_FLAG_HIDDEN); return im; }
 
+/* An artist's wall: [ All Songs ] under the counter, the Artists list's "All Songs" row */
+static void aw_all_songs_cb(lv_event_t *e){
+    if(lv_event_get_code(e)!=LV_EVENT_CLICKED || g_scope < 0) return;
+    library_wall_open(g_scope, g_scope_key, NULL, NULL);
+    screen_show(SCR_LIBRARY);
+}
+static void aw_all_songs_pill(void){
+    const char *txt = tr("All Songs");
+    lv_point_t sz; lv_text_get_size(&sz, txt, TF(USER_14), 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    int w = sz.x + 28; if(w < 96) w = 96; if(w > 132) w = 132;   /* its text, at most what the round edge leaves there */
+    lv_obj_t *b = lv_button_create(g_root);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_size(b, w, 24); lv_obj_align(b, LV_ALIGN_TOP_MID, 0, 323);
+    lv_obj_set_style_radius(b, 12, 0);
+    lv_obj_set_style_bg_color(b, TC(SURFACE), 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(b, TC(SURFACE_PRESSED), LV_STATE_PRESSED);
+    ui_on(b, aw_all_songs_cb, LV_EVENT_CLICKED, NULL, "albumwall.all_songs", UI_CORE);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, txt);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_DOT); lv_obj_set_width(l, w - 20);   /* a long translation ends in "..." */
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(l, TF(USER_14), 0);
+    lv_obj_set_style_text_color(l, TC(TEXT_PRIMARY), 0);
+    lv_obj_center(l);
+}
+/* Show an artist's albums on the next entry, from the first one (kind = LDB_SCOPE_ARTIST or LDB_SCOPE_GROUP, as the
+ * Artists list is grouped). Returns how many there are; when none (or library.db can't be read) the wall is unchanged. */
+int albumwall_open_artist(int kind, const char *key){
+    ldb_list l;
+    int n = ldb_read_scope_albums(kind, key ? key : "", &l);
+    if(n <= 0){ ldb_list_free(&l); return n; }
+    if(g_scope < 0) g_cur_all = g_cur;
+    ldb_list_free(&g_alb); g_alb = l; g_nalb = 0;   /* nothing indexes the new list before albumwall_refresh counts it */
+    g_scope = kind; snprintf(g_scope_key, sizeof g_scope_key, "%s", key ? key : "");
+    g_cur = 0;
+    return n;
+}
+/* Show every album on the next entry, back at the full wall's own centre album. */
+void albumwall_open_all(void){
+    if(g_scope < 0) return;
+    ldb_list_free(&g_alb); g_nalb = 0;   /* albumwall_refresh reads every album again */
+    g_scope = -1; g_scope_key[0] = 0;
+    g_cur = g_cur_all;
+}
+
 void albumwall_create(lv_obj_t *root){
     g_root = root;
     if(!g_prefetch) g_prefetch = lv_timer_create(aw_prefetch_cb, 40, NULL);
@@ -506,12 +593,17 @@ void albumwall_refresh(void){
     for(int c=0;c<AW_CARDS;c++){ g_front[c]=NULL; g_side[c]=NULL; }
     lv_obj_set_style_bg_color(g_root, TC(CANVAS), 0);
     lv_obj_set_style_bg_opa(g_root, LV_OPA_COVER, 0);
-    ui_header_cb(g_root, "Albums", aw_back_cb);
+    lv_obj_t *title = ui_header_cb(g_root, "Albums", aw_back_cb);
+    if(g_scope >= 0) theme_title_text(title, g_scope_key[0] ? g_scope_key : "Unknown artist");   /* an artist's wall */
 
     /* the album list, read again only when a scan replaced library.db (the sprites were dropped above either way) */
     int rd = 0;
-    if(!ldb_list_current(&g_alb)){ ldb_list_free(&g_alb); rd = ldb_read_albums(&g_alb); }
+    if(!ldb_list_current(&g_alb)){
+        ldb_list_free(&g_alb);
+        rd = g_scope < 0 ? ldb_read_albums(&g_alb) : ldb_read_scope_albums(g_scope, g_scope_key, &g_alb);
+    }
     g_nalb = g_alb.n;
+    if(g_scope >= 0) aw_all_songs_pill();   /* the artist's songs stay one tap away, even if a rescan left no albums */
     if(g_nalb <= 0){
         lv_obj_t *e = lv_label_create(g_root);
         lv_label_set_text(e, rd < 0 ? "Scan the library to see albums" : "No albums found");
@@ -534,18 +626,20 @@ void albumwall_refresh(void){
     lv_obj_align(g_initial, LV_ALIGN_TOP_MID, 0, 72 + AW_SRC/2 - 12);
     lv_obj_add_flag(g_initial, LV_OBJ_FLAG_HIDDEN);
 
+    /* name, album artist, counter; an artist's wall lifts them a little for the All Songs pill under the counter */
+    const int y_name = g_scope < 0 ? 266 : 261, y_artist = g_scope < 0 ? 292 : 284, y_counter = g_scope < 0 ? 318 : 303;
     g_name = lv_label_create(g_root);
     lv_label_set_long_mode(g_name, LV_LABEL_LONG_DOT); lv_obj_set_size(g_name, 260, 24);
-    lv_obj_set_style_text_align(g_name, LV_TEXT_ALIGN_CENTER, 0); lv_obj_align(g_name, LV_ALIGN_TOP_MID, 0, 266);
+    lv_obj_set_style_text_align(g_name, LV_TEXT_ALIGN_CENTER, 0); lv_obj_align(g_name, LV_ALIGN_TOP_MID, 0, y_name);
     lv_obj_set_style_text_font(g_name, TF(USER_18), 0); lv_obj_set_style_text_color(g_name, TC(TEXT_PRIMARY), 0);
 
     g_artist = lv_label_create(g_root);
     lv_label_set_long_mode(g_artist, LV_LABEL_LONG_DOT); lv_obj_set_size(g_artist, 220, 20);
-    lv_obj_set_style_text_align(g_artist, LV_TEXT_ALIGN_CENTER, 0); lv_obj_align(g_artist, LV_ALIGN_TOP_MID, 0, 292);
+    lv_obj_set_style_text_align(g_artist, LV_TEXT_ALIGN_CENTER, 0); lv_obj_align(g_artist, LV_ALIGN_TOP_MID, 0, y_artist);
     lv_obj_set_style_text_font(g_artist, TF(USER_16), 0); lv_obj_set_style_text_color(g_artist, TC(TEXT_MUTED), 0);
 
     g_counter = lv_label_create(g_root);
-    lv_obj_align(g_counter, LV_ALIGN_TOP_MID, 0, 318);
+    lv_obj_align(g_counter, LV_ALIGN_TOP_MID, 0, y_counter);
     lv_obj_set_style_text_font(g_counter, TF(UI_14), 0); lv_obj_set_style_text_color(g_counter, TC(TEXT_DISABLED), 0);
 
     aw_render_all(); aw_labels();

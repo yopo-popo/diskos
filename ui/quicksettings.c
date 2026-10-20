@@ -161,7 +161,7 @@ static void tile_short_cb(lv_event_t *e){
         case QT_SEARCH:    screen_show(SCR_SEARCH); break;
         case QT_RESCAN:    ui_rescan_library(); break;
         case QT_MODE:      modes_open(); break;
-        case QT_SCREENOFF: ui_request_sleep(); screen_show(SCR_SAVER); break;
+        case QT_SCREENOFF: ui_request_sleep(); break;
         case QT_SHUFFLE: {
             if(ui_book_active()){ ui_toast("Not available in books"); break; }   /* books stay in Single */
             int on = cfg_get_int("work_mode", 0) == 1 ? 0 : 1;                    /* Shuffle <-> Sequential */

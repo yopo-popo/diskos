@@ -132,6 +132,7 @@ typedef struct {
     int disc, track;            /* song: 0 = not tagged */
     int duration_ms;            /* song: 0 = unknown */
     int count;                  /* album: its songs */
+    int year;                   /* album: its year (the one most of its songs carry), 0 = none; songs: 0 */
     int letter;                 /* the jump-bar letter of its sort key (ldb_key_letter) */
 } ldb_item;
 typedef struct {

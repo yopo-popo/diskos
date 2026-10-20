@@ -867,7 +867,7 @@ static const char *READ_ALBUMS =
     "SELECT a.title, a.album_artist,"
     " (SELECT t.path FROM tracks t WHERE t.album_artist=a.album_artist AND t.album_title=a.title " ALBUM_ORDER " LIMIT 1),"
     " NULL, NULL, 0, 0, 0, 0, 0,"
-    " (SELECT count(*) FROM tracks t WHERE t.album_artist=a.album_artist AND t.album_title=a.title), a.title_key"
+    " (SELECT count(*) FROM tracks t WHERE t.album_artist=a.album_artist AND t.album_title=a.title), a.title_key, a.year"
     " FROM albums a ORDER BY a.title_key, a.album_artist_key, a.title, a.album_artist;";
 
 /* The Artists view's key of song t under "By Album Artist": its album artist, else (no album) its first artist. */
@@ -888,18 +888,20 @@ static const char *READ_SCOPE_SONGS = "SELECT " SONG_COLS " " SONG_FROM " WHERE 
 static const char *READ_SCOPE_ALBUM_SONGS =
     "SELECT " SONG_COLS " FROM tracks t WHERE t.album_artist=?2 AND t.album_title=?3 AND %s " ALBUM_ORDER ";";
 static const char *READ_SCOPE_COUNT = "SELECT count(*) FROM tracks t WHERE %s;";
-#define SCOPE_ALBUMS(s) "SELECT a.title, a.album_artist," \
+#define SCOPE_ALBUMS(s, order) "SELECT a.title, a.album_artist," \
     " (SELECT t.path FROM tracks t WHERE t.album_artist=a.album_artist AND t.album_title=a.title " ALBUM_ORDER " LIMIT 1)," \
-    " NULL, NULL, 0, 0, 0, 0, 0, s.n, a.title_key FROM (" s ") s JOIN albums a ON a.album_artist=s.aa AND a.title=s.at" \
-    " ORDER BY a.title_key, a.album_artist_key, a.title, a.album_artist;"
-/* an artist's albums: those with a song of the scope, counting those songs */
+    " NULL, NULL, 0, 0, 0, 0, 0, s.n, a.title_key, a.year FROM (" s ") s JOIN albums a ON a.album_artist=s.aa AND a.title=s.at" \
+    " ORDER BY " order ";"
+#define ALBUMS_BY_TITLE "a.title_key, a.album_artist_key, a.title, a.album_artist"
+#define ALBUMS_BY_YEAR  "IFNULL(a.year, 0)=0, a.year, " ALBUMS_BY_TITLE   /* oldest first, undated last */
+/* an artist's albums: those with a song of the scope, counting those songs; by year (yopo, 2026-10-20) */
 static const char *READ_SCOPE_ALBUMS = SCOPE_ALBUMS("SELECT t.album_artist AS aa, t.album_title AS at, count(*) AS n"
-    " FROM tracks t WHERE t.album_title IS NOT NULL AND %s GROUP BY t.album_artist, t.album_title");
+    " FROM tracks t WHERE t.album_title IS NOT NULL AND %s GROUP BY t.album_artist, t.album_title", ALBUMS_BY_YEAR);
 /* a genre's albums: only those whose every song has the genre (yopo, 2026-10-17) */
 static const char *READ_GENRE_ALBUMS = SCOPE_ALBUMS("SELECT t.album_artist AS aa, t.album_title AS at, count(*) AS n"
     " FROM tracks t WHERE (t.album_artist, t.album_title) IN (SELECT t2.album_artist, t2.album_title"
     " FROM track_file_genres g JOIN tracks t2 ON t2.id=g.track_id WHERE g.genre=?1 AND t2.album_title IS NOT NULL)"
-    " GROUP BY t.album_artist, t.album_title HAVING min(%s)=1");
+    " GROUP BY t.album_artist, t.album_title HAVING min(%s)=1", ALBUMS_BY_TITLE);
 /* Most Played and Recent: the songs of listening.db's play counts that are in the library (attached as ls) */
 #define HISTORY_FROM "FROM ls.listened_songs h JOIN tracks t ON t.path=h.path AND t.start_ms=h.start_ms"
 static const char *const READ_HISTORY[2] = {
@@ -990,6 +992,7 @@ static int read_list(sqlite3_stmt *st, ldb_list *out){
         r->it.duration_ms = sqlite3_column_int(st, 9);
         r->it.count = sqlite3_column_int(st, 10);
         r->it.letter = ldb_key_letter((const char *)sqlite3_column_text(st, 11));
+        r->it.year = sqlite3_column_count(st) > 12 ? sqlite3_column_int(st, 12) : 0;   /* album lists: their year */
         n++;
     }
     if(ok && rc != SQLITE_DONE) ok = 0;

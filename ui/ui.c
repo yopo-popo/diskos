@@ -48,28 +48,16 @@ LV_FONT_DECLARE(font_icons_28)
 #define ARC_SWEEP    286
 #define ARC_ROT      127
 
-#define COVER_D      148
-
 static lv_obj_t *ring;
-static lv_obj_t *cover;
-static lv_obj_t *cover_img;
-static lv_obj_t *cover_note;
-static lv_obj_t *spindle;       /* vinyl-style centre label (hidden in Cover mode) */
-/* full-screen album-art view - reuses the stock player's /usr/data/fiio/cover.png (364px sharp,
- * incl. its online-fetched art). Tap the cover to open, tap again to close. Overlay on the NP root. */
-static lv_obj_t *fsart, *fsart_img, *fsart_title, *fsart_artist;
-static int fsart_on;
 static lv_obj_t *title;
 static lv_obj_t *artist;
-static lv_obj_t *album;   /* also hosts the track position: "N / M" or "Album [U+00B7] N/M" */
-static lv_obj_t *album_pos;   /* the position on its own line, for a theme that shows it (hidden otherwise) */
 static lv_obj_t *btn_pp;
 static lv_obj_t *btn_prev;
 static lv_obj_t *btn_next;
 static lv_obj_t *btn_fav;
 static lv_obj_t *fav_icon;
-static lv_obj_t *btn_sleep;    /* audiobook sleep-timer moon (occupies the heart slot for books) */
-static lv_obj_t *sleep_icon;
+static int g_np_ov_on;          /* Now Playing's controls show over the art (see "Now Playing: two states") */
+static uint32_t g_np_ov_touch;  /* the last touch while they show */
 static int g_np_fav, g_np_have, g_fav_px, g_fav_py;
 static char g_np_curpath[520];   /* the track the last update showed (the seek scrub latches it) */
 static lv_obj_t *btn_mode;
@@ -263,90 +251,14 @@ static int g_ring_d = ARC_D;      /* the drawn ring diameter; the seek band foll
 #define RING_R   (g_ring_d / 2)
 
 /* A theme may seek on a straight bar instead of the ring (ui_np_seek_line): the band is then the bar's box. */
-static int g_np_backdrop_on = 1;       /* the blurred cover behind Now Playing (a theme may turn it off) */
-static lv_obj_t *backdrop;
-void ui_np_backdrop_enabled(int on){ g_np_backdrop_on = on; if(!on && backdrop) lv_obj_add_flag(backdrop, LV_OBJ_FLAG_HIDDEN); }
+void ui_np_backdrop_enabled(int on){ (void)on; }   /* Now Playing always shows its art now: a theme's request is a no-op */
 static int g_pp_filled;               /* the theme's play key is an accent-filled button (ui_np_pp_filled) */
 void ui_np_pp_filled(int on){ g_pp_filled = on; }
 static lv_obj_t *g_seek_bar;          /* the line-seek bar (lv_bar or lv_slider), NULL = ring */
 static int32_t g_seek_shown;          /* the value last shown by seek_show() */
-#define SOME_RING_DOTS 112
-static lv_obj_t *g_some_ring_dot[SOME_RING_DOTS];
-static int g_some_ring_bucket;
-/* The hi-fi bezel has minute marks at 6 degree intervals. Only marks whose lit state
- * changes are invalidated; the arc below them still supplies the seek recognizer. */
-#define HIFI_TICKS 47
-static lv_obj_t *g_hifi_tick[HIFI_TICKS];
-static lv_point_precise_t g_hifi_tick_pts[HIFI_TICKS][2];
-static int g_hifi_bucket;
-static int hifi_np_active(void){ return !strcmp(theme_kit()->id, "hi-fi"); }
-static void hifi_ticks_show(int value){
-    int bucket = (value * HIFI_TICKS + 500) / 1000;
-    if(bucket < 0) bucket = 0;
-    if(bucket > HIFI_TICKS) bucket = HIFI_TICKS;
-    int lo = bucket < g_hifi_bucket ? bucket : g_hifi_bucket;
-    int hi = bucket > g_hifi_bucket ? bucket : g_hifi_bucket;
-    for(int i = lo; i < hi; i++)
-        if(g_hifi_tick[i]) lv_obj_set_style_line_color(g_hifi_tick[i],
-                                i < bucket ? TC(ACCENT_PRIMARY) : TC(DOT_GRID), 0);
-    g_hifi_bucket = bucket;
-}
-static void hifi_ticks_create(lv_obj_t *parent){
-    g_hifi_bucket = 0;
-    for(int i = 0; i < HIFI_TICKS; i++){
-        int deg = 132 + 6 * i;
-        double a = deg * 3.141592653589793 / 180.0;
-        int major = (deg % 30) == 0;
-        g_hifi_tick_pts[i][0] = (lv_point_precise_t){ 180 + (major ? 166 : 170) * cos(a),
-                                                       180 + (major ? 166 : 170) * sin(a) };
-        g_hifi_tick_pts[i][1] = (lv_point_precise_t){ 180 + 175 * cos(a), 180 + 175 * sin(a) };
-        lv_obj_t *tick = lv_line_create(parent);
-        lv_line_set_points(tick, g_hifi_tick_pts[i], 2);
-        lv_obj_set_style_line_width(tick, major ? 2 : 1, 0);
-        lv_obj_set_style_line_color(tick, TC(DOT_GRID), 0);
-        lv_obj_clear_flag(tick, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-        g_hifi_tick[i] = tick;
-    }
-}
-static void some_ring_show(int value){
-    int bucket = (value * SOME_RING_DOTS + 500) / 1000;
-    if(bucket < 0) bucket = 0;
-    if(bucket > SOME_RING_DOTS) bucket = SOME_RING_DOTS;
-    if(bucket == g_some_ring_bucket) return;
-    int lo = bucket < g_some_ring_bucket ? bucket : g_some_ring_bucket;
-    int hi = bucket > g_some_ring_bucket ? bucket : g_some_ring_bucket;
-    for(int i = lo; i < hi; i++){
-        lv_obj_t *dot = g_some_ring_dot[i];
-        if(dot) lv_obj_set_style_bg_color(dot, i < bucket ? accent : TC(CONTROL_TRACK), 0);
-    }
-    g_some_ring_bucket = bucket;
-}
-static void some_ring_create(lv_obj_t *parent){
-    int radius = g_ring_d / 2 - 3;
-    for(int i = 0; i < SOME_RING_DOTS; i++){
-        double a = (ARC_ROT + (double)ARC_SWEEP * i / (SOME_RING_DOTS - 1)) * 3.141592653589793 / 180.0;
-        lv_obj_t *dot = lv_obj_create(parent);
-        lv_obj_remove_style_all(dot);
-        lv_obj_set_size(dot, 4, 4);
-        lv_obj_set_pos(dot, RING_CX + (int)lround(radius * cos(a)) - 2,
-                            RING_CY + (int)lround(radius * sin(a)) - 2);
-        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(dot, TC(CONTROL_TRACK), 0);
-        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-        lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-        g_some_ring_dot[i] = dot;
-    }
-    lv_obj_set_style_arc_opa(ring, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_arc_opa(ring, LV_OPA_TRANSP, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, LV_PART_KNOB);
-}
 static void seek_show(int32_t v){
     g_seek_shown = v;
-    int hifi = hifi_np_active();
-    if(theme_trait(THEME_TRAIT_MATRIX_CLOCK)) some_ring_show(v);
-    else if(!hifi) lv_arc_set_value(ring, v);
-    if(hifi) hifi_ticks_show(v);
-    if(theme_kit()->np_progress) theme_kit()->np_progress(v);
+    lv_arc_set_value(ring, v);
     if(g_seek_bar){
         if(lv_obj_check_type(g_seek_bar, &lv_slider_class)) lv_slider_set_value(g_seek_bar, v, LV_ANIM_OFF);
         else lv_bar_set_value(g_seek_bar, v, LV_ANIM_OFF);
@@ -394,6 +306,8 @@ static int32_t seek_pt_to_value(int x, int y){
 /* press: returns 1 if this touch could be a seek (and arms the recognizer) */
 int ui_np_seek_press(int x, int y){
     g_seek_cand = 0; g_seek_on = 0; g_scrubbing = 0;   /* also clears a stuck scrub from a missed release */
+    if(!g_np_ov_on) return 0;                     /* only the art shows: a touch is a tap on it, never a seek */
+    g_np_ov_touch = lv_tick_get();                /* a touch keeps the controls up */
     if(y < 40) return 0;                          /* top drawer zone */
     if(g_track_dur <= 0) return 0;                /* nothing to seek */
     if(!seek_on_band(x, y, 34)) return 0;         /* not on the ring (grab band) */
@@ -404,6 +318,7 @@ int ui_np_seek_press(int x, int y){
 }
 /* move: returns 1 while a seek owns the gesture (so main.c skips navigation) */
 int ui_np_seek_move(int x, int y){
+    if(g_np_ov_on) g_np_ov_touch = lv_tick_get();
     if(!g_seek_cand) return 0;
     int dx = x - g_seek_sx, dy = y - g_seek_sy;
     int adx = dx<0?-dx:dx, ady = dy<0?-dy:dy;
@@ -528,68 +443,6 @@ static void transport_cb(lv_event_t *e)
     ui_transport_command((const char *)lv_event_get_user_data(e));
 }
 
-/* The cover opens Song Info on a TAP, but it is also where a horizontal
- * slide-to-the-side (-> Now Playing hub) often starts.  A clickable-but-not-
- * scrollable object still fires CLICKED after a slide, which used to open Song
- * Info instead of letting the swipe reach the hub.  So only treat it as a tap
- * when the finger barely moved; a slide is ignored here and handled by the
- * main-loop swipe gesture (-> SCR_NPHUB). */
-static int g_cover_px, g_cover_py;
-/* ---- full-screen album art (stock cover.png reuse) ---------------------------------------- */
-static char fsart_path[256];
-static void fsart_reload_img(void){
-    if(!fsart_img) return;
-    lv_image_set_src(fsart_img, NULL);                 /* cache off -> force a fresh decode */
-    /* Use the stock player's cover.JPG (364px sharp) - LVGL's JPEG decoder (TJPGD) is enabled;
-     * PNG (lodepng) is NOT, so cover.png can't be loaded. Fall back to our own BMP art. */
-    if(access("/usr/data/fiio/cover.jpg", 0) == 0)
-        lv_image_set_src(fsart_img, "A:/usr/data/fiio/cover.jpg");
-    else if(backdrop_valid)
-        lv_image_set_src(fsart_img, backdrop_src);     /* fallback: our own blurred backdrop (BMP) */
-    else if(cover_valid)
-        lv_image_set_src(fsart_img, cover_src);        /* last resort: the 148px cover (BMP) */
-}
-static void fsart_refresh_text(void){
-    if(fsart_title)  lv_label_set_text(fsart_title,  lv_label_get_text(title));
-    if(fsart_artist) lv_label_set_text(fsart_artist, lv_label_get_text(artist));
-}
-void ui_np_fsart_open(void){
-    if(!fsart || fsart_on || !g_np_have) return;       /* nothing to show if no track */
-    fsart_path[0] = '\0';
-    fsart_reload_img();
-    fsart_refresh_text();
-    lv_obj_set_style_opa(fsart, LV_OPA_TRANSP, 0);
-    lv_obj_remove_flag(fsart, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(fsart);
-    anim_fade(fsart, LV_OPA_TRANSP, LV_OPA_COVER, 240, NULL);
-    fsart_on = 1;
-}
-static void fsart_hidden_cb(lv_anim_t *a){ (void)a; if(fsart) lv_obj_add_flag(fsart, LV_OBJ_FLAG_HIDDEN); }
-void ui_np_fsart_close(void){
-    if(!fsart || !fsart_on) return;
-    fsart_on = 0;
-    anim_fade(fsart, LV_OPA_COVER, LV_OPA_TRANSP, 200, fsart_hidden_cb);
-}
-int ui_np_fsart_active(void){ return fsart_on; }
-static void fsart_click_cb(lv_event_t *e){
-    /* LVGL is the sole closer. The opening tap's CLICKED targets the cover (the press
-     * target), not this overlay, so raising fsart mid-click can't retarget it here -
-     * no timing guard needed. main.c only swallows the raw gesture; it never mutates fsart. */
-    if(lv_event_get_code(e)==LV_EVENT_CLICKED) ui_np_fsart_close();
-}
-
-static void cover_click_cb(lv_event_t *e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-    lv_indev_t *id = lv_indev_active();
-    if(code == LV_EVENT_PRESSED) {
-        if(id){ lv_point_t p; lv_indev_get_point(id, &p); g_cover_px = p.x; g_cover_py = p.y; }
-    }
-    /* Cover-tap no longer opens full-screen art (removed per product decision - the
-     * vinyl screensaver is the album-art showcase; full-screen art stays available via
-     * Options -> Full-screen Art). The PRESSED tracking above + main.c's cover-tap
-     * seek-skip remain so a tap on the cover can't accidentally seek. */
-}
 static void make_clickable(lv_obj_t *o, const char *cmd)
 {
     lv_obj_add_flag(o, LV_OBJ_FLAG_CLICKABLE);
@@ -604,12 +457,8 @@ static void apply_accent(void)
         lv_obj_set_style_arc_color(ring, accent, LV_PART_INDICATOR);
     }
 
-    if(cover_note) {
-        lv_obj_set_style_text_color(cover_note, TC(TEXT_PRIMARY), LV_PART_MAIN);
-    }
-
     if(btn_pp) {
-        if(theme_trait(THEME_TRAIT_NP_BIG_PLAY) || g_pp_filled) lv_obj_set_style_bg_color(btn_pp, accent, LV_PART_MAIN);
+        if(g_pp_filled) lv_obj_set_style_bg_color(btn_pp, accent, LV_PART_MAIN);
         else lv_obj_set_style_text_color(btn_pp, accent, LV_PART_MAIN);
     }
 
@@ -621,14 +470,9 @@ static void apply_accent(void)
         lv_obj_set_style_text_color(mode_icon, accent, LV_PART_MAIN);
     }
 
-    if(spindle) {
-        lv_obj_set_style_bg_color(spindle, accent, LV_PART_MAIN);
-    }
-
     /* keep the other accent-bearing surfaces in lockstep so no screen shows a stale
-     * (hardcoded-pink) accent: Home's now-playing capsule + the saver decorations. */
+     * (hardcoded-pink) accent: Home's now-playing capsule. */
     home_set_accent(accent);
-    saver_set_accent(accent);
 }
 
 /* the live accent (user-picked static, or the album-derived dynamic colour). Other
@@ -859,81 +703,6 @@ void ui_np_title_scroll(int visible)
         lv_label_set_long_mode(title, LV_LABEL_LONG_CLIP);
     }
 }
-
-static int g_np_vinyl = 0;
-static int g_spinning  = 0;
-
-static void spin_cb(void *var, int32_t v){ lv_image_set_rotation((lv_obj_t *)var, v % 3600); }
-
-/* Start/stop the vinyl spin. Idempotent - main.c calls this every loop with the
- * live condition (vinyl style && playing && Now Playing visible && screen on),
- * so the disc only spins when you're actually watching it. On pause it FREEZES
- * at the current angle (no reset) and resumes from there. */
-void ui_vinyl_spin(int want)
-{
-    want = want && g_np_vinyl && cover_img &&
-           !lv_obj_has_flag(cover_img, LV_OBJ_FLAG_HIDDEN) && lv_image_get_src(cover_img);
-    if(want == g_spinning) return;
-    g_spinning = want;
-    if(want){
-        int32_t cur = lv_image_get_rotation(cover_img);   /* resume from here */
-        lv_anim_t a; lv_anim_init(&a);
-        lv_anim_set_var(&a, cover_img);
-        lv_anim_set_exec_cb(&a, spin_cb);
-        lv_anim_set_values(&a, cur, cur + 3600);   /* +one turn; spin_cb wraps %3600 */
-        lv_anim_set_time(&a, 9000);                /* ~9s/rev - relaxed */
-        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_start(&a);
-    } else {
-        lv_anim_delete(cover_img, spin_cb);        /* freeze at current angle */
-    }
-}
-
-/* Now Playing style: 0 = album cover (rounded square), 1 = vinyl disc. */
-void ui_set_np_style(int vinyl)
-{
-    if(!cover) return;
-    g_np_vinyl = vinyl;
-    lv_obj_set_style_radius(cover, !strcmp(theme_kit()->id, "bauhaus") ? 0 : vinyl ? (COVER_D/2) : 14, LV_PART_MAIN);
-    if(spindle) {
-        if(vinyl) lv_obj_remove_flag(spindle, LV_OBJ_FLAG_HIDDEN);
-        else      lv_obj_add_flag(spindle, LV_OBJ_FLAG_HIDDEN);
-    }
-    if(!vinyl){
-        ui_vinyl_spin(0);                                  /* stop the spin */
-        if(cover_img) lv_image_set_rotation(cover_img, 0); /* Cover must sit upright */
-    }
-}
-
-static void set_cover_fallback(bool show, bool loading)
-{
-    if(show) {
-        ui_vinyl_spin(0);
-        if(cover_img) lv_obj_add_flag(cover_img, LV_OBJ_FLAG_HIDDEN);
-        if(cover_note) lv_obj_remove_flag(cover_note, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        if(cover_img) lv_obj_remove_flag(cover_img, LV_OBJ_FLAG_HIDDEN);
-        if(cover_note) lv_obj_add_flag(cover_note, LV_OBJ_FLAG_HIDDEN);
-    }
-    theme_kit()->np_cover_state(cover, cover_note, show, loading);
-}
-
-#ifdef DISKOS_HOST
-void ui_host_cover_state(int state){
-    if(state == 0){
-        enum { HOST_ART_SIZE = 148 };
-        static uint32_t pixels[HOST_ART_SIZE * HOST_ART_SIZE];
-        static lv_image_dsc_t art;
-        for(int y = 0; y < HOST_ART_SIZE; y++) for(int x = 0; x < HOST_ART_SIZE; x++)
-            pixels[y * HOST_ART_SIZE + x] = 0xff000000u | ((uint32_t)(30 + x) << 16) | ((uint32_t)(35 + y) << 8) | 90u;
-        art.header.magic = LV_IMAGE_HEADER_MAGIC; art.header.cf = LV_COLOR_FORMAT_ARGB8888;
-        art.header.w = HOST_ART_SIZE; art.header.h = HOST_ART_SIZE; art.header.stride = HOST_ART_SIZE * 4;
-        art.data = (const uint8_t *)pixels; art.data_size = sizeof pixels;
-        lv_image_set_src(cover_img, &art);
-    }
-    set_cover_fallback(state != 0, state == 1);
-}
-#endif
 
 /* Decode the 148px cover BMP into a RAM ARGB8888 descriptor. A file-sourced
  * lv_bmp image can't be rotated by the SW renderer (renders black) because the
@@ -1186,44 +955,310 @@ static void update_accent_seed(const track_state_t *st)
 }
 
 /* set by clear_art_state / apply_art (main thread); main.c re-pushes the
- * art-dependent surfaces (Home pill / Saver backdrop / Options thumb) when set. */
+ * art-dependent surfaces (Home pill / backdrop / Options thumb) when set. */
 static int g_art_applied = 0;
 
 /* Only current small artwork may act as the NP placeholder. */
 static int g_np_small_valid, g_np_cover_loading;
 
-/* The parent supplies the crop; the provider supplies borrowed sharp pixels. */
+/* ---- Now Playing: two states -------------------------------------------------------------------
+ * The cover art fills the round screen and turns slowly while music plays. A tap shows the controls (g_np_ov)
+ * over a blurred, dimmed copy of the same art, which keeps turning; a tap on an empty spot, or NP_OV_IDLE_MS
+ * without a touch, hides them again. The picture is the shared sharp 360 px cover (sharpart.c's sharp_cover_*);
+ * until it lands, the small 148 px cover is enlarged in its place. diskOS turns both pictures itself
+ * (sharp_rotate, ~6 ms a frame) into opaque images, with sharp_spin_start's spin (27 s a turn, 30 frames a
+ * second). */
+#define NP_W              360
+#define NP_OV_IDLE_MS     5000
+#define NP_OV_FADE_MS     220
+#define NP_BLUR_TINT      150     /* how far the blurred art leans to the theme's image tint (of 255), as the old backdrop */
+#define NP_BS             (NP_W / 4)   /* the blur works on a quarter-size copy */
+#define NP_LOG_MS         10000   /* the frame cost goes to diskos_boot.log ("NP spin") this often while turning */
+static lv_obj_t *g_np_art, *g_np_blur_img;      /* the turning sharp and blurred pictures */
+static lv_obj_t *g_np_noart, *g_np_noart_title; /* no cover: a dark disc with the song title */
+static lv_obj_t *g_np_tap;                       /* full-screen tap target under the controls */
+static lv_obj_t *g_np_ov;                        /* the controls and the song's info */
+static uint32_t *g_np_up;                        /* the small cover enlarged to NP_W, while there is no sharp one */
+static uint32_t *g_np_blur;                      /* the blurred, dimmed copy of the current picture */
+static uint32_t *g_np_out, *g_np_outb;           /* what g_np_art and g_np_blur_img show */
+static lv_image_dsc_t g_np_out_dsc, g_np_outb_dsc;
+static const uint32_t *g_np_src;                 /* the unturned picture; NULL = no art */
+static int32_t g_np_angle;                       /* 0.1 degree */
+static int g_np_spinning;
+static lv_timer_t *g_np_ov_tm;
+static int g_np_tap_px, g_np_tap_py;
+static uint32_t g_np_log_t0, g_np_turn_us, g_np_turn_n, g_np_draw_us, g_np_draw_n, g_np_draw_t0;
+
+static uint32_t np_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint32_t)((uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u); }
+static inline uint32_t np_lerp(uint32_t a, uint32_t b, uint32_t w){   /* per channel a..b, w in 0..256 */
+    uint32_t rb = (((a & 0x00FF00FFu) * (256 - w) + (b & 0x00FF00FFu) * w) >> 8) & 0x00FF00FFu;
+    uint32_t ag = ((((a >> 8) & 0x00FF00FFu) * (256 - w) + ((b >> 8) & 0x00FF00FFu) * w)) & 0xFF00FF00u;
+    return rb | ag;
+}
+/* Sample positions for growing an n-pixel line to NP_W pixels (bilinear, pixel centres lined up). */
+static void np_grow_map(int n, int16_t *i0, int16_t *i1, uint8_t *f)
+{
+    for(int d = 0; d < NP_W; d++){
+        int32_t v = (int32_t)(((int64_t)(2 * d + 1) * n * 32768) / NP_W) - 32768;   /* 16.16 */
+        if(v < 0) v = 0;
+        i0[d] = (int16_t)(v >> 16);
+        i1[d] = (int16_t)(i0[d] + 1 < n ? i0[d] + 1 : n - 1);
+        f[d] = (uint8_t)((v >> 8) & 0xFF);
+    }
+}
+/* The small cover (sw x sw BGRA bytes) grown to NP_W x NP_W. */
+__attribute__((optimize("O2")))
+static void np_enlarge(const uint8_t *src, int sw, uint32_t *dst)
+{
+    static int16_t i0[NP_W], i1[NP_W]; static uint8_t f[NP_W];
+    np_grow_map(sw, i0, i1, f);
+    for(int y = 0; y < NP_W; y++){
+        const uint8_t *r0 = src + i0[y] * sw * 4, *r1 = src + i1[y] * sw * 4;
+        for(int x = 0; x < NP_W; x++){
+            const uint8_t *a = r0 + i0[x] * 4, *b = r0 + i1[x] * 4, *c = r1 + i0[x] * 4, *d = r1 + i1[x] * 4;
+            uint32_t pa = a[0] | (uint32_t)a[1] << 8 | (uint32_t)a[2] << 16, pb = b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16;
+            uint32_t pc = c[0] | (uint32_t)c[1] << 8 | (uint32_t)c[2] << 16, pd = d[0] | (uint32_t)d[1] << 8 | (uint32_t)d[2] << 16;
+            dst[y * NP_W + x] = np_lerp(np_lerp(pa, pb, f[x]), np_lerp(pc, pd, f[x]), f[y]) | 0xFF000000u;
+        }
+    }
+}
+/* One box-blur pass (radius 4) over every row (horiz) or column of an NP_BS x NP_BS channel. */
+static void np_box(const uint8_t *in, uint8_t *out, int horiz)
+{
+    const int r = 4, n = NP_BS, w = 2 * r + 1;
+    for(int line = 0; line < n; line++){
+        int base = horiz ? line * n : line, step = horiz ? 1 : n;
+        int sum = 0;
+        for(int k = -r; k <= r; k++) sum += in[base + (k < 0 ? 0 : k) * step];
+        for(int i = 0; i < n; i++){
+            out[base + i * step] = (uint8_t)(sum / w);
+            int add = i + r + 1, sub = i - r;
+            if(add > n - 1) add = n - 1;
+            if(sub < 0) sub = 0;
+            sum += in[base + add * step] - in[base + sub * step];
+        }
+    }
+}
+/* The soft copy for under the controls: shrink 4x, blur that (three box passes each way, close to a gaussian),
+ * grow it back and lean it towards the theme's image tint so the text over it reads. */
+__attribute__((optimize("O2")))
+static void np_make_blur(const uint32_t *src, uint32_t *dst)
+{
+    static uint8_t ch[3][NP_BS * NP_BS], tmp[NP_BS * NP_BS];
+    static int16_t i0[NP_W], i1[NP_W]; static uint8_t f[NP_W];
+    for(int by = 0; by < NP_BS; by++)
+        for(int bx = 0; bx < NP_BS; bx++){
+            uint32_t s0 = 0, s1 = 0, s2 = 0;
+            for(int y = 0; y < 4; y++){
+                const uint32_t *p = src + (by * 4 + y) * NP_W + bx * 4;
+                for(int x = 0; x < 4; x++){ s0 += p[x] & 0xFF; s1 += (p[x] >> 8) & 0xFF; s2 += (p[x] >> 16) & 0xFF; }
+            }
+            int i = by * NP_BS + bx;
+            ch[0][i] = (uint8_t)(s0 >> 4); ch[1][i] = (uint8_t)(s1 >> 4); ch[2][i] = (uint8_t)(s2 >> 4);
+        }
+    for(int k = 0; k < 3; k++)
+        for(int pass = 0; pass < 3; pass++){ np_box(ch[k], tmp, 1); np_box(tmp, ch[k], 0); }
+    uint32_t tint = lv_color_to_u32(TC(IMAGE_TINT));
+    uint32_t tk[3];
+    for(int k = 0; k < 3; k++) tk[k] = ((tint >> (8 * k)) & 0xFF) * NP_BLUR_TINT;
+    const uint32_t keep = 255 - NP_BLUR_TINT;
+    np_grow_map(NP_BS, i0, i1, f);
+    for(int y = 0; y < NP_W; y++){
+        int r0 = i0[y] * NP_BS, r1 = i1[y] * NP_BS;
+        uint32_t fy = f[y];
+        for(int x = 0; x < NP_W; x++){
+            uint32_t fx = f[x], px = 0xFF000000u;
+            for(int k = 0; k < 3; k++){
+                const uint8_t *c = ch[k];
+                uint32_t top = c[r0 + i0[x]] * (256 - fx) + c[r0 + i1[x]] * fx;
+                uint32_t bot = c[r1 + i0[x]] * (256 - fx) + c[r1 + i1[x]] * fx;
+                uint32_t v = (top * (256 - fy) + bot * fy) >> 16;
+                px |= ((v * keep + tk[k]) / 255) << (8 * k);
+            }
+            dst[y * NP_W + x] = px;
+        }
+    }
+}
+static void np_dsc(lv_image_dsc_t *d, uint32_t *px)
+{
+    memset(d, 0, sizeof *d);
+    d->header.magic = LV_IMAGE_HEADER_MAGIC;
+    d->header.cf = LV_COLOR_FORMAT_XRGB8888;   /* opaque: a plain copy for LVGL, no per-pixel blend */
+    d->header.w = d->header.h = NP_W;
+    d->header.stride = NP_W * 4;
+    d->data = (const uint8_t *)px;
+    d->data_size = NP_W * NP_W * 4;
+}
+/* The picture buffers, allocated once; 0 when memory is short (Now Playing then shows the no-art disc). */
+static int np_bufs(void)
+{
+    const size_t n = (size_t)NP_W * NP_W;
+    if(!g_np_out){ g_np_out = calloc(n, 4); if(g_np_out) np_dsc(&g_np_out_dsc, g_np_out); }   /* zeroed: outside the circle stays black */
+    if(!g_np_outb){ g_np_outb = calloc(n, 4); if(g_np_outb) np_dsc(&g_np_outb_dsc, g_np_outb); }
+    if(!g_np_blur) g_np_blur = malloc(n * 4);
+    return g_np_out && g_np_outb && g_np_blur;
+}
+static void np_vis(lv_obj_t *o, int on)
+{
+    if(!o || on == !lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN)) return;
+    if(on) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+    else   lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+}
+static void np_turn(lv_obj_t *img, const uint32_t *src, uint32_t *out, lv_image_dsc_t *dsc)
+{
+    uint32_t t = np_us();
+    sharp_rotate(src, out, g_np_angle);
+    g_np_turn_us += np_us() - t; g_np_turn_n++;
+    lv_image_cache_drop(dsc);
+    lv_obj_invalidate(img);
+}
+/* Turns the pictures that show to the current angle. */
+static void np_draw(void)
+{
+    if(!g_np_src || !g_np_art) return;
+    if(!lv_obj_has_flag(g_np_art, LV_OBJ_FLAG_HIDDEN)) np_turn(g_np_art, g_np_src, g_np_out, &g_np_out_dsc);
+    if(!lv_obj_has_flag(g_np_blur_img, LV_OBJ_FLAG_HIDDEN)) np_turn(g_np_blur_img, g_np_blur, g_np_outb, &g_np_outb_dsc);
+}
+/* Shows what fits the state (stopping a fade): the sharp art alone, the blurred art under the controls, or the
+ * no-art disc (with the title while the controls are hidden). */
+static void np_show_now(void)
+{
+    if(!g_np_ov) return;
+    lv_anim_delete(g_np_ov, NULL);
+    lv_anim_delete(g_np_blur_img, NULL);
+    lv_obj_set_style_opa(g_np_ov, LV_OPA_COVER, 0);
+    lv_obj_set_style_opa(g_np_blur_img, LV_OPA_COVER, 0);
+    int art = g_np_src != NULL, ov = g_np_ov_on;
+    np_vis(g_np_art, art && !ov);
+    np_vis(g_np_blur_img, art && ov);
+    np_vis(g_np_noart, !art);
+    np_vis(g_np_noart_title, !art && !ov);
+    np_vis(g_np_ov, ov);
+    np_draw();
+}
+static void np_ov_faded(lv_anim_t *a){ (void)a; np_show_now(); }
+/* Shows (on) or hides the controls. Animated: both pictures show and turn while the blurred one and the
+ * controls fade, then np_show_now settles the end state. */
+static void np_ov_set(int on, int animate)
+{
+    if(!g_np_ov) { g_np_ov_on = 0; return; }
+    if(on == g_np_ov_on){ if(!animate) np_show_now(); return; }
+    g_np_ov_on = on;
+    if(g_np_ov_tm){
+        if(on){ g_np_ov_touch = lv_tick_get(); lv_timer_reset(g_np_ov_tm); lv_timer_resume(g_np_ov_tm); }
+        else lv_timer_pause(g_np_ov_tm);
+    }
+    if(!animate){ np_show_now(); return; }
+    int art = g_np_src != NULL;
+    lv_opa_t from = on ? LV_OPA_TRANSP : LV_OPA_COVER, to = on ? LV_OPA_COVER : LV_OPA_TRANSP;
+    np_vis(g_np_noart_title, 0);
+    np_vis(g_np_art, art);
+    np_vis(g_np_blur_img, art);
+    np_vis(g_np_ov, 1);
+    np_draw();
+    if(art){ lv_obj_set_style_opa(g_np_blur_img, from, 0); anim_fade(g_np_blur_img, from, to, NP_OV_FADE_MS, NULL); }
+    lv_obj_set_style_opa(g_np_ov, from, 0);
+    anim_fade(g_np_ov, from, to, NP_OV_FADE_MS, np_ov_faded);
+}
+/* The controls hide after NP_OV_IDLE_MS without a touch (a finger on the ring keeps them). */
+static void np_ov_idle(lv_timer_t *t)
+{
+    (void)t;
+    if(g_scrubbing || g_seek_cand){ g_np_ov_touch = lv_tick_get(); return; }
+    if(g_np_ov_on && lv_tick_elaps(g_np_ov_touch) >= NP_OV_IDLE_MS) np_ov_set(0, 1);
+}
+/* A still tap shows or hides the controls; a slide is a gesture for main.c (section pull, options swipe). A tap on
+ * the ring's band while the controls show is left alone: that is where a seek starts. */
+static void np_tap_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_point_t p = { 0, 0 };
+    lv_indev_t *id = lv_indev_active();
+    if(id) lv_indev_get_point(id, &p);
+    if(code == LV_EVENT_PRESSED){ g_np_tap_px = p.x; g_np_tap_py = p.y; return; }
+    if(code != LV_EVENT_CLICKED) return;
+    int dx = p.x - g_np_tap_px, dy = p.y - g_np_tap_py;
+    if((dx < 0 ? -dx : dx) > 18 || (dy < 0 ? -dy : dy) > 18) return;   /* was a swipe (cst816t wobble tolerance) */
+    if(g_np_ov_on && seek_on_band(g_np_tap_px, g_np_tap_py, 34)) return;
+    np_ov_set(!g_np_ov_on, 1);
+}
+static void np_noart_text(void)
+{
+    if(g_np_noart_title) set_label_text_changed(g_np_noart_title, lv_label_get_text(title));
+}
+static void np_log(void)
+{
+    uint32_t el = lv_tick_elaps(g_np_log_t0);
+    if(el < NP_LOG_MS) return;
+    if(g_np_turn_n)
+        fprintf(stderr, "NP spin: %u frames in %u ms, turn %u us, draw %u us (averages)\n", (unsigned)g_np_draw_n, (unsigned)el,
+                (unsigned)(g_np_turn_us / g_np_turn_n), (unsigned)(g_np_draw_n ? g_np_draw_us / g_np_draw_n : 0));
+    g_np_log_t0 = lv_tick_get();
+    g_np_turn_us = g_np_turn_n = g_np_draw_us = g_np_draw_n = 0;
+}
+/* LVGL's own render time per frame (refresh start to rendered and flushed), counted while the art turns. */
+static void np_render_cb(lv_event_t *e)
+{
+    if(!g_np_spinning) return;
+    if(lv_event_get_code(e) == LV_EVENT_REFR_START) g_np_draw_t0 = np_us();
+    else if(g_np_draw_t0){ g_np_draw_us += np_us() - g_np_draw_t0; g_np_draw_n++; g_np_draw_t0 = 0; }
+}
+static void np_spin_cb(void *var, int32_t v)
+{
+    static uint32_t last;
+    (void)var;
+    if(!sharp_spin_due(&last)) return;
+    g_np_angle = v % 3600;
+    np_draw();
+    np_log();
+}
+/* main.c, every loop: the art turns only while playing, on screen and lit; paused it stays at its angle. */
+void ui_np_spin(int want)
+{
+    want = want && g_np_src && g_np_art;
+    if(want == g_np_spinning) return;
+    g_np_spinning = want;
+    if(want){
+        g_np_log_t0 = lv_tick_get();
+        g_np_turn_us = g_np_turn_n = g_np_draw_us = g_np_draw_n = g_np_draw_t0 = 0;
+        sharp_spin_start(g_np_art, g_np_angle, np_spin_cb);
+    } else lv_anim_delete(g_np_art, np_spin_cb);   /* paused it stays at its angle */
+}
+
+/* The picture changed (a cover arrived or went, the track or the theme changed): use the best one there is. */
 void ui_np_cover_changed(void)
 {
-    if (!cover_img) return;
-    int bauhaus = !strcmp(theme_kit()->id, "bauhaus");
-    const lv_image_dsc_t *sharp = bauhaus ? sharp_cover_get() : NULL;
-    int d = sharp ? 360 : COVER_D;
-    lv_image_set_src(cover_img, NULL);   /* detach even if the next file source fails to open */
-    lv_image_set_src(cover_img, sharp ? (const void *)sharp :
-                     g_np_small_valid ? (coverdsc_valid ? (const void *)&g_coverdsc : (const void *)cover_src) : NULL);
-    lv_obj_set_size(cover_img, d, d);
-    lv_image_set_inner_align(cover_img, LV_IMAGE_ALIGN_CENTER);
-    lv_image_set_pivot(cover_img, d / 2, d / 2);
-    lv_image_set_scale(cover_img, bauhaus && !sharp ? 623 : 256);
-    lv_obj_center(cover_img);
-    set_cover_fallback(!sharp && !g_np_small_valid, g_np_cover_loading != 0);
+    if(!g_np_art) return;
+    const lv_image_dsc_t *sharp = sharp_cover_get();
+    const uint32_t *src = NULL;
+    if(sharp && sharp->header.w == NP_W && sharp->header.h == NP_W) src = (const uint32_t *)sharp->data;
+    else if(g_np_small_valid && coverdsc_valid){
+        if(!g_np_up) g_np_up = malloc((size_t)NP_W * NP_W * 4);
+        if(g_np_up){ np_enlarge(g_coverdsc.data, CBMP, g_np_up); src = g_np_up; }
+    }
+    if(src && !np_bufs()) src = NULL;
+    g_np_src = src;
+    if(src){
+        np_make_blur(src, g_np_blur);
+        if(lv_image_get_src(g_np_art) != &g_np_out_dsc) lv_image_set_src(g_np_art, &g_np_out_dsc);
+        if(lv_image_get_src(g_np_blur_img) != &g_np_outb_dsc) lv_image_set_src(g_np_blur_img, &g_np_outb_dsc);
+    }
+    if(!src) ui_np_spin(0);
+    np_show_now();
 }
 
 static void np_sharp_demand(void)
 {
-    if (!strcmp(theme_kit()->id, "bauhaus") && screen_current() == SCR_NOWPLAYING) sharp_cover_request();
+    if (screen_current() == SCR_NOWPLAYING) sharp_cover_request();
 }
 
 /* Drop all album-art state to the no-art fallback (used for no-track, empty
- * path, and failed decode) so stale art isn't republished to Home/Saver. */
+ * path, and failed decode) so stale art isn't republished to Home. */
 static void clear_art_state(void)
 {
     cover_valid = thumb_valid = backdrop_valid = 0;
     coverdsc_valid = 0;
     last_art_key[0] = '\0';
-    if(backdrop) lv_obj_add_flag(backdrop, LV_OBJ_FLAG_HIDDEN);
-    if(cover_note) lv_label_set_text(cover_note, LV_SYMBOL_AUDIO);  /* no-art / failed decode = music note */
     g_np_small_valid = g_np_cover_loading = 0;
     ui_np_cover_changed();
     g_art_applied = 1;   /* re-push: clears Home/Saver since validity flags are now 0 */
@@ -1236,7 +1271,7 @@ static void clear_art_state(void)
  * state); the main thread applies the result in ui_art_poll() (LVGL is not
  * thread-safe). A new decode ALWAYS targets the non-displayed buffer
  * (displayed_idx ^ 1), so an in-flight decode can never overwrite the /tmp BMP the
- * shown art (Home pill / Saver backdrop) may still be rendering from. */
+ * shown art (Home pill / backdrop) may still be rendering from. */
 typedef struct {
     char track[256];
     int  idx;
@@ -1252,8 +1287,8 @@ typedef struct {
 /* Serializes the two artwork decoders (the live NP worker below + the background cover prewarm) so
  * they never run two ~19MB image pipelines at once (OOM/stall). Held only around the decoder call. */
 static pthread_mutex_t g_decode_mu = PTHREAD_MUTEX_INITIALIZER;
-/* Shared by ALL artwork decoders (live NP, prewarm, AND the vinyl saver) so at most one runs at
- * once - two ~19MB pipelines together risk OOM. saver.c wraps its decode with these. */
+/* Shared by ALL artwork decoders (live NP, prewarm, AND the sharp cover) so at most one runs at
+ * once - two ~19MB pipelines together risk OOM. sharpart.c wraps its decode with these. */
 void ui_decode_lock(void){ pthread_mutex_lock(&g_decode_mu); }
 void ui_decode_unlock(void){ pthread_mutex_unlock(&g_decode_mu); }
 
@@ -1357,11 +1392,6 @@ static void apply_art(const art_req_t *job)
         if(acc_rgb){ accent = theme_accent_from_rgb(acc_rgb); apply_accent(); }
     }
     copy_cstr(last_art_key, sizeof last_art_key, job->art_key);   /* cache key (album+dir) */
-    if(backdrop && g_np_backdrop_on) {                /* a theme may keep its own background (ui_np_backdrop_enabled) */
-        lv_image_set_src(backdrop, backdrop_src);
-        lv_obj_remove_flag(backdrop, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_background(backdrop);
-    }
     displayed_idx = job->idx;   /* this buffer is now the one on screen */
     g_art_applied = 1;          /* main.c re-pushes Home/Saver/npmenu art next loop */
 }
@@ -1450,28 +1480,6 @@ static chapter_t g_chaps[NP_MAXCHAP];
 static int       g_nchaps;
 static char      g_chap_path[256];
 
-/* Build the Now Playing secondary line for a BOOK. Returns 1 if st is a book (out is set - possibly
- * empty when the book carries no chapters), 0 if it isn't a book (caller shows the album line). */
-static int book_meta_line(const track_state_t *st, char *out, int cap)
-{
-    if(!mdb_is_book_path(st->path)) return 0;
-    if(strcmp(g_chap_path, st->path) != 0){          /* new book -> load its chapters once (udta chpl parse) */
-        g_nchaps = scan_read_chapters(st->path, g_chaps, NP_MAXCHAP);
-        copy_cstr(g_chap_path, sizeof g_chap_path, st->path);
-    }
-    if(g_nchaps <= 0){ out[0] = '\0'; return 1; }    /* a book without chapters: show nothing, not an album */
-    int cur = 0;
-    for(int i = 0; i < g_nchaps; i++){ if(g_chaps[i].start_ms <= st->position_ms) cur = i; else break; }
-    /* The chpl reader fills untitled chapters with "Chapter N"; if this chapter has only that
-     * auto-name, show "Chapter N/M" rather than the redundant "N/M [U+00B7] Chapter N". */
-    char autoname[24]; snprintf(autoname, sizeof autoname, "Chapter %d", cur + 1);
-    if(strcmp(g_chaps[cur].title, autoname) == 0)
-        snprintf(out, cap, "Chapter %d/%d", cur + 1, g_nchaps);
-    else
-        snprintf(out, cap, "%d/%d  \xC2\xB7  %s", cur + 1, g_nchaps, g_chaps[cur].title);   /* 2/3 [U+00B7] Into the Future */
-    return 1;
-}
-
 /* Swap the prev/next transport glyphs between music (track skip) and audiobook (-15s/+30s). Only
  * touches the widgets when the mode actually changes, so it's cheap to call every update. */
 static int g_np_bookmode = -1;   /* -1 unknown, 0 music, 1 book */
@@ -1485,9 +1493,9 @@ static void np_transport_glyphs(int book)
     lv_label_set_text(btn_next, book ? "+30" : LV_SYMBOL_NEXT);
 }
 
-/* ---- audiobook sleep timer (moon on Now Playing) --------------------------------------------- */
+/* ---- audiobook sleep timer (Now Playing options, for a book) ----------------------------------- */
 /* End of the chapter that currently contains the playback position (in book ms), for "End of chapter"
- * sleep. Reuses the g_chaps cache loaded by book_meta_line. */
+ * sleep. Loads the book's chapters once (shared with book_chapter_window). */
 static long book_cur_chapter_end(const track_state_t *st)
 {
     if(strcmp(g_chap_path, st->path) != 0){
@@ -1523,10 +1531,9 @@ static int book_chapter_window(const track_state_t *st, long *lo, long *hi)
 
 static lv_obj_t *g_sleep_dlg;
 void ui_np_close_overlays(void){ if(g_sleep_dlg){ lv_obj_del(g_sleep_dlg); g_sleep_dlg = NULL; } }
-int ui_np_cover_hit(int x, int y){   /* main.c: a press on the (visible) cover is a cover tap, not a seek */
-    if(!cover || lv_obj_has_flag(cover, LV_OBJ_FLAG_HIDDEN)) return 0;
-    lv_area_t a; lv_obj_get_coords(cover, &a);
-    return x >= a.x1 && x <= a.x2 && y >= a.y1 && y <= a.y2;
+int ui_np_cover_hit(int x, int y){   /* main.c: while only the art shows, every press is a tap on it (never a seek) */
+    (void)x; (void)y;
+    return !g_np_ov_on;
 }
 int  ui_np_overlay_active(void){ return g_sleep_dlg != NULL; }   /* 1 while the sleep popover is up (main loop suppresses the ring/nav gesture) */
 
@@ -1551,10 +1558,10 @@ static void sleep_opt_cb(lv_event_t *e)
 }
 static void sleep_scrim_cb(lv_event_t *e){ if(lv_event_get_code(e) == LV_EVENT_CLICKED) ui_np_close_overlays(); }
 
-static void sleep_click_cb(lv_event_t *e)
+/* The sleep-timer chooser (Now Playing options, for a book). */
+void ui_sleep_popover(void)
 {
-    if(lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if(g_sleep_dlg){ ui_np_close_overlays(); return; }              /* tap the moon again to dismiss */
+    if(g_sleep_dlg){ ui_np_close_overlays(); return; }
     lv_obj_t *scrim = lv_obj_create(lv_layer_top());               /* full-screen dim; tap outside closes */
     g_sleep_dlg = scrim;
     lv_obj_remove_style_all(scrim);
@@ -1635,10 +1642,10 @@ int ui_take_art_force(void){ int f = g_art_force; g_art_force = 0; return f; }
 /* Entry also handles unchanged state after a fresh theme process or SD denial. */
 void ui_np_enter(void)
 {
-    if (!g_np_small_valid && (strcmp(theme_kit()->id, "bauhaus") || !sharp_cover_get())) ui_art_retry();
+    if (!g_np_small_valid && !sharp_cover_get()) ui_art_retry();
     g_art_force = 1;
-    ui_np_cover_changed();
-    if (!strcmp(theme_kit()->id, "bauhaus")) sharp_cover_request();
+    np_ov_set(0, 0);   /* Now Playing opens on the art */
+    sharp_cover_request();
 }
 
 /* Two independent state pieces: last_path owns local decoding/display; the token,
@@ -1698,7 +1705,6 @@ static void update_cover_for_path(const track_state_t *st)
         /* art is already valid for this album - ensure the cover is shown (recovers
          * if a previous in-flight load had swapped in the loading glyph and then a
          * same-album track arrived before that decode landed). */
-        if(cover_note) lv_label_set_text(cover_note, LV_SYMBOL_AUDIO);
         g_np_small_valid = 1; g_np_cover_loading = 0;
         ui_np_cover_changed();
         return;
@@ -1711,10 +1717,8 @@ static void update_cover_for_path(const track_state_t *st)
     /* New album/art incoming: hide the now-wrong NP cover and show a loading glyph
      * while the worker decodes, so the previous album's art doesn't masquerade as
      * this track's. apply_art() (success) or clear_art_state() (fail) restores it.
-     * NB: do NOT touch cover_valid here - it's read by ui_current_cover_dsc() for the
-     * vinyl saver, which (like the Home thumb/backdrop) keeps last-good art until the
-     * new decode lands; only this prominent NP cover shows the loading state. */
-    if(cover_note) lv_label_set_text(cover_note, LV_SYMBOL_REFRESH);
+     * NB: do NOT touch cover_valid here - the Home thumb/backdrop keep last-good art until the
+     * new decode lands; only Now Playing shows the loading state. */
     g_np_small_valid = 0; g_np_cover_loading = 1;
     ui_np_cover_changed();
     coverdsc_valid = 0;   /* the RAM decode is now the PREVIOUS album's - don't let the accent use stale art */
@@ -1802,7 +1806,7 @@ void ui_art_poll(lv_timer_t *t)
 }
 
 /* main.c calls this each loop: returns 1 once after art was (re)applied so the
- * dependent surfaces (Home pill / Saver backdrop / Options thumb) get re-pushed. */
+ * dependent surfaces (Home pill / backdrop / Options thumb) get re-pushed. */
 int ui_take_art_applied(void)
 {
     if(!g_art_applied) return 0;
@@ -1970,20 +1974,13 @@ const char *ui_current_cover_src(void)
     return cover_valid ? cover_src : NULL;
 }
 
-/* Rotatable RAM cover (ARGB8888 dsc) for the vinyl screensaver - the file-BMP
- * renders black when rotated, this one transforms fine. NULL if no art. */
-const void *ui_current_cover_dsc(void)
-{
-    return coverdsc_valid ? (const void *)&g_coverdsc : NULL;   /* NULL if RAM decode failed (no stale art) */
-}
-
 /* Native-size 42px thumb path for the Home pill, or NULL when no art. */
 const char *ui_current_thumb_src(void)
 {
     return thumb_valid ? thumb_src : NULL;
 }
 
-/* Full-screen blurred backdrop path (for the screensaver), or NULL. */
+/* Full-screen blurred backdrop path (for Home), or NULL. */
 const char *ui_current_backdrop_src(void)
 {
     return backdrop_valid ? backdrop_src : NULL;
@@ -2053,6 +2050,35 @@ const lv_font_t *ui_font_cjk(int size)
     return &s_font[size];
 }
 
+/* The clock and battery line, at the top of the Library root (main's clock_tick and status poll feed it). */
+static lv_obj_t *g_status;
+static char g_status_hm[12];
+static int  g_status_batt = -1, g_status_charging;
+static void status_paint(void){
+    if(!g_status) return;
+    char t[48];
+    int b = g_status_batt;   /* the same glyphs as Home's status had: the bolt while charging, else the battery level */
+    const char *bs = g_status_charging ? LV_SYMBOL_CHARGE : b >= 90 ? LV_SYMBOL_BATTERY_FULL : b >= 65 ? LV_SYMBOL_BATTERY_3 :
+                     b >= 40 ? LV_SYMBOL_BATTERY_2 : b >= 15 ? LV_SYMBOL_BATTERY_1 : LV_SYMBOL_BATTERY_EMPTY;
+    if(b >= 0) snprintf(t, sizeof t, "%s   %s %d%%", g_status_hm, bs, b);
+    else snprintf(t, sizeof t, "%s", g_status_hm);
+    if(strcmp(lv_label_get_text(g_status), t)) lv_label_set_text(g_status, t);
+}
+static void status_deleted(lv_event_t *e){ if(lv_event_get_target(e) == (void *)g_status) g_status = NULL; }
+lv_obj_t *ui_status_line(lv_obj_t *parent)
+{
+    g_status = lv_label_create(parent);
+    style_text(g_status, TF(UI_14), TC(TEXT_SECONDARY));
+    lv_obj_align(g_status, LV_ALIGN_TOP_MID, 0, 8);
+    lv_obj_clear_flag(g_status, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(g_status, status_deleted, LV_EVENT_DELETE, NULL);
+    lv_label_set_text(g_status, "");
+    status_paint();
+    return g_status;
+}
+void ui_status_clock(const char *hm){ snprintf(g_status_hm, sizeof g_status_hm, "%s", hm ? hm : ""); status_paint(); }
+void ui_status_batt(int batt, int charging){ g_status_batt = batt; g_status_charging = charging; status_paint(); }
+
 void ui_create(lv_obj_t *root)
 {
     lv_obj_t *scr = root;
@@ -2064,7 +2090,7 @@ void ui_create(lv_obj_t *root)
     lin_lut_init();   /* seed the OKLab sRGB LUT once, up front: dynamic accent compute
                        * (art worker) needs it whether or not the prewarm ever runs. */
     /* settings_apply_startup() ran before us and already loaded g_accent_mode/g_accent_color
-     * from cfg, so honor a saved STATIC accent here - otherwise Home/Saver (created right
+     * from cfg, so honor a saved STATIC accent here - otherwise Home (created right
      * after, and now reading the live accent) would paint the default until the first
      * ui_update() corrected them. Dynamic mode keeps the default until an album accent lands. */
     accent = (g_accent_mode == 1) ? theme_accent_from_rgb(g_accent_color) : TC(ACCENT_PRIMARY);
@@ -2086,20 +2112,69 @@ void ui_create(lv_obj_t *root)
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(scr, TC(CANVAS), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
-
-    /* full-screen blurred album-art backdrop (created first = behind everything) */
     backdrop_src[0] = '\0';
-    backdrop = lv_image_create(scr);
-    lv_obj_set_size(backdrop, 360, 360);
-    lv_obj_align(backdrop, LV_ALIGN_CENTER, 0, 0);
-    /* darken the blurred art so foreground text/controls stay readable */
-    lv_obj_set_style_image_recolor(backdrop, TC(IMAGE_TINT), LV_PART_MAIN);
-    lv_obj_set_style_image_recolor_opa(backdrop, 150, LV_PART_MAIN);
-    lv_obj_add_flag(backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(backdrop, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    g_np_mode = -1;        /* the widgets are new: let the refreshes below paint them */
+    g_np_bookmode = -1;
 
-    ring = lv_arc_create(scr);
-    if(theme_trait(THEME_TRAIT_NP_BIG_PLAY)) g_ring_d = 352;
+    /* Now Playing: two states (see above ui_np_cover_changed) */
+    ui_np_spin(0);
+    g_np_ov_on = 0;
+    if(!g_np_ov_tm) g_np_ov_tm = lv_timer_create(np_ov_idle, 250, NULL);
+    lv_timer_pause(g_np_ov_tm);
+    static int s_np_perf;
+    if(!s_np_perf && lv_display_get_default()){
+        s_np_perf = 1;
+        lv_display_add_event_cb(lv_display_get_default(), np_render_cb, LV_EVENT_REFR_START, NULL);
+        lv_display_add_event_cb(lv_display_get_default(), np_render_cb, LV_EVENT_RENDER_READY, NULL);
+    }
+
+    /* ---- the art: a dark disc with the title when there is none; the turning picture, sharp alone, blurred under the controls ---- */
+    g_np_noart = lv_obj_create(scr);
+    lv_obj_remove_style_all(g_np_noart);
+    lv_obj_set_size(g_np_noart, NP_W, NP_W);
+    lv_obj_center(g_np_noart);
+    lv_obj_set_style_radius(g_np_noart, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(g_np_noart, TC(ART_PLACEHOLDER), 0);
+    lv_obj_set_style_bg_opa(g_np_noart, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(g_np_noart, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    g_np_noart_title = lv_label_create(g_np_noart);
+    lv_obj_set_width(g_np_noart_title, 240);
+    style_text(g_np_noart_title, TF(USER_20), TC(TEXT_SECONDARY));
+    lv_label_set_long_mode(g_np_noart_title, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(g_np_noart_title, tr("No Track"));
+    lv_obj_center(g_np_noart_title);
+
+    g_np_art = lv_image_create(scr);
+    g_np_blur_img = lv_image_create(scr);
+    lv_obj_t *pics[2] = { g_np_art, g_np_blur_img };
+    for(int i = 0; i < 2; i++){
+        lv_obj_set_size(pics[i], NP_W, NP_W);
+        lv_obj_center(pics[i]);
+        lv_obj_clear_flag(pics[i], LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(pics[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* ---- a still tap anywhere shows or hides the controls (the buttons above it take their own taps) ---- */
+    g_np_tap = lv_obj_create(scr);
+    lv_obj_remove_style_all(g_np_tap);
+    lv_obj_set_size(g_np_tap, NP_W, NP_W);
+    lv_obj_center(g_np_tap);
+    lv_obj_clear_flag(g_np_tap, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g_np_tap, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(g_np_tap, np_tap_cb, LV_EVENT_PRESSED, NULL);
+    ui_on(g_np_tap, np_tap_cb, LV_EVENT_CLICKED, NULL, "ui.np_tap", UI_CORE);
+
+    /* ---- the controls: seek ring, title, artist, transport, play mode, heart, times ---- */
+    g_np_ov = lv_obj_create(scr);
+    lv_obj_remove_style_all(g_np_ov);
+    lv_obj_set_size(g_np_ov, NP_W, NP_W);
+    lv_obj_center(g_np_ov);
+    lv_obj_clear_flag(g_np_ov, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g_np_ov, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t *ov = g_np_ov;
+
+    ring = lv_arc_create(ov);
+    g_ring_d = ARC_D;
     lv_obj_set_size(ring, g_ring_d, g_ring_d);
     lv_obj_align(ring, LV_ALIGN_CENTER, 0, 0);
     lv_arc_set_range(ring, 0, 1000);
@@ -2119,103 +2194,48 @@ void ui_create(lv_obj_t *root)
     lv_obj_set_style_pad_all(ring, 5, LV_PART_KNOB);
     lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
     /* display-only: seek is driven by the NP recognizer (ui_np_seek_*) fed from
-     * main.c's raw touch loop, so nav swipes / drawer pulls never grab the arc */
+     * main.c's raw touch loop, so nav swipes / edge pulls never grab the arc */
     lv_obj_clear_flag(ring, LV_OBJ_FLAG_CLICKABLE);
-    if(theme_trait(THEME_TRAIT_MATRIX_CLOCK)) some_ring_create(scr);
-    if(hifi_np_active()) hifi_ticks_create(scr);
 
-    cover = lv_obj_create(scr);
-    lv_obj_remove_style_all(cover);
-    lv_obj_set_size(cover, COVER_D, COVER_D);
-    lv_obj_align(cover, LV_ALIGN_TOP_MID, 0, 42);
-    lv_obj_set_style_radius(cover, 14, LV_PART_MAIN);
-    lv_obj_set_style_clip_corner(cover, true, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(cover, TC(ART_PLACEHOLDER), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(cover, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(cover, 0, LV_PART_MAIN);
-    lv_obj_clear_flag(cover, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(cover, LV_OBJ_FLAG_CLICKABLE);   /* tap art -> Song Info */
-    lv_obj_add_event_cb(cover, cover_click_cb, LV_EVENT_PRESSED, NULL);
-    ui_on(cover, cover_click_cb, LV_EVENT_CLICKED, NULL, "ui.cover", UI_DECORATIVE);   /* tap only guards against a seek */
+    title = lv_label_create(ov);
+    g_title_scroll_mode = LV_LABEL_LONG_CLIP;
+    lv_obj_set_width(title, 250);
+    style_text(title, TF(USER_20), TC(TEXT_PRIMARY));
+    lv_label_set_long_mode(title, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_label_set_text(title, tr("No Track"));
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 96);
 
-    cover_img = lv_image_create(cover);
-    lv_obj_set_size(cover_img, COVER_D, COVER_D);
-    lv_obj_center(cover_img);
-    /* CENTER (not STRETCH): the BMP is already COVER_D, and STRETCH forces the
-     * pivot to (0,0) which would break the vinyl spin. Pivot at centre. */
-    lv_image_set_inner_align(cover_img, LV_IMAGE_ALIGN_CENTER);
-    lv_image_set_pivot(cover_img, COVER_D/2, COVER_D/2);
-    lv_obj_add_flag(cover_img, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(cover_img, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    artist = lv_label_create(ov);
+    lv_obj_set_width(artist, 230);
+    style_text(artist, TF(USER_16), TC(TEXT_SECONDARY));
+    lv_label_set_long_mode(artist, LV_LABEL_LONG_DOT);
+    lv_label_set_text(artist, "");
+    lv_obj_align(artist, LV_ALIGN_TOP_MID, 0, 126);
 
-    cover_note = lv_label_create(cover);
-    style_text(cover_note, TF(UI_28), TC(TEXT_PRIMARY));
-    lv_label_set_text(cover_note, LV_SYMBOL_AUDIO);
-    lv_obj_set_style_text_opa(cover_note, LV_OPA_90, LV_PART_MAIN);
-    lv_obj_center(cover_note);
-    lv_obj_clear_flag(cover_note, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    set_cover_fallback(true, false);
+    btn_prev = lv_label_create(ov);
+    style_text(btn_prev, TF(UI_28), TC(TEXT_PRIMARY));
+    lv_label_set_text(btn_prev, LV_SYMBOL_PREV);
+    lv_obj_align(btn_prev, LV_ALIGN_TOP_MID, -72, 168);
 
-    /* vinyl centre label: accent disc with a small spindle hole, on top of the
-     * art. Shown only in Vinyl style. */
-    spindle = lv_obj_create(cover);
-    lv_obj_remove_style_all(spindle);
-    lv_obj_set_size(spindle, 34, 34);
-    lv_obj_center(spindle);
-    lv_obj_set_style_radius(spindle, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(spindle, accent, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(spindle, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_clear_flag(spindle, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t *hole = lv_obj_create(spindle);
-    lv_obj_remove_style_all(hole);
-    lv_obj_set_size(hole, 8, 8);
-    lv_obj_center(hole);
-    lv_obj_set_style_radius(hole, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(hole, TC(CANVAS), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(hole, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_add_flag(spindle, LV_OBJ_FLAG_HIDDEN);
+    btn_pp = lv_label_create(ov);
+    style_text(btn_pp, TF(UI_32), accent);
+    ui_pp_glyph(btn_pp, 0);
+    lv_obj_align(btn_pp, LV_ALIGN_TOP_MID, 0, 164);
 
-    /* The Playback (tuning) and Options menus moved off this screen - they're
-     * reached by a right-edge swipe (-> SCR_NPHUB); back is a left-edge swipe.
-     * The seek ring fills the screen, so the ring previews a seek anywhere you
-     * drag, but the actual seek is only COMMITTED on release if the gesture
-     * wasn't a deliberate edge swipe (see ui_seek_commit/ui_seek_cancel, driven
-     * by the main loop). So seek works everywhere except a bezel-edge flick. */
+    btn_next = lv_label_create(ov);
+    style_text(btn_next, TF(UI_28), TC(TEXT_PRIMARY));
+    lv_label_set_text(btn_next, LV_SYMBOL_NEXT);
+    lv_obj_align(btn_next, LV_ALIGN_TOP_MID, 72, 168);
 
-    /* Favorites heart - upper-right, just outside the cover's right edge */
-    btn_fav = lv_button_create(scr);
-    lv_obj_remove_style_all(btn_fav);
-    lv_obj_set_size(btn_fav, 44, 44);
-    lv_obj_align(btn_fav, LV_ALIGN_TOP_MID, 118, 126);
-    lv_obj_add_flag(btn_fav, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(btn_fav, fav_click_cb, LV_EVENT_PRESSED, NULL);
-    ui_on(btn_fav, fav_click_cb, LV_EVENT_CLICKED, NULL, "ui.fav", UI_CORE);
-    fav_icon = lv_label_create(btn_fav);
-    lv_obj_set_style_text_font(fav_icon, TF(ICON_28), LV_PART_MAIN);
-    lv_obj_set_style_text_color(fav_icon, TC(TEXT_MUTED), LV_PART_MAIN);
-    lv_label_set_text(fav_icon, HEART_OUTLINE);
-    lv_obj_center(fav_icon);
-    lv_obj_add_flag(btn_fav, LV_OBJ_FLAG_HIDDEN);   /* shown once a track loads */
+    make_clickable(btn_prev, "0201000C0002");
+    make_clickable(btn_pp,   "0201000C0000");
+    make_clickable(btn_next, "0201000C0001");
 
-    /* Audiobook sleep-timer moon - occupies the heart slot for books (heart is hidden for them). */
-    btn_sleep = lv_button_create(scr);
-    lv_obj_remove_style_all(btn_sleep);
-    lv_obj_set_size(btn_sleep, 44, 44);
-    lv_obj_align(btn_sleep, LV_ALIGN_TOP_MID, 118, 126);
-    lv_obj_add_flag(btn_sleep, LV_OBJ_FLAG_CLICKABLE);
-    ui_on(btn_sleep, sleep_click_cb, LV_EVENT_CLICKED, NULL, "ui.sleep", UI_CORE);
-    sleep_icon = lv_label_create(btn_sleep);
-    lv_obj_set_style_text_font(sleep_icon, TF(ICON_28), LV_PART_MAIN);
-    lv_obj_set_style_text_color(sleep_icon, TC(TEXT_MUTED), LV_PART_MAIN);
-    lv_label_set_text(sleep_icon, MOON_ICON);
-    lv_obj_center(sleep_icon);
-    lv_obj_add_flag(btn_sleep, LV_OBJ_FLAG_HIDDEN);   /* shown only for audiobooks */
-
-    /* Play-mode toggle - left side, mirrors the heart */
-    btn_mode = lv_button_create(scr);
+    /* Play-mode toggle (left) and the favourites heart (right), under the transport */
+    btn_mode = lv_button_create(ov);
     lv_obj_remove_style_all(btn_mode);
     lv_obj_set_size(btn_mode, 44, 44);
-    lv_obj_align(btn_mode, LV_ALIGN_TOP_MID, -118, 126);
+    lv_obj_align(btn_mode, LV_ALIGN_TOP_MID, -52, 222);
     lv_obj_add_flag(btn_mode, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(btn_mode, mode_click_cb, LV_EVENT_PRESSED, NULL);
     ui_on(btn_mode, mode_click_cb, LV_EVENT_CLICKED, NULL, "ui.mode", UI_CORE);
@@ -2231,157 +2251,41 @@ void ui_create(lv_obj_t *root)
     lv_obj_add_flag(mode_one, LV_OBJ_FLAG_HIDDEN);
     mode_refresh(cfg_get_int("work_mode", 0));
 
-    title = lv_label_create(scr);
-    g_title_scroll_mode = LV_LABEL_LONG_CLIP;
-    lv_obj_set_width(title, 260);
-    style_text(title, TF(USER_20), TC(TEXT_PRIMARY));
-    lv_label_set_long_mode(title, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_label_set_text(title, tr("No Track"));
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 198);
+    btn_fav = lv_button_create(ov);
+    lv_obj_remove_style_all(btn_fav);
+    lv_obj_set_size(btn_fav, 44, 44);
+    lv_obj_align(btn_fav, LV_ALIGN_TOP_MID, 52, 222);
+    lv_obj_add_flag(btn_fav, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(btn_fav, fav_click_cb, LV_EVENT_PRESSED, NULL);
+    ui_on(btn_fav, fav_click_cb, LV_EVENT_CLICKED, NULL, "ui.fav", UI_CORE);
+    fav_icon = lv_label_create(btn_fav);
+    lv_obj_set_style_text_font(fav_icon, TF(ICON_28), LV_PART_MAIN);
+    lv_obj_set_style_text_color(fav_icon, TC(TEXT_MUTED), LV_PART_MAIN);
+    lv_label_set_text(fav_icon, HEART_OUTLINE);
+    lv_obj_center(fav_icon);
+    lv_obj_add_flag(btn_fav, LV_OBJ_FLAG_HIDDEN);   /* shown once a track loads */
 
-    artist = lv_label_create(scr);
-    lv_obj_set_width(artist, 238);
-    style_text(artist, TF(USER_16), TC(TEXT_SECONDARY));
-    lv_label_set_long_mode(artist, LV_LABEL_LONG_DOT);
-    lv_label_set_text(artist, "");
-    lv_obj_align(artist, LV_ALIGN_TOP_MID, 0, 226);
-
-    album = lv_label_create(scr);
-    lv_obj_set_width(album, 218);
-    style_text(album, TF(USER_14), TC(TEXT_MUTED));
-    lv_label_set_long_mode(album, LV_LABEL_LONG_DOT);
-    lv_label_set_text(album, "");
-    lv_obj_align(album, LV_ALIGN_TOP_MID, 0, 246);
-
-    album_pos = lv_label_create(scr);
-    style_text(album_pos, TF(USER_14), TC(TEXT_MUTED));
-    lv_label_set_long_mode(album_pos, LV_LABEL_LONG_DOT);
-    lv_label_set_text(album_pos, "");
-    lv_obj_add_flag(album_pos, LV_OBJ_FLAG_HIDDEN);
-
-    btn_prev = lv_label_create(scr);
-    style_text(btn_prev, TF(UI_28), TC(TEXT_MUTED));
-    lv_label_set_text(btn_prev, LV_SYMBOL_PREV);
-    lv_obj_align(btn_prev, LV_ALIGN_TOP_MID, -60, 284);
-
-    btn_pp = lv_label_create(scr);
-    style_text(btn_pp, TF(UI_32), accent);
-    ui_pp_glyph(btn_pp, 0);
-    lv_obj_align(btn_pp, LV_ALIGN_TOP_MID, 0, 280);
-
-    btn_next = lv_label_create(scr);
-    style_text(btn_next, TF(UI_28), TC(TEXT_MUTED));
-    lv_label_set_text(btn_next, LV_SYMBOL_NEXT);
-    lv_obj_align(btn_next, LV_ALIGN_TOP_MID, 60, 284);
-
-    if(theme_trait(THEME_TRAIT_NP_BIG_PLAY)){
-        /* assets/reference/something/nowplaying_dark.png: dot-matrix title, a filled accent play circle */
-        style_text(title, TF(HEADER), TC(TEXT_PRIMARY));
-        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 194);   /* the taller dot face: tighter text block */
-        lv_obj_align(artist, LV_ALIGN_TOP_MID, 0, 224);
-        lv_obj_align(album, LV_ALIGN_TOP_MID, 0, 242);
-        lv_obj_set_size(btn_pp, 52, 52);
-        lv_obj_set_style_radius(btn_pp, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_opa(btn_pp, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_color(btn_pp, accent, 0);
-        lv_obj_set_style_text_color(btn_pp, TC(ON_ACCENT), 0);
-        lv_obj_set_style_text_align(btn_pp, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_pad_top(btn_pp, 9, 0);
-        lv_obj_align(btn_pp, LV_ALIGN_TOP_MID, 0, 264);   /* clear of the album line, above the times */
-        lv_obj_set_style_text_color(btn_prev, TC(TEXT_PRIMARY), 0);
-        lv_obj_set_style_text_color(btn_next, TC(TEXT_PRIMARY), 0);
-        lv_obj_align(btn_prev, LV_ALIGN_TOP_MID, -70, 274);
-        lv_obj_align(btn_next, LV_ALIGN_TOP_MID, 70, 274);
-    }
-    make_clickable(btn_prev, "0201000C0002");
-    make_clickable(btn_pp,   "0201000C0000");
-    make_clickable(btn_next, "0201000C0001");
-
-    /* Times sit as a centered pair below the transport buttons, inside the
-     * arc's bottom gap so they never clash with the green progress fill. */
-    t_elapsed = lv_label_create(scr);
+    /* Times sit as a centered pair in the ring's bottom gap, so they never clash with the progress fill. */
+    t_elapsed = lv_label_create(ov);
     lv_obj_set_width(t_elapsed, 80);   /* fits -999:59:59 at Montserrat 14 */
-    style_text(t_elapsed, TF(UI_14), TC(TEXT_MUTED));
+    style_text(t_elapsed, TF(UI_14), TC(TEXT_SECONDARY));
     lv_label_set_text(t_elapsed, "0:00");
     lv_obj_align(t_elapsed, LV_ALIGN_TOP_MID, -46, 318);
 
-    lv_obj_t *t_sep = lv_label_create(scr);
+    lv_obj_t *t_sep = lv_label_create(ov);
     style_text(t_sep, TF(UI_14), TC(TEXT_SEPARATOR));
     lv_label_set_text(t_sep, "/");
     lv_obj_align(t_sep, LV_ALIGN_TOP_MID, 0, 318);
 
-    t_remain = lv_label_create(scr);
+    t_remain = lv_label_create(ov);
     lv_obj_set_width(t_remain, 80);   /* fits -999:59:59 at Montserrat 14 */
-    style_text(t_remain, TF(UI_14), TC(TEXT_MUTED));
+    style_text(t_remain, TF(UI_14), TC(TEXT_SECONDARY));
     lv_label_set_text(t_remain, "0:00");
     lv_obj_align(t_remain, LV_ALIGN_TOP_MID, 46, 318);
 
-    /* page dots - Now Playing is the left page, the hub (right swipe) the right */
-    lv_obj_t *dots[2];
-    for(int i=0;i<2;i++){
-        lv_obj_t *dot = dots[i] = lv_obj_create(scr);
-        lv_obj_remove_style_all(dot);
-        lv_obj_set_size(dot, 7, 7);
-        lv_obj_align(dot, LV_ALIGN_BOTTOM_MID, i==0 ? -8 : 8, -14);
-        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(dot, (i==0 ? TC(PAGE_DOT_ACTIVE) : TC(PAGE_DOT_DIM)), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(dot, i==0 ? LV_OPA_COVER : LV_OPA_60, LV_PART_MAIN);
-    }
-
-    if(theme_kit()->nowplaying){                   /* the active theme lays Now Playing out its own way */
-        np_parts_t np = { scr, backdrop, ring, cover, cover_img, cover_note, btn_fav, fav_icon, btn_sleep, sleep_icon,
-                          btn_mode, mode_icon, mode_one, title, artist, album, btn_prev, btn_pp, btn_next, t_elapsed,
-                          t_sep, t_remain, { dots[0], dots[1] }, album_pos };
-        theme_kit()->nowplaying(&np);
-    }
-
-    /* ---- full-screen album-art overlay (hidden until the cover is tapped) ---- */
-    fsart = lv_obj_create(scr);
-    lv_obj_remove_style_all(fsart);
-    lv_obj_set_size(fsart, 360, 360);
-    lv_obj_set_pos(fsart, 0, 0);
-    lv_obj_set_style_bg_color(fsart, TC(CANVAS), 0);
-    lv_obj_set_style_bg_opa(fsart, LV_OPA_COVER, 0);
-    lv_obj_add_flag(fsart, LV_OBJ_FLAG_CLICKABLE);          /* tap anywhere -> close */
-    lv_obj_clear_flag(fsart, LV_OBJ_FLAG_SCROLLABLE);
-    ui_on(fsart, fsart_click_cb, LV_EVENT_CLICKED, NULL, "ui.fsart", UI_CORE);
-    lv_obj_add_flag(fsart, LV_OBJ_FLAG_HIDDEN);
-
-    fsart_img = lv_image_create(fsart);                    /* the 364px stock cover, centred (bezel crops) */
-    lv_obj_center(fsart_img);
-    lv_obj_clear_flag(fsart_img, LV_OBJ_FLAG_CLICKABLE);
-
-    /* bottom scrim so title/artist stay legible over any cover */
-    lv_obj_t *scrim = lv_obj_create(fsart);
-    lv_obj_remove_style_all(scrim);
-    lv_obj_set_size(scrim, 360, 130);
-    lv_obj_align(scrim, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(scrim, TC(SCRIM), 0);
-    lv_obj_set_style_bg_grad_color(scrim, TC(SCRIM), 0);
-    lv_obj_set_style_bg_grad_dir(scrim, LV_GRAD_DIR_VER, 0);
-    lv_obj_set_style_bg_main_opa(scrim, LV_OPA_TRANSP, 0);  /* transparent at top */
-    lv_obj_set_style_bg_grad_opa(scrim, LV_OPA_80, 0);      /* darker at the bottom */
-    lv_obj_set_style_bg_opa(scrim, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(scrim, LV_OBJ_FLAG_CLICKABLE);
-
-    fsart_title = lv_label_create(fsart);
-    lv_obj_set_width(fsart_title, 240);   /* round-screen chord at y~310 is ~249px wide; 300 overran the bezel */
-    style_text(fsart_title, TF(USER_20), TC(TEXT_PRIMARY));
-    lv_obj_set_style_text_align(fsart_title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(fsart_title, LV_LABEL_LONG_DOT);
-    lv_obj_align(fsart_title, LV_ALIGN_BOTTOM_MID, 0, -50);
-    lv_obj_clear_flag(fsart_title, LV_OBJ_FLAG_CLICKABLE);
-
-    fsart_artist = lv_label_create(fsart);
-    lv_obj_set_width(fsart_artist, 176);   /* chord at y~334 is only ~186px wide; 280 was clipped by the bezel */
-    style_text(fsart_artist, TF(USER_16), TC(TEXT_SECONDARY));
-    lv_obj_set_style_text_align(fsart_artist, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(fsart_artist, LV_LABEL_LONG_DOT);
-    lv_obj_align(fsart_artist, LV_ALIGN_BOTTOM_MID, 0, -26);
-    lv_obj_clear_flag(fsart_artist, LV_OBJ_FLAG_CLICKABLE);
-
+    np_noart_text();
     apply_accent();
-    ui_set_np_style(cfg_get_int("np_style", 0));
+    ui_np_cover_changed();   /* binds the picture again (and tints the blur for this theme) */
 }
 
 void ui_update(const track_state_t *st)
@@ -2402,16 +2306,13 @@ void ui_update(const track_state_t *st)
 
         set_label_text_changed(title, "No Track");
         set_label_text_changed(artist, "");
-        set_label_text_changed(album, "");
-        if(album_pos) set_label_text_changed(album_pos, "");
+        np_noart_text();
         set_label_text_changed(t_elapsed, "0:00");
         set_label_text_changed(t_remain, "0:00");
         ui_pp_glyph(btn_pp, 0);
-        if(theme_kit()->np_state) theme_kit()->np_state(0, 0);
         art_request_clear();   /* clear art + invalidate any in-flight decode (was a bare fallback) */
         g_np_curpath[0] = '\0';
         fav_refresh(0, 0);
-        if(btn_sleep) lv_obj_add_flag(btn_sleep, LV_OBJ_FLAG_HIDDEN);   /* no track -> hide the sleep moon too */
         ui_np_close_overlays();   /* no track -> dismiss any open sleep popover */
         g_track_dur = 0;
         set_progress_changed(0);
@@ -2423,54 +2324,20 @@ void ui_update(const track_state_t *st)
 
     set_label_text_changed(title, st->title[0] ? st->title : "Untitled");
     set_label_text_changed(artist, st->artist[0] ? st->artist : "");
-    /* keep the full-screen art view fresh while it's open: text every update, image only on a
-     * genuine track change (a PNG decode is too costly to do every position tick). */
-    if(fsart_on){
-        fsart_refresh_text();
-        if(strcmp(fsart_path, st->path) != 0){ copy_cstr(fsart_path, sizeof fsart_path, st->path); fsart_reload_img(); }
-    }
-    /* Secondary line. For a BOOK it shows the current chapter (an album tag is meaningless for an
-     * audiobook, and the all-songs queue position is noise); for music it's the album, carrying the
-     * track position as "Album [U+00B7] N/M". */
-    {
-        char ab[240];
-        int pos_own_line = album_pos && !lv_obj_has_flag(album_pos, LV_OBJ_FLAG_HIDDEN);
-        const char *pos_text = "";
-        if(!book_meta_line(st, ab, sizeof ab)){        /* not a book -> album + position */
-            const char *alb = st->album;
-            if(pos_own_line){                                                              /* Album, then N/M below */
-                snprintf(ab, sizeof ab, "%s", alb);
-                pos_text = st->playing_num;
-            } else if(alb[0] && st->playing_num[0])
-                snprintf(ab, sizeof ab, "%s  \xC2\xB7  %s", alb, st->playing_num);          /* Album [U+00B7] 3/19 */
-            else if(alb[0])
-                snprintf(ab, sizeof ab, "%s", alb);                                         /* Album */
-            else if(st->playing_num[0]){
-                const char *sl = strchr(st->playing_num, '/');
-                if(sl && sl[1]) snprintf(ab, sizeof ab, "%.*s / %s", (int)(sl - st->playing_num), st->playing_num, sl + 1);  /* 3 / 19 */
-                else            snprintf(ab, sizeof ab, "%s", st->playing_num);
-            } else ab[0] = '\0';
-        }
-        set_label_text_changed(album, ab);
-        if(pos_own_line) set_label_text_changed(album_pos, pos_text);
-    }
+    np_noart_text();
     snprintf(g_np_curpath, sizeof g_np_curpath, "%s", st->path);
     fav_refresh(fav_current(st), 1);
 
     /* Audiobook transport: -15/+30 skips instead of track prev/next, and no shuffle or favourite
-     * (they make no sense for a book; the freed space is reserved for the sleep control later). */
+     * (they make no sense for a book; its sleep timer is in Now Playing options). */
     {
         int is_book = mdb_is_book_path(st->path);
         np_transport_glyphs(is_book);
         if(is_book){
             lv_obj_add_flag(btn_fav, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(btn_mode, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_remove_flag(btn_sleep, LV_OBJ_FLAG_HIDDEN);   /* moon replaces the heart for books */
-            int armed = ui_sleep_state(NULL);                   /* accent the moon while a timer is set */
-            lv_obj_set_style_text_color(sleep_icon, armed ? accent : TC(TEXT_MUTED), LV_PART_MAIN);
         } else {
             lv_obj_remove_flag(btn_mode, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(btn_sleep, LV_OBJ_FLAG_HIDDEN);
             ui_np_close_overlays();   /* not a book -> dismiss any open sleep popover (its context is gone) */
         }
     }
@@ -2499,7 +2366,6 @@ void ui_update(const track_state_t *st)
         long d = pos - g_seek_target_ms; if(d < 0) d = -d;   /* ABSOLUTE ms gap - unaffected by a chapter-window flip at a seek-to-boundary */
         if(lv_tick_get() < g_seek_hold_until && d > 3000) {
             ui_pp_glyph(btn_pp, ui_pp_icon_playing(st->state == 2));
-            if(theme_kit()->np_state) theme_kit()->np_state(ui_pp_icon_playing(st->state == 2), 1);   /* keep the words with the glyph */
             return;   /* ignore this stale echo */
         }
         g_seek_hold_until = 0; g_seek_target_ms = -1;   /* caught up or window lapsed */
@@ -2520,7 +2386,6 @@ void ui_update(const track_state_t *st)
     set_progress_changed(progress);
 
     ui_pp_glyph(btn_pp, ui_pp_icon_playing(st->state == 2));
-    if(theme_kit()->np_state) theme_kit()->np_state(ui_pp_icon_playing(st->state == 2), 1);
 }
 
 /* ---- volume overlay: a draggable arc on lv_layer_top (shows over any screen).

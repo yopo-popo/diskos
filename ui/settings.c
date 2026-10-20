@@ -117,7 +117,6 @@ void ui_sd_quiesce_begin(void); int ui_sd_quiesce_drained(void); void ui_sd_quie
 
 static void apply_swipe(int v){ ui_apply_swipe_thresh(v); }   /* live; persisted on slider release */
 static void apply_anim(int v){ screen_set_anim(v); }
-static void apply_weather(int v){ weather_set_enabled(v); }
 static void apply_mode(int v){ if(ui_book_active()) return; ui_set_workmode(v); }   /* an active book stays in Single; cfg still updates for later music */
 static void apply_eq(int v){ ui_eq_select(v); }   /* central: also records eq_last so the drawer A/B stays in sync */
 /* audio cluster: v<0 = "System default" (unmanaged) -> ui_set_* no-ops, leaving the player's
@@ -139,7 +138,6 @@ static void apply_sleep(int idx){
     static const int M[] = {0,15,30,45,60,90};
     ui_set_sleep_timer((idx>=0 && idx<6) ? M[idx] : 0);
 }
-static void apply_np_style(int v){ ui_set_np_style(v); }
 /* Theme settings apply by re-launching the UI (palette + Outdoor backlight are read at startup). set_val has already
  * saved the new value; if the reload is refused (a library scan is running) the old value goes back, and the detail
  * view is rebuilt after this event finishes (it cannot be deleted from inside its own switch/button callback). */
@@ -300,7 +298,7 @@ static void apply_wifi(int v){ (void)v; wifi_open(); }   /* opens SCR_WIFI */
 static void apply_bt(int v){ (void)v; bt_open(); }       /* opens SCR_BT */
 static void apply_workmode(int v){ (void)v; modes_open(); }  /* opens SCR_WORKMODE (source-mode picker) */
 static void apply_eq_custom(int v){ (void)v; screen_show(SCR_EQ); }  /* opens Custom EQ */
-static void apply_qsconfig(int v){ (void)v; screen_show(SCR_QSCONFIG); }  /* opens Quick Settings tile picker */
+static void apply_lastfm(int v){ (void)v; lastfm_open(); }  /* opens SCR_LASTFM (it used to live in Apps) */
 
 /* ---- Default-UI preference + Restart ------------------------------------- *
  * Boot model: the user picks a persistent default UI (diskOS or Stock) here;
@@ -607,12 +605,10 @@ static const char *const OPT_EQ[]   = { "Off","Jazz","Rock","R&B","Hip-Hop","Pop
 static const char *const OPT_SLEEP[] = { "Off","15 min","30 min","45 min","60 min","90 min" };
 static const char *const OPT_SLEEP_ACT[] = { "Pause","Shut down" };
 static const char *const OPT_IDLE_OFF[POWER_IDLE_N] = { "Off","5 min","10 min","30 min","60 min","90 min","120 min" };
-static const char *const OPT_POWER[] = { "Off","30 sec","1 min","2 min","5 min" };  /* idx->TMAP secs in main.c */
-static const char *const OPT_NPSTYLE[] = { "Cover", "Vinyl" };
+static const char *const OPT_POWER[] = { "Never","30 sec","1 min","2 min","5 min" };  /* idx->TMAP secs in main.c */
 static const char *const OPT_APPEARANCE[] = { "Dark", "Light" };
 static const char *const OPT_FONTSIZE[] = { "Small", "Medium", "Large" };
 static const char *const OPT_ALBUMVIEW[] = { "List", "Cover Flow" };
-static const char *const OPT_SAVERSTYLE[] = { "Cover", "Analog", "Minimal", "Digital", "Vinyl" };
 static const char *const OPT_BOOTDEF[] = { "diskOS", "Stock" };
 static const char *const OPT_ARTCACHE[] = { "Covers only","When Idle","Idle & Charging" };
 
@@ -640,10 +636,6 @@ static const char *const D_MODE[] = {
     "Repeat the current track over and over.",
     "Loop the whole list when it ends.",
     "Play the current track once, then stop.",
-};
-static const char *const D_NPSTYLE[] = {
-    "Album cover shown as a rounded square.",
-    "Spinning vinyl record while a track plays.",
 };
 
 static const setting_t TABLE[] = {
@@ -701,28 +693,18 @@ static const setting_t TABLE[] = {
       "Songs with no cover of their own get one from the internet (Wi-Fi). Each album is looked up once; playback is never touched.", NULL },
     { "Display",  "Online Lyrics", ST_TOGGLE, "online_lyrics", 0,1,1, NULL, 0, NULL, NULL, 1,
       "Songs with no lyrics of their own (no .lrc file, none in the song's tags) are looked up on lrclib.net (Wi-Fi). Off stops diskOS's own lookup; lyrics from the SD card or the song's tags still show.", NULL },
-    { "Display",  "Quick Settings", ST_ACTION, NULL, 0,0,0, NULL,0, LV_SYMBOL_RIGHT, apply_qsconfig, 0,
-      "Choose which tiles appear in the pull-down Quick Settings drawer.", NULL },
-    { "Display",  "Now Playing", ST_CYCLER, "np_style",   0,0,0, OPT_NPSTYLE, 2, NULL, apply_np_style, 0,
-      "Album art style on the Now Playing screen.", D_NPSTYLE },
     { "Display",  "Album View",  ST_CYCLER, "album_view", 0,0,0, OPT_ALBUMVIEW, 2, NULL, NULL, 0,
       "How the Albums list looks: a text list, or a cover flow you flick through.", NULL },
     { "Display",  "Accent Colour", ST_ACTION, NULL, 0,0,0, NULL,0, LV_SYMBOL_RIGHT, apply_open_colorpick, 0,
       "Now Playing accent: derived from album art, or any fixed colour you pick.", NULL },
     { "Display",  "Album Art Cache", ST_CYCLER, "artcache", 0,0,0, OPT_ARTCACHE, 3, NULL, apply_artcache, 0,
       "Pre-decode album art so covers load instantly. Background decoding can warm the player; it throttles on heat.", D_ARTCACHE },
-    { "Display",  "Screensaver", ST_CYCLER, "saver_idx",  0,0,0, OPT_POWER, 5, NULL, NULL, 2,
-      "Idle time before the clock screensaver appears and the screen dims.", NULL },
-    { "Display",  "Saver Style", ST_CYCLER, "saver_style", 0,0,0, OPT_SAVERSTYLE, 5, NULL, NULL, 0,
-      "Screensaver look: Cover art, Analog clock, Minimal, Digital, or spinning Vinyl.", NULL },
-    { "Display",  "Screen Off",  ST_CYCLER, "screenoff_idx", 0,0,0, OPT_POWER, 5, NULL, NULL, 3,
-      "How long after the screensaver the screen turns fully off.", NULL },
+    { "Display",  "Screen Off",  ST_CYCLER, "screenoff_idx", 0,0,0, OPT_POWER, 5, NULL, NULL, 2,
+      "Idle time before the screen turns off. It dims for the last 10 seconds, and a touch then keeps it on.", NULL },
     { "Display",  "24-Hour Time", ST_TOGGLE, "time_24h",  0,1,1, NULL, 0, NULL, apply_time, 1,
       "Use a 24-hour clock instead of AM/PM.", NULL },
     { "Display",  "Animations",  ST_TOGGLE, "anim",      0,1,1, NULL, 0, NULL, apply_anim, 1,
       "Slide animations between screens.", NULL },
-    { "Display",  "Weather on Home", ST_TOGGLE, "weather_on", 0,1,1, NULL, 0, NULL, apply_weather, 1,
-      "Show the weather glance on the home screen and screensaver (tap it to open the full forecast). Off skips the background fetch to save battery.", NULL },
     { "Display",  "Back-swipe",  ST_SLIDER, "swipe_thresh", 30,120,5, NULL,0, NULL, apply_swipe, 60,
       "Swipe distance needed to go back. Lower is more sensitive.", NULL },
     { "Network",  "Wi-Fi",       ST_ACTION, NULL, 0,0,0, NULL,0, LV_SYMBOL_RIGHT, apply_wifi, 0,
@@ -731,6 +713,8 @@ static const setting_t TABLE[] = {
       "Pair Bluetooth devices. Audio routes to connected headphones or speakers (SBC, beta).", NULL },
     { "Network",  "Bluetooth Codec", ST_CYCLER, "bt_codec", 0,0,0, BT_CODEC_LABEL, BT_CODEC_N, NULL, NULL, 0,
       "Codec for Bluetooth headphones, as in the stock player. Applies the next time the headphones connect. If they lack the codec, SBC is used. AAC and LDAC are heavier for this player and may stutter.", NULL },
+    { "Network",  "Last.fm",     ST_ACTION, NULL, 0,0,0, NULL,0, LV_SYMBOL_RIGHT, apply_lastfm, 0,
+      "Scrobble what you play to your Last.fm account (Wi-Fi).", NULL },
     { "System",   "Language",    ST_CHOICE, "language", 0,0,0, i18n_lang_names, LANG_COUNT, NULL, apply_language, LANG_EN,
       "Interface language. Song, artist and album names are always shown as they are tagged.", NULL },
     { "System",   "Sleep Timer", ST_CYCLER, "sleep_idx", 0,0,0, OPT_SLEEP, 6, NULL, apply_sleep, 0,

@@ -28,10 +28,10 @@ Built with **LVGL 9.2.2** (software renderer) on a static-musl mipsel toolchain.
 | Area | Files |
 |---|---|
 | Core / loop / nav | `main.c`, `screenmgr.c` / `screens.h`, `fb_pan.c`, `ipc.c` / `ipc.h`, `config.c` |
-| Now Playing + art | `ui.c` / `ui.h`, `art.c` / `art.h`, `artcache.c`, `saver.c`, `songinfo.c`, `npmenus.c` |
+| Now Playing + art | `ui.c` / `ui.h`, `art.c` / `art.h`, `artcache.c`, `sharpart.c`, `songinfo.c`, `npmenus.c` |
 | Library / browse | `home.c`, `library.c`, `musicdb.c`, `search.c`, `playlistview.c`, `scanner.c`, `librarydb.c` |
 | Settings / features | `settings.c`, `eqcustom.c`, `quicksettings.c`, `modes.c`, `kbinput.c`, `colorpick.c`, `toast.c`, `apps.c`, `debug_ui.c`, `fwcaps.c` |
-| Connectivity | `wifi.c`, `bt.c`, `weather.c`, `lyrics.c`, `lastfm.c` / `lastfm_ui.c` |
+| Connectivity | `wifi.c`, `bt.c`, `lyrics.c`, `lastfm.c` / `lastfm_ui.c` |
 | Bundled third-party | `third_party/freetype-2.13.3/` (FTL), `sqlite3.c` (public domain), `jsmn.h` (MIT), `md5.c` (public domain), `font_*.c` (generated glyph data) |
 | Dev/diagnostic tools | `fbshot.c`, and other small on-device helpers (not part of the shipped UI) |
 
@@ -111,7 +111,7 @@ The installer keeps the stock `mq_player` audio engine; only the UI is replaced.
   - **Source Han Sans** - CJK glyph fallback - [`licenses/OFL-1.1-SourceHanSans.txt`](licenses/OFL-1.1-SourceHanSans.txt)
   - **Noto Sans** - Latin-extended / Greek / Cyrillic glyphs (`font_intl_14.c` .. `font_intl_20.c`) - [`licenses/OFL-1.1-NotoSans.txt`](licenses/OFL-1.1-NotoSans.txt)
   - **Noto Sans Hebrew** - Hebrew glyphs (`font_hebrew_14.c` .. `font_hebrew_20.c`, `font_hebrew_24.c`, `font_hebrew_40.c`) - [`licenses/OFL-1.1-NotoSans.txt`](licenses/OFL-1.1-NotoSans.txt)
-  - **Font Awesome 4.7.0** - UI + weather icon glyphs (`font_icons_20.c`, `font_icons_28.c`, `font_weather16.c`, `font_icon_globe_20.c`) - [`licenses/OFL-1.1-FontAwesome.txt`](licenses/OFL-1.1-FontAwesome.txt)
+  - **Font Awesome 4.7.0** - UI icon glyphs (`font_icons_20.c`, `font_icons_28.c`, `font_icon_globe_20.c`) - [`licenses/OFL-1.1-FontAwesome.txt`](licenses/OFL-1.1-FontAwesome.txt)
   - **IBM Plex Mono** (SemiBold/Bold) - "something" theme text (`font_mono_*.c`); converted under the name `diskos_mono`
     because the licence reserves the name "Plex" - [`licenses/OFL-1.1-IBMPlexMono.txt`](licenses/OFL-1.1-IBMPlexMono.txt)
   - **Doto** (weight 700, square dots) - "something" theme titles and date (`font_dot_*.c`), converted as `diskos_dot` - [`licenses/OFL-1.1-Doto.txt`](licenses/OFL-1.1-Doto.txt)

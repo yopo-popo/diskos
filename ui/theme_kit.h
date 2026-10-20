@@ -16,7 +16,7 @@
 typedef enum {
     UI_CORE,        /* must be on the same screen in every theme (play/pause, seek, back, list rows, settings controls) */
     UI_REACHABLE,   /* must exist somewhere in every theme (favourite, sleep timer, lyrics, queue, song info) */
-    UI_DECORATIVE,  /* a theme may drop it (tapping the art, the weather line when weather is reachable elsewhere) */
+    UI_DECORATIVE,  /* a theme may drop it (tapping the art) */
 } ui_tier_t;
 
 /* lv_obj_add_event_cb for a user action, with its stable name ("screen.thing[.gesture]") and tier */
@@ -62,7 +62,7 @@ void kit_some_dot_arrow(lv_obj_t *glyph, int left); /* Something's decorative ma
 /* Home's parts, as built by home.c, for a theme that lays Home out its own way. It may move, resize and restyle any
  * of them and hide only DECORATIVE ones (hint, thumb art/glyph, date); every control must stay reachable. */
 typedef struct {
-    lv_obj_t *root, *status, *clock, *date, *weather, *search, *library, *hint, *np, *np_thumb, *np_art, *np_glyph,
+    lv_obj_t *root, *status, *clock, *date, *search, *library, *hint, *np, *np_thumb, *np_art, *np_glyph,
              *np_title, *np_artist, *pp, *pp_label;
 } home_parts_t;
 
@@ -83,9 +83,6 @@ typedef struct {
     int n; lv_obj_t *tile[QS_TILES_MAX], *cap[QS_TILES_MAX];
 } qs_parts_t;
 
-/* The screensaver (saver.c) after it laid out the user's saver style (0 Cover, 1 Analog, 2 Minimal, 3 Digital,
- * 4 Vinyl). Display only: any touch wakes it. */
-typedef struct { lv_obj_t *root, *clock, *date, *weather, *track, *artist, *face; int style; } saver_parts_t;
 typedef enum { KIT_EMPTY_LYRICS, KIT_EMPTY_UPNEXT, KIT_EMPTY_LIBRARY, KIT_EMPTY_SEARCH } kit_empty_kind_t;
 typedef enum { KIT_VALUE_COUNT, KIT_VALUE_DURATION } kit_value_kind_t;
 /* Called only by rows that actually have a separate right-hand value. */
@@ -115,17 +112,12 @@ typedef struct theme_kit {
     void (*row_decor)(lv_obj_t *row, lv_obj_t *title); /* true list row; decoration cannot own input */
     void (*quicksettings)(const qs_parts_t *p);   /* drawer layout (after each build) */
     void (*qs_tile)(lv_obj_t *tile, lv_obj_t *glyph, lv_obj_t *cap, int on, int toggle);   /* paint a tile lit / unlit (toggle: 0 = a one-shot action) */
-    void (*saver)(const saver_parts_t *p);    /* screensaver touches (after each relayout) */
-    void (*saver_clock)(const char *t);       /* the screensaver's time changed (a theme drawing its own clock) */
     void (*pass_end)(void);                   /* after a styling pass: work that needs the whole of a list at once */
     void (*np_state)(int playing, int have_track);   /* Now Playing's play state changed (a theme spelling it out) */
     void (*title)(lv_obj_t *label, const char *text);   /* set a screen title, already in the theme's case */
     void (*title_fit)(lv_obj_t *label, const char *text);   /* size a content-sized title for this text, BEFORE it is set
                                                             * (face, tracking, the box's width); the caller then sets it */
     const char *back_text;                    /* Back as text (e.g. "<"), NULL = the arrow icon */
-    int saver_mer_apart;                      /* the saver's AM/PM beside the digits instead of in the clock face: 1 = in a small
-                                               * text face (hi-fi: its segment face has no letters), 2 = in the theme's date
-                                               * face (bauhaus: as on its Home, and "5:53 PM" was too wide for the saver) */
 } theme_kit_t;
 
 const theme_kit_t *theme_kit(void);          /* the active theme's kit, entries already resolved (never NULL) */
