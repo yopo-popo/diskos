@@ -8,8 +8,10 @@
  *
  * Rules the module enforces (agreed with yopo):
  * - Nothing is ever placed at or above the playing item; edits happen after it.
- * - The playing item can't be moved or removed, and the unit holding it can't be moved or removed whole.
- * - Items of a unit are always next to each other. Nothing is dropped inside another unit.
+ * - The playing item can't be moved or removed. It stands apart from its unit: moving or removing that unit moves
+ *   or removes only its items after the playing one (moved, they become a unit of their own).
+ * - Items of a unit are always next to each other. Nothing is dropped inside another unit, except right after the
+ *   playing item: that splits its unit, the items after the gap becoming a unit of their own (as add next does).
  *
  * All calls are from the UI thread. Indexes are 0-based positions in the whole list (played items too).
  */
@@ -48,13 +50,13 @@ typedef struct {
     int collapsed;
 } queue_unit;
 
-/* Rows for the queue screen: the playing item and everything after it. A unit shows a header row and,
- * unless collapsed, a row per item; the playing unit, collapsed, shows only its playing item. */
+/* Rows for the queue screen: the playing item first, on its own, then everything after it. A unit shows a header
+ * row and, unless collapsed, a row per item; for the playing unit that is its items after the playing one. */
 enum { QROW_ITEM, QROW_UNIT };
 typedef struct {
     int kind;
-    int index;              /* QROW_ITEM: the item; QROW_UNIT: its first item from the playing one on */
-    int count;              /* QROW_UNIT: items shown under it (from the playing one on) */
+    int index;              /* QROW_ITEM: the item; QROW_UNIT: its first item after the playing one */
+    int count;              /* QROW_UNIT: its items after the playing one */
     int64_t unit_id;        /* the item's or header's unit, 0 for a loose item */
 } queue_row;
 
@@ -95,6 +97,7 @@ const queue_item *queue_get(int index);
 const queue_unit *queue_unit_get(int64_t unit_id);
 int  queue_find(int64_t item_id);                  /* index or -1 */
 int  queue_unit_range(int64_t unit_id, int *first);/* item count, first index in *first */
+int  queue_unit_later(int64_t unit_id, int *first);/* the same for its items after the playing one (-1 = none) */
 unsigned queue_version(void);                      /* bumps on every change */
 
 int  queue_row_count(void);
@@ -108,12 +111,12 @@ int  queue_add_last(const queue_track *t, int n, const queue_album *unit);
  * it in (dropped between or next to that unit's songs), or 0 to make it loose (the unit shrinks). A song
  * is never dropped inside another unit. */
 int  queue_move_item(int index, int before, int64_t into_unit);
-int  queue_move_unit(int64_t unit_id, int before);
+int  queue_move_unit(int64_t unit_id, int before);   /* the playing unit: its items after the playing one */
 /* 1 = that drop is allowed (dropping onto itself counts): for showing where a drag can land. */
 int  queue_can_move_item(int index, int before, int64_t into_unit);
 int  queue_can_move_unit(int64_t unit_id, int before);
 int  queue_remove_item(int index);
-int  queue_remove_unit(int64_t unit_id);
+int  queue_remove_unit(int64_t unit_id);          /* the playing unit: its items after the playing one */
 int  queue_undo(void);                             /* brings back the last removal, if nothing else changed */
 int  queue_can_undo(void);
 int  queue_pop_unit(int64_t unit_id);              /* songs become loose, in place */

@@ -11,4 +11,7 @@
 void folderbrowser_create(lv_obj_t *root);   /* build the screen once (from screens_init) */
 void folderbrowser_open(void);               /* reset to the SD root + show SCR_FOLDER */
 int  folderbrowser_back(void);               /* up one folder, where it was: 1, or 0 at the SD root */
+/* Import playlist: the same browser from the SD root showing folders and .m3u / .m3u8 files; a tap on a file calls
+ * picked(its whole path). folderbrowser_open() is the plain browser again. */
+void folderbrowser_pick_playlist(void (*picked)(const char *path));
 #endif

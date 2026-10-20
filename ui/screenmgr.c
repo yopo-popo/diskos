@@ -94,6 +94,7 @@ static void root_rest(lv_obj_t *o)
     lv_obj_set_style_opa(o, LV_OPA_COVER, 0);
     lv_obj_set_style_transform_scale_x(o, 256, 0);
     lv_obj_set_style_transform_scale_y(o, 256, 0);
+    ui_np_art_follow(o);   /* Now Playing's art back in place with it */
 }
 
 
@@ -187,7 +188,8 @@ static void transition(int from, int to, int dir)
         if (dir == 2 || dir == -2) library_return();   /* back from another section: keep the scroll too */
         else library_enter();
     }
-    if (to == SCR_LYRICS || to == SCR_NPHUB) ui_np_backdrop_sync();   /* Now Playing's art behind its side pages */
+    if (to == SCR_LYRICS || to == SCR_NPHUB || to == SCR_LIBRARY || to == SCR_UPNEXT)
+        ui_np_backdrop_sync();   /* Now Playing's art behind these pages */
 
     kit_pass(nw);   /* the active theme styles anything new on the incoming screen (no-op for Default) */
     mclock_sync(ui_screen_backlight_on()); /* set the incoming colon before its root becomes visible */
@@ -216,7 +218,7 @@ static void transition(int from, int to, int dir)
     if (to == SCR_QUICK || from == SCR_QUICK) { show_raw(to); return; }
 
     /* Now Playing's strip (Options on its left, Lyrics on its right) scrolls as one: both pages move together, and
-     * nothing dims or edges them. */
+     * nothing dims or edges them. The turning art stays still under them (ui_np_art_follow): only their items move. */
     if (od && np_strip(from) != 2 && np_strip(to) != 2) {
         int x = np_strip(to) > np_strip(from) ? SCR_W : -SCR_W;   /* the page on the right comes in from the right */
         lv_obj_clear_flag(od, LV_OBJ_FLAG_HIDDEN);

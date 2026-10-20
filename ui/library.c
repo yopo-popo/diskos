@@ -277,24 +277,19 @@ static void playlist_cb(lv_event_t *e){
         library_reload();
     }
 }
-static void pl_new_done(const char *name){   /* keyboard finished */
-    if(!name || !name[0]) return;
-    long long id = shdb_pl_create(name, g_pl_folder);
-    if(id == 0) ui_toast("There's already a playlist with that name");
-    else if(id < 0) ui_toast("Couldn't make the playlist");
-    else library_reload();
-}
-static void pl_new_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    kbinput_open("Playlist name", "", pl_new_done);   /* create an empty playlist */
-}
-static void pl_folder_done(const char *name){
-    if(!name || !name[0]) return;
-    if(shdb_folder_create(name, g_pl_folder) > 0) library_reload();
-    else ui_toast("Couldn't make the folder");
-}
-static void pl_folder_cb(lv_event_t *e){
-    if(lv_event_get_code(e)==LV_EVENT_CLICKED) kbinput_open("Folder name", "", pl_folder_done);
+/* A hold on the title of Playlists (or a folder in it): the page's menu, New Playlist, New Folder, Reorder, Import
+ * (playlists.c; yopo 2026-10-20). The title sits at the top edge, where the finger lies partly on the bezel and the
+ * point the panel reports wanders as it presses, so this allows more travel than ui_on's 16 px swipe guard. */
+#define PL_HOLD_SLOP 40
+static void pl_title_hold_cb(lv_event_t *e){
+    if(lv_event_get_code(e)!=LV_EVENT_LONG_PRESSED || g_view!=VIEW_PLAYLISTS || g_pl_reorder) return;
+    if(ui_press_travel() > PL_HOLD_SLOP) return;   /* a swipe that began on the title */
+    im_item it;
+    memset(&it, 0, sizeof it);
+    it.kind = IM_PLAYLISTS_PAGE; it.id = g_pl_folder;
+    snprintf(it.title, sizeof it.title, "%s", g_pl_folder ? g_pl_folder_name : tr("Playlists"));
+    it.where = IM_IN_PLAYLISTS; it.where_id = g_pl_folder;
+    itemmenu_open(&it);
 }
 /* Playlists' Reorder (yopo 2026-10-20): the hold menu's Reorder puts a handle (rowdrag) on each row of the folder shown;
  * a drag moves the row there, Done or Back ends it. */
@@ -507,14 +502,15 @@ int library_back(void){
  * swipe is the one-page back (library_back). Returns the title, as ui_header_cb does. */
 void library_home(void);
 static void home_cb(lv_event_t *e){
-    if(lv_event_get_code(e)==LV_EVENT_CLICKED && ui_press_travel() <= 18) library_home();   /* a swipe that began here isn't a tap */
+    lv_event_code_t c = lv_event_get_code(e);
+    if((c==LV_EVENT_CLICKED || c==LV_EVENT_SHORT_CLICKED) && ui_press_travel() <= 18) library_home();   /* a swipe that began here isn't a tap */
 }
 lv_obj_t *library_header(lv_obj_t *root, const char *title){
     lv_obj_t *t = ui_header_cb(root, title, home_cb);
     if(t){
         lv_obj_add_flag(t, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_ext_click_area(t, 12);
-        ui_on(t, home_cb, LV_EVENT_CLICKED, NULL, "library.title", UI_CORE);
+        ui_on(t, home_cb, LV_EVENT_SHORT_CLICKED, NULL, "library.title", UI_CORE);   /* a hold isn't a tap (Playlists' title menu) */
     }
     return t;
 }
@@ -989,6 +985,7 @@ static void library_reload(void){
     theme_title_text(g_title, (g_view==VIEW_GROUP) ? ttl : tr(ttl));
     if(g_status){ if(g_view==VIEW_MENU) lv_obj_remove_flag(g_status, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN); }
     if(g_back){ if(g_view==VIEW_MENU) lv_obj_add_flag(g_back, LV_OBJ_FLAG_HIDDEN); else lv_obj_remove_flag(g_back, LV_OBJ_FLAG_HIDDEN); }
+    ui_np_backdrop_on(SCR_LIBRARY, g_view == VIEW_MENU);   /* only the top page shows it */
     /* the top page's list starts at the screen's top, under its title (which scrolls with it); the others below theirs */
     if(g_view==VIEW_MENU){ lv_obj_set_pos(g_list, 30, 0); lv_obj_set_size(g_list, 286, LIST_Y + LIST_H); }
     else { lv_obj_set_pos(g_list, 30, LIST_Y); lv_obj_set_size(g_list, 286, LIST_H); }
@@ -1152,21 +1149,15 @@ static void library_reload(void){
         if(g_pl_reorder && g_npl >= 2) g_pl_rows = calloc((size_t)g_npl, sizeof *g_pl_rows);
         if(!g_pl_rows) g_pl_reorder = 0;                               /* nothing to reorder */
         g_pl_drag.list = g_list;
-        lv_obj_t *nr=base_row();
-        if(g_pl_reorder){   /* Reorder: Done in place of the two New rows */
+        /* New Playlist, New Folder and Import are in the title's hold menu (pl_title_hold_cb) */
+        if(g_npl == 0){ empty_label(tr(g_pl_folder ? "Empty folder\nHold the title to make a playlist here"
+                                                   : "No playlists yet\nHold the title to make one")); return; }
+        { static int s_title_hint = 0; if(!s_title_hint) s_title_hint = ui_toast_hint("Hold the title for New Playlist and more"); }
+        if(g_pl_reorder){   /* Reorder: Done first */
+            lv_obj_t *nr=base_row();
             ui_on(nr, pl_done_cb, LV_EVENT_CLICKED, NULL, "library.pl_done", UI_CORE);
             kit_row_layout(nr, KIT_ROW_SYMBOL);
             row_two(nr, tr_sym(LV_SYMBOL_OK, "Done"), NULL, NULL, KIT_VALUE_COUNT);
-            theme_list_row(nr);
-        } else {            /* "New Playlist" and "New Folder" come first, so an empty list can still make one */
-            ui_on(nr, pl_new_cb, LV_EVENT_CLICKED, NULL, "library.pl_new", UI_CORE);
-            kit_row_layout(nr, KIT_ROW_SYMBOL);
-            row_two(nr, tr_sym(LV_SYMBOL_PLUS, "New Playlist"), NULL, NULL, KIT_VALUE_COUNT);
-            theme_list_row(nr);
-            nr=base_row();
-            ui_on(nr, pl_folder_cb, LV_EVENT_CLICKED, NULL, "library.pl_folder", UI_CORE);
-            kit_row_layout(nr, KIT_ROW_SYMBOL);
-            row_two(nr, tr_sym(LV_SYMBOL_DIRECTORY, "New Folder"), NULL, NULL, KIT_VALUE_COUNT);
             theme_list_row(nr);
         }
         for(int i=0;i<g_npl;i++){
@@ -1401,8 +1392,13 @@ void library_create(lv_obj_t *root){
     if(theme_screen_plain(THEME_PLAIN_LIBRARY)) theme_screen_solid(root);   /* the theme draws Library plain */
     lv_obj_set_style_bg_color(root, TC(CANVAS), 0);
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+    ui_np_backdrop(root, SCR_LIBRARY);   /* trial: Now Playing's art, blurred and turning, behind the top page */
 
     g_title = library_header(root, "Library");   /* its back arrow and title: Library's top page */
+    if(g_title){   /* Playlists' menu (not through ui_on: see pl_title_hold_cb); the title shows the press at once */
+        lv_obj_add_event_cb(g_title, pl_title_hold_cb, LV_EVENT_LONG_PRESSED, NULL);
+        lv_obj_set_style_text_opa(g_title, LV_OPA_50, LV_STATE_PRESSED);
+    }
     g_back = ui_header_back();
     g_status = ui_status_line(root);
 

@@ -28,7 +28,6 @@
 #include "ota.h"
 #include "controls.h"
 #include "i18n.h"
-#include "playlists.h"
 
 /* Killed children are always collected, so none is left a zombie: kill_and_reap() waits up to 300 ms (a SIGKILLed
  * child normally exits at once), and anything still unreaped (e.g. stuck in kernel I/O) is parked and swept by a
@@ -287,14 +286,6 @@ static void apply_timezone(int v){
         return;
     }
     theme_reload_or_revert("tz_idx");                  /* the UI re-reads the zone rules at start */
-}
-static void apply_import_m3u(int v){ (void)v;
-    int n = playlists_import_card(NULL);   /* every folder on the card (bounded walk); names that exist are skipped */
-    char b[48];
-    if(n < 0)       snprintf(b, sizeof b, "Can't read the SD card");
-    else if(n == 0) snprintf(b, sizeof b, "No new playlists found");
-    else            snprintf(b, sizeof b, "Imported %d playlist%s", n, n==1 ? "" : "s");
-    ui_toast(b);
 }
 static void apply_wifi(int v){ (void)v; wifi_open(); }   /* opens SCR_WIFI */
 static void apply_bt(int v){ (void)v; bt_open(); }       /* opens SCR_BT */
@@ -735,8 +726,6 @@ static const setting_t TABLE[] = {
       "What the volume keys do when held: adjust the volume or switch track.", NULL },
     { "System",   "Rescan Library", ST_ACTION, NULL, 0,0,0, NULL,0, "Scan", apply_rescan, 0,
       "Re-scan the SD card for new or removed music.", NULL },
-    { "System",   "Import Playlists", ST_ACTION, NULL, 0,0,0, NULL,0, "Import", apply_import_m3u, 0,
-      "Import .m3u / .m3u8 playlists found on the SD card.", NULL },
     { "System",   "Default UI",  ST_CYCLER, "boot_default", 0,0,0, OPT_BOOTDEF, 2, NULL, apply_boot_default, 0,
       "Which UI boots by default. To boot the other one, hold Vol-Up from power-on until it appears.", NULL },
     { "System",   "Automatic Time", ST_TOGGLE, "auto_time", 0,1,1, NULL, 0, NULL, apply_auto_time, 1,

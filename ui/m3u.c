@@ -5,7 +5,6 @@
 #include "shelvesdb.h"
 #include "sdio.h"
 #include "artcache.h"   /* sd_write_begin / sd_write_end */
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -120,10 +119,6 @@ int playlists_export(long long id, const char *name, char *file, int cap){
 
 /* Import. A line naming a song: a path from the playlist file's folder, from the card's root, or a whole path. */
 #define M3U_MAX_BYTES (4L * 1024 * 1024)
-#define WALK_DEPTH   8
-#define WALK_DIRS    4096
-#define WALK_FILES   512
-#define WALK_ENTRIES 65536
 
 static int utf8_ok(const char *s){
     const unsigned char *p = (const unsigned char *)s;
@@ -222,12 +217,15 @@ static void trim(char *s){
     size_t n = strlen(s);
     while(n && (s[n-1] == ' ' || s[n-1] == '\t')) s[--n] = 0;
 }
-/* 1 = a playlist made, 0 = left out (its name exists, or no song of it was found) */
-static int import_file(const char *file){
+long long playlists_import_file(const char *file, long long folder_id, char *name_out, int cap, int *found, int *missed){
+    if(found) *found = 0;
+    if(missed) *missed = 0;
+    if(name_out && cap > 0) name_out[0] = 0;
+    if(!file || !shdb_ready() || !sd_io_begin()) return -1;
     FILE *f = fopen(file, "r");
-    if(!f) return 0;
+    if(!f){ sd_io_end(); return -1; }
     struct stat st;
-    if(fstat(fileno(f), &st) != 0 || st.st_size > M3U_MAX_BYTES){ fclose(f); return 0; }
+    if(fstat(fileno(f), &st) != 0 || st.st_size > M3U_MAX_BYTES){ fclose(f); sd_io_end(); return -1; }
     char dir[600], name[LDB_NAME] = "", raw[1024], line[1024], title[LDB_NAME] = "";
     snprintf(dir, sizeof dir, "%s", file);
     char *sl = strrchr(dir, '/');
@@ -235,7 +233,7 @@ static int import_file(const char *file){
     songs_t s;
     memset(&s, 0, sizeof s);
     long long start = 0;
-    int start_known = 0, cue_track = 0, ok = 1;
+    int start_known = 0, cue_track = 0, ok = 1, lost = 0;
     while(ok && fgets(raw, sizeof raw, f)){
         if(!strchr(raw, '\n') && !feof(f)){   /* longer than any path: skip it whole */
             int c; while((c = fgetc(f)) != '\n' && c != EOF){}
@@ -265,11 +263,13 @@ static int import_file(const char *file){
             long long at = start_known ? start : 0;
             if(!start_known && cue_track > 0 && !ldb_track_start_at(path, cue_track, &at)) at = -1;   /* that track isn't known */
             if(at >= 0) ok = songs_add(&s, path, at, title);
-        }
+            else lost++;
+        } else lost++;
         start = 0; start_known = 0; cue_track = 0; title[0] = 0;
     }
     if(ferror(f)) ok = 0;
     fclose(f);
+    sd_io_end();
     if(!name[0]){   /* no #PLAYLIST line: the file's name */
         const char *b = strrchr(file, '/');
         to_utf8(b ? b + 1 : file, name, sizeof name);
@@ -277,45 +277,23 @@ static int import_file(const char *file){
         if(dot) *dot = 0;
         trim(name);
     }
-    int made = 0;
-    if(ok && s.n > 0 && name[0] && shdb_pl_find(name) == 0){
-        long long id = shdb_pl_create(name, 0);
+    long long id = ok ? 0 : -1;
+    if(ok && s.n > 0 && name[0]){
+        char nm[LDB_NAME];
+        snprintf(nm, sizeof nm, "%s", name);
+        id = shdb_pl_create(nm, folder_id);
+        for(int k = 2; id == 0 && k < 100; k++){   /* the name is taken: "Name (2)", "Name (3)"... */
+            snprintf(nm, sizeof nm, "%.*s (%d)", LDB_NAME - 8, name, k);
+            id = shdb_pl_create(nm, folder_id);
+        }
+        if(id == 0) id = -1;
+        if(id > 0 && shdb_pl_add(id, s.v, s.n) != s.n){ shdb_pl_delete(id); id = -1; }
         if(id > 0){
-            if(shdb_pl_add(id, s.v, s.n) == s.n) made = 1;
-            else shdb_pl_delete(id);
+            if(name_out && cap > 0) snprintf(name_out, (size_t)cap, "%s", nm);
+            if(found) *found = s.n;
+            if(missed) *missed = lost;
         }
     }
     songs_free(&s);
-    return made;
-}
-/* budget: [0] folders, [1] files, [2] directory entries still allowed */
-static void import_walk(const char *dir, int depth, int *budget, int *made, int *skipped){
-    if(budget[0]-- <= 0) return;
-    DIR *d = opendir(dir);
-    if(!d) return;
-    struct dirent *e;
-    while(budget[2] > 0 && (e = readdir(d))){
-        budget[2]--;
-        const char *n = e->d_name;
-        if(n[0] == '.' || !strcasecmp(n, "System Volume Information")) continue;   /* hidden folders hold our own files */
-        char path[600];
-        if(snprintf(path, sizeof path, "%s/%s", dir, n) >= (int)sizeof path) continue;
-        int isdir = e->d_type == DT_DIR, isreg = e->d_type == DT_REG;
-        if(e->d_type == DT_UNKNOWN){ struct stat st; if(lstat(path, &st) == 0){ isdir = S_ISDIR(st.st_mode); isreg = S_ISREG(st.st_mode); } }
-        size_t L = strlen(n);
-        if(isreg && ((L > 4 && !strcasecmp(n + L - 4, ".m3u")) || (L > 5 && !strcasecmp(n + L - 5, ".m3u8")))){
-            if(budget[1]-- <= 0) break;
-            if(import_file(path)) (*made)++; else (*skipped)++;
-        } else if(isdir && depth < WALK_DEPTH) import_walk(path, depth + 1, budget, made, skipped);
-    }
-    closedir(d);
-}
-int playlists_import_card(int *skipped){
-    int made = 0, left = 0, budget[3] = { WALK_DIRS, WALK_FILES, WALK_ENTRIES };
-    if(skipped) *skipped = 0;
-    if(!shdb_ready() || !sd_io_begin()) return -1;
-    import_walk(CARD, 0, budget, &made, &left);
-    sd_io_end();
-    if(skipped) *skipped = left;
-    return made;
+    return id;
 }

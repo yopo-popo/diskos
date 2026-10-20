@@ -69,9 +69,11 @@ int  sharp_spin_due(uint32_t *last);                                     /* in i
 void sharp_cover_invalidate(void);
 void ui_np_cover_changed(void);        /* rebind before shared pixels are freed */
 void ui_np_enter(void);                /* refresh on forward and back entry */
-void ui_np_backdrop(lv_obj_t *root, int scr);   /* a side page (Lyrics, Options): Now Playing's blurred, turning art behind it */
-void ui_np_backdrop_sync(void);       /* on entering a side page: its backdrop at the current angle */
-int  ui_np_turns_on(int scr);         /* 1 = the art turns while this screen shows (Now Playing and its side pages) */
+void ui_np_backdrop(lv_obj_t *root, int scr);   /* Now Playing's art behind a page: sharp and dimmed for Options, else blurred */
+void ui_np_backdrop_sync(void);       /* on entering such a page: its backdrop at the current angle */
+void ui_np_backdrop_on(int scr, int on);   /* the page shows or hides its backdrop (Library: only on its top page) */
+int  ui_np_turns_on(int scr);         /* 1 = the art turns while this screen shows (Now Playing, or a page showing its backdrop) */
+void ui_np_art_follow(lv_obj_t *root);   /* a page slid: Now Playing's art in it stays still on the screen */
 void ui_status_clock(const char *hm);          /* the clock and battery line: the clock */
 void ui_status_batt(int batt, int charging);    /* the clock and battery line: battery %, -1 = unknown */
 lv_obj_t *ui_status_line(lv_obj_t *parent);     /* that line, at the top of parent (the Library root) */

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 diskOS contributors */
 #include "anim.h"
+#include "screens.h"
 #include "theme.h"
 
 /* ---- concurrency cap (use LVGL's running count so delete can't leak it) -- */
@@ -102,12 +103,15 @@ static void start_expo(lv_obj_t *o, lv_anim_exec_xcb_t xcb, int from, int to,
 }
 
 /* Page-transition slide: exponential ease-out, the confident-arrival curve. */
+/* A sliding page moves; Now Playing's art in it stays still (ui_np_art_follow), so only the page's items move. */
+static void exec_page_x(void *o, int32_t v){ lv_obj_set_x((lv_obj_t*)o, (int)v); ui_np_art_follow((lv_obj_t*)o); }
+static void exec_page_y(void *o, int32_t v){ lv_obj_set_y((lv_obj_t*)o, (int)v); ui_np_art_follow((lv_obj_t*)o); }
 void anim_page_slide(lv_obj_t *o, int from, int to, uint32_t ms, lv_anim_completed_cb_t done){
-    start_expo(o, exec_x, from, to, ms, done);
+    start_expo(o, exec_page_x, from, to, ms, done);
 }
 /* The same curve vertically: switching between the Library / Now Playing / Queue sections. */
 void anim_page_slide_y(lv_obj_t *o, int from, int to, uint32_t ms, lv_anim_completed_cb_t done){
-    start_expo(o, exec_y, from, to, ms, done);
+    start_expo(o, exec_page_y, from, to, ms, done);
 }
 
 /* Depth scrim: a reusable full-screen translucent-black overlay that dims the screen BENEATH the

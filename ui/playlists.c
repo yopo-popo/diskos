@@ -10,6 +10,7 @@
 #include "i18n.h"
 #include "musicdb.h"
 #include "ipc.h"
+#include "folderbrowser.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -393,16 +394,54 @@ static void folder_delete_run(const im_item *it){
  * screen), else the Playlists list */
 static int reorder_shown(const im_item *it){
     return (it->kind == IM_SONG && it->where == IM_IN_PLAYLIST && it->row_id > 0)
-        || ((it->kind == IM_PLAYLIST || it->kind == IM_FOLDER) && it->where == IM_IN_PLAYLISTS);
+        || ((it->kind == IM_PLAYLIST || it->kind == IM_FOLDER || it->kind == IM_PLAYLISTS_PAGE) && it->where == IM_IN_PLAYLISTS);
 }
 static void reorder_run(const im_item *it){
     if(it->kind == IM_SONG || screen_current() == SCR_PLVIEW) plview_reorder(1);
     else library_pl_reorder(1);
 }
+/* The Playlists page's own menu (a hold on its title, yopo 2026-10-20): New Playlist and New Folder in the folder shown,
+ * Reorder, Import playlists */
+static int page_shown(const im_item *it){ return it->kind == IM_PLAYLISTS_PAGE; }
+static long long g_new_in;   /* the folder New Playlist / New Folder make it in */
+static void page_new_done(const char *name){
+    if(!name || !name[0]) return;
+    long long id = shdb_pl_create(name, g_new_in);
+    if(id == 0) ui_toast("There's already a playlist with that name");
+    else if(id < 0) ui_toast("Couldn't make the playlist");
+    else library_refresh();
+}
+static void page_new_run(const im_item *it){ g_new_in = it->id; kbinput_open("Playlist name", "", page_new_done); }
+static void page_folder_done(const char *name){
+    if(!name || !name[0]) return;
+    if(shdb_folder_create(name, g_new_in) > 0) library_refresh();
+    else ui_toast("Couldn't make the folder");
+}
+static void page_folder_run(const im_item *it){ g_new_in = it->id; kbinput_open("Folder name", "", page_folder_done); }
+/* Import playlist: the owner browses the card to one .m3u / .m3u8 file (yopo: never search the card for them); it
+ * becomes a playlist in the folder shown */
+static void import_picked(const char *path){
+    char name[LDB_NAME], msg[LDB_NAME + 64];
+    int found = 0, missed = 0;
+    long long id = playlists_import_file(path, g_new_in, name, sizeof name, &found, &missed);
+    if(id < 0) snprintf(msg, sizeof msg, "%s", tr("Couldn't import that file"));
+    else if(id == 0) snprintf(msg, sizeof msg, "%s", tr("None of its songs are on the card"));
+    else if(missed) snprintf(msg, sizeof msg, tr("Imported %s: %d of %d songs found"), name, found, found + missed);
+    else if(found == 1) snprintf(msg, sizeof msg, tr("Imported %s, 1 song"), name);
+    else snprintf(msg, sizeof msg, tr("Imported %s, %d songs"), name, found);
+    ui_toast(msg);
+    if(id <= 0) return;   /* still browsing: another file can be picked */
+    library_refresh();
+    if(screen_current() == SCR_FOLDER) screen_back();
+}
+static void page_import_run(const im_item *it){ g_new_in = it->id; folderbrowser_pick_playlist(import_picked); }
 static const im_entry E_ADD = { "Add to playlist", add_shown, add_run, 300 };
 static const im_entry E_MOVE = { "Move to folder", either_shown, move_run, 310 };
 static const im_entry E_RENAME = { "Rename", either_shown, rename_run, 400 };
 static const im_entry E_REORDER = { "Reorder", reorder_shown, reorder_run, 405 };
+static const im_entry E_PAGE_NEW = { "New Playlist", page_shown, page_new_run, 300 };
+static const im_entry E_PAGE_FOLDER = { "New Folder", page_shown, page_folder_run, 301 };
+static const im_entry E_PAGE_IMPORT = { "Import playlist", page_shown, page_import_run, 420 };
 static const im_entry E_EXPORT = { "Save to the card", list_shown, export_run, 410 };
 static const im_entry E_REMOVE = { "Remove from playlist", remove_shown, remove_run, 900 };
 static const im_entry E_DELETE = { "Delete playlist", list_shown, delete_run, 910 };
@@ -425,6 +464,9 @@ void plpick_create(lv_obj_t *root){
     itemmenu_add(&E_MOVE);
     itemmenu_add(&E_RENAME);
     itemmenu_add(&E_REORDER);
+    itemmenu_add(&E_PAGE_NEW);
+    itemmenu_add(&E_PAGE_FOLDER);
+    itemmenu_add(&E_PAGE_IMPORT);
     itemmenu_add(&E_EXPORT);
     itemmenu_add(&E_REMOVE);
     itemmenu_add(&E_DELETE);

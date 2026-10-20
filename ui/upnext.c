@@ -20,7 +20,8 @@
 /* ---- Up Next (SCR_UPNEXT), the Queue section's page. While the player plays our queue (player_mq.c) it shows the
  * queue from the playing song on and edits it, as yopo designed it: an album is one row that a tap opens or closes, a
  * hold on any row opens the item menu, the handle on a row's right drags it (an album as a whole) and a leftward swipe
- * removes it, with Undo for a few seconds. The playing song and the album holding it stay put.
+ * removes it, with Undo for a few seconds. The playing song comes first and stays put, apart from its album: what is
+ * dropped right under it plays next, ahead of the album's later songs, which show (and move) as an album of their own.
  * When the player plays its own list (a book, a search result), this page only reads that list (LIST_SONG_0, shuffle
  * order in LIST_SONG_3: mdb_upnext) and jumps within it (ui_queue_jump), never showing a guessed order: while the player
  * is rebuilding the list it says so and retries.
@@ -53,7 +54,7 @@ typedef struct {
     queue_row r;
     int64_t   id;                      /* the song's queue id, or the album's unit id */
     int       end;                     /* the first song after this row's own songs */
-    int       fixed;                   /* the playing song, or the album holding it: it stays put */
+    int       fixed;                   /* the playing song: it stays put */
     lv_obj_t *obj;
 } un_qrow;
 static un_qrow     g_qr[UN_SHOW];
@@ -425,40 +426,56 @@ static void q_prepare(void *ctx, int k){
             lv_obj_add_flag(g_qr[j].obj, LV_OBJ_FLAG_HIDDEN);
 }
 
-/* Row k dropped between rows ia and ib (-1 = none): the song it lands before, and the album a song stays in (0 = it
- * becomes a loose song). 0 = the queue doesn't allow it there. A song stays in its album only between the album's
- * own rows: dropped above the header or below the last song it leaves the album (a one-song album keeps its song). */
-static int q_place(int k, int ia, int ib, int *before, int64_t *into){
+/* Row k dropped between rows ia and ib (-1 = none): the song it lands before, the album a song stays in (0 = it
+ * becomes a loose song), and *unit = the move is its album's (queue_move_unit). 0 = the queue doesn't allow it there,
+ * or nothing would change. Right under the playing song is outside every album (the queue splits the playing album
+ * there). A song stays in its album between the album's own rows and right below its last song (yopo 2026-10-20);
+ * dropped above the header or further away it leaves the album. A song that is all its album shows (a one-song
+ * album, or the playing album's one later song) takes the album along. */
+static int q_place(int k, int ia, int ib, int *before, int64_t *into, int *unit){
+    *unit = 0;
     if(ia < 0 || ia < g_qd.kcur) return 0;                               /* never above or at the playing song */
     const un_qrow *d = &g_qr[k], *a = &g_qr[ia], *b = ib >= 0 ? &g_qr[ib] : NULL;
+    int after_now = ia == g_qd.kcur;
     *before = b ? b->r.index : a->end;
     *into = 0;
     int64_t in = 0;                                                      /* the album the gap is inside */
-    if(b) in = b->r.kind == QROW_ITEM && b->r.unit_id && a->r.unit_id == b->r.unit_id ? b->r.unit_id : 0;
+    if(after_now) in = 0;
+    else if(b) in = b->r.kind == QROW_ITEM && b->r.unit_id && a->r.unit_id == b->r.unit_id ? b->r.unit_id : 0;
     else if(a->r.unit_id){                                               /* the rows stop (UN_SHOW) inside an album */
         const queue_item *nx = queue_get(*before);
         if(nx && nx->unit_id == a->r.unit_id) in = a->r.unit_id;
     }
-    if(d->r.kind == QROW_UNIT) return !in && queue_can_move_unit(d->id, *before);
+    if(d->r.kind == QROW_UNIT){ *unit = 1; return !in && queue_can_move_unit(d->id, *before); }
     int64_t own = d->r.unit_id;
     if(in && in != own) return 0;                                        /* never inside another album */
-    *into = in ? own : own && queue_unit_range(own, NULL) == 1 ? own : 0;
+    const queue_item *ci = queue_get(queue_current());
+    int f;
+    if(own && !in && ci && ci->unit_id == own && queue_unit_later(own, &f) == 1){   /* the playing album's one later song */
+        if(*before == f || *before == f + 1) return 0;                   /* where it is */
+        *unit = 1; *into = own;
+        return queue_can_move_unit(own, *before);
+    }
+    if(in) *into = own;
+    else if(own && !after_now && a->r.kind == QROW_ITEM && a->r.unit_id == own) *into = own;   /* its album's last song */
+    else if(own && queue_unit_range(own, NULL) == 1) *into = own;
     int i = queue_find(d->id);
-    return i >= 0 && queue_can_move_item(i, *before, *into);
+    if(i < 0 || (*into == own && (*before == i || *before == i + 1))) return 0;   /* where it is (above its own header) */
+    return queue_can_move_item(i, *before, *into);
 }
 
 static int q_accepts(void *ctx, int k, int to, int above, int below){
     (void)ctx; (void)to;
-    int before; int64_t into;
-    return q_place(k, above, below, &before, &into);
+    int before, unit; int64_t into;
+    return q_place(k, above, below, &before, &into, &unit);
 }
 
 static void q_drop(void *ctx, int k, int to, int above, int below){
     (void)ctx; (void)to;
-    int before, rc; int64_t into;
+    int before, unit, rc; int64_t into;
     if(queue_version() != g_qd.ver) rc = 1;                              /* the queue changed under the drag */
-    else if(!q_place(k, above, below, &before, &into)) rc = QERR_PLACE;
-    else if(g_qr[k].r.kind == QROW_UNIT) rc = queue_move_unit(g_qr[k].id, before);
+    else if(!q_place(k, above, below, &before, &into, &unit)) rc = QERR_PLACE;
+    else if(unit) rc = queue_move_unit(g_qr[k].r.unit_id, before);
     else rc = queue_move_item(queue_find(g_qr[k].id), before, into);
     if(rc > 0) ui_toast("Queue changed");
     else if(rc < 0) ui_toast("Couldn't move that");
@@ -476,8 +493,8 @@ static void q_add_row(int k){
     int cur = queue_current();
     int unit = q->r.kind == QROW_UNIT;
     int now = !unit && q->r.index == cur;                                /* the playing song */
-    int fixed = q->fixed = now || (unit && q->r.index == cur);           /* it and its album stay put */
-    int inner = !unit && q->r.unit_id;                                   /* a song of an album */
+    int fixed = q->fixed = now;                                          /* it stays put */
+    int inner = !unit && q->r.unit_id && !now;                           /* a song under its album (the playing one stands apart) */
     lv_obj_t *r = q->obj = lv_button_create(g_un_list);
     lv_obj_remove_style_all(r);
     lv_obj_remove_flag(r, LV_OBJ_FLAG_SCROLL_ON_FOCUS);                  /* a press near the bottom must not scroll the list */
@@ -495,13 +512,21 @@ static void q_add_row(int k){
     lv_obj_add_event_cb(r, q_swipe_cb, LV_EVENT_RELEASED, (void *)(intptr_t)k);
     lv_obj_add_event_cb(r, q_swipe_cb, LV_EVENT_PRESS_LOST, (void *)(intptr_t)k);
     if(!fixed) rowdrag_handle(r, k, &g_qdl);
-    int right = fixed ? 200 : ROW_W - ROWDRAG_HANDLE_W - 56;             /* where the text ends (the length sits after it) */
+    /* The length ends where the handle's lines begin (15 px into it); the text ends before the length, or for an
+     * album (no length) at the lines. */
+    int dur_w = fixed ? 52 : 40, dur_x = fixed ? 204 : ROW_W - ROWDRAG_HANDLE_W + 10 - dur_w;
+    int right = unit ? ROW_W - ROWDRAG_HANDLE_W + 8 : dur_x - 4;
     if(unit){
         const queue_unit *u = queue_unit_get(q->id);
         un_label(r, u && u->album[0] ? u->album : "Unknown album", 30, 6, right - 30, 21, TF(USER_16), TC(TEXT_PRIMARY));
         char sub[300], cnt[24];
         int n = q->r.count;
-        if(fixed) snprintf(cnt, sizeof cnt, "%d to go", n);                /* the playing album: from its playing song on */
+        const queue_item *ci = queue_get(cur);
+        const queue_unit *cu = ci && ci->unit_id ? queue_unit_get(ci->unit_id) : NULL;
+        /* the playing album's later songs, or the same album right under the playing song (split from it by a drop) */
+        int more = cu && u && (cu == u || (q->r.index == cur + 1 && !strcmp(cu->album, u->album) &&
+                                           !strcmp(cu->album_artist, u->album_artist)));
+        if(more) snprintf(cnt, sizeof cnt, "%d more", n);
         else snprintf(cnt, sizeof cnt, "%d song%s", n, n == 1 ? "" : "s");
         snprintf(sub, sizeof sub, "%s%s%s", u ? u->album_artist : "", u && u->album_artist[0] ? " - " : "", cnt);
         un_label(r, sub, 30, 28, right - 30, 17, TF(USER_14), TC(TEXT_MUTED));
@@ -531,11 +556,11 @@ static void q_add_row(int k){
     int len = it->end_ms > it->start_ms ? it->end_ms - it->start_ms : it->duration_ms;
     char dur[12]; un_fmt_dur(len, dur, sizeof dur);
     if(dur[0]){
-        lv_obj_t *d = un_label(r, dur, right + 2, 17, 54, 18, TF(UI_12), TC(TEXT_MUTED));   /* length, right-aligned */
+        lv_obj_t *d = un_label(r, dur, dur_x, 17, dur_w, 18, TF(UI_12), TC(TEXT_MUTED));   /* length, right-aligned */
         lv_obj_set_style_text_align(d, LV_TEXT_ALIGN_RIGHT, 0);
         kit_row_value(r, t, s, d, KIT_VALUE_DURATION);
         if(!fixed){                                                      /* the theme's look, but clear of the handle */
-            lv_obj_set_pos(d, right + 2, 17); lv_obj_set_size(d, 54, 18);
+            lv_obj_set_pos(d, dur_x, 17); lv_obj_set_size(d, dur_w, 18);
             lv_obj_set_width(t, right - x); lv_obj_set_width(s, right - x);
         }
     }
@@ -565,11 +590,8 @@ static void q_rebuild(void){
             q->end = u && u->collapsed ? q->r.index + q->r.count : q->r.index;
         } else {
             const queue_item *it = queue_get(q->r.index);
-            const queue_unit *u = q->r.unit_id ? queue_unit_get(q->r.unit_id) : NULL;
             q->id = it ? it->id : 0;
             q->end = q->r.index + 1;
-            if(u && u->collapsed && k > 0 && g_qr[k - 1].r.kind == QROW_UNIT)   /* the playing song of a closed album */
-                q->end = g_qr[k - 1].r.index + g_qr[k - 1].r.count;
         }
     }
     if(n > 1 && n < rows && g_qr[n - 1].r.kind == QROW_UNIT) n--;        /* never end on an album's header */
@@ -665,6 +687,7 @@ void upnext_create(lv_obj_t *root){
     static int listening;
     lv_obj_set_style_bg_color(root, TC(CANVAS), 0);
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+    ui_np_backdrop(root, SCR_UPNEXT);   /* trial: Now Playing's art, blurred and turning */
     g_un_head = ui_header(root, "Up Next");
     { lv_obj_t *b = ui_header_back(); if(b) lv_obj_add_flag(b, LV_OBJ_FLAG_HIDDEN); }   /* the Queue section's root: Back leads nowhere */
 

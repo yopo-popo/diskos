@@ -162,7 +162,7 @@ void nphub_refresh(void){ nphub_populate(); }   /* called on each SCR_NPHUB show
 void nphub_create(lv_obj_t *root){
     lv_obj_set_style_bg_color(root, TC(CANVAS), 0);
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
-    ui_np_backdrop(root, SCR_NPHUB);   /* Now Playing's blurred art, turning (the page left of Now Playing) */
+    ui_np_backdrop(root, SCR_NPHUB);   /* Now Playing's art, turning and dimmed (the page left of Now Playing) */
     g_hub_list = panel_list(root);
     lv_obj_set_pos(g_hub_list, 46, 0); lv_obj_set_size(g_hub_list, 280, 360);   /* the whole page: no header */
     lv_obj_set_style_pad_top(g_hub_list, 70, 0);   /* rows clear of the round bezel at both ends */

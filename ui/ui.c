@@ -1121,16 +1121,16 @@ static void np_turn(lv_obj_t *img, const uint32_t *src, uint32_t *out, lv_image_
     lv_image_cache_drop(dsc);
     if(img) lv_obj_invalidate(img);
 }
-/* Now Playing's side pages show its art turning behind them: Lyrics the blurred copy (g_np_outb), Options the sharp
- * one (g_np_out) under a dimming like the controls' (yopo 2026-10-20). Each page has its own image, which np_draw
- * turns while that page is the screen. */
+/* Now Playing's art behind other pages: Options the sharp one (g_np_out) under a dimming like the controls', the rest
+ * (Lyrics, and as a trial Library's top page and Up Next) the blurred copy (g_np_outb) (yopo 2026-10-20). Each page has
+ * its own image, which np_draw turns while that page is the screen. */
 #define NP_BD_MAX 4
 #define NP_BD_BLUR  1
 #define NP_BD_SHARP 2
-static struct { lv_obj_t *img, *dim; int scr, kind; } g_np_bd[NP_BD_MAX];
+static struct { lv_obj_t *img, *dim; int scr, kind, off; } g_np_bd[NP_BD_MAX];   /* off: the page hides it (ui_np_backdrop_on) */
 static void np_bd_bind(int i)
 {
-    int art = g_np_src != NULL;
+    int art = g_np_src != NULL && !g_np_bd[i].off;
     const lv_image_dsc_t *d = g_np_bd[i].kind == NP_BD_SHARP ? &g_np_out_dsc : &g_np_outb_dsc;
     if(art && lv_image_get_src(g_np_bd[i].img) != d) lv_image_set_src(g_np_bd[i].img, d);
     np_vis(g_np_bd[i].img, art);   /* no art: the page's own canvas */
@@ -1141,7 +1141,7 @@ static int np_bd_shown(void)
 {
     if(!g_np_src) return 0;
     int cur = screen_current(), k = 0;
-    for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img && g_np_bd[i].scr == cur) k |= g_np_bd[i].kind;
+    for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img && !g_np_bd[i].off && g_np_bd[i].scr == cur) k |= g_np_bd[i].kind;
     return k;
 }
 static void np_bd_invalidate(void)
@@ -1155,7 +1155,7 @@ static void np_bd_deleted(lv_event_t *e)
     for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img == o) g_np_bd[i].img = g_np_bd[i].dim = NULL;
 }
 /* Turns the pictures that show to the current angle: the sharp one for Now Playing or the Options backdrop, the
- * blurred one for the Lyrics backdrop. */
+ * blurred one for the other backdrops. */
 static void np_draw(void)
 {
     if(!g_np_src || !g_np_art) return;
@@ -1173,7 +1173,7 @@ void ui_np_backdrop(lv_obj_t *root, int scr)
     if(i == NP_BD_MAX) return;
     g_np_bd[i].scr = scr;
     g_np_bd[i].kind = scr == SCR_NPHUB ? NP_BD_SHARP : NP_BD_BLUR;
-    g_np_bd[i].dim = NULL;
+    g_np_bd[i].dim = NULL; g_np_bd[i].off = 0;
     if(g_np_bd[i].kind == NP_BD_SHARP){
         lv_obj_t *d = lv_obj_create(root);
         lv_obj_remove_style_all(d);
@@ -1194,14 +1194,38 @@ void ui_np_backdrop(lv_obj_t *root, int scr)
     g_np_bd[i].img = o;
     np_bd_bind(i);
 }
-/* Entering a side page, or the picture changed: bind every backdrop and turn its art to the current angle. */
+/* Entering a page with a backdrop, or the picture changed: bind every backdrop and turn its art to the current angle. */
 void ui_np_backdrop_sync(void)
 {
     for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img) np_bd_bind(i);
     if(np_bd_shown()) np_draw();
 }
+/* A page shows (on) or hides its backdrop, e.g. Library only on its top page. */
+void ui_np_backdrop_on(int scr, int on)
+{
+    for(int i = 0; i < NP_BD_MAX; i++)
+        if(g_np_bd[i].img && g_np_bd[i].scr == scr && g_np_bd[i].off == !!on){ g_np_bd[i].off = !on; np_bd_bind(i); }
+    if(on && np_bd_shown()) np_draw();
+}
 /* The screens on which the art turns: Now Playing and its side pages. */
-int ui_np_turns_on(int scr){ return scr == SCR_NOWPLAYING || scr == SCR_LYRICS || scr == SCR_NPHUB; }
+int ui_np_turns_on(int scr)
+{
+    if(scr == SCR_NOWPLAYING) return 1;
+    for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img && !g_np_bd[i].off && g_np_bd[i].scr == scr) return 1;
+    return 0;   /* e.g. Library below its top page: nothing there turns */
+}
+/* Keeps Now Playing's art still on the screen while a page holding it slides: the picture and its dimming move
+ * against the page, so only the page's own items move (yopo 2026-10-20). Runs on every step of a page slide. */
+void ui_np_art_follow(lv_obj_t *root)
+{
+    int32_t x = -lv_obj_get_style_x(root, 0), y = -lv_obj_get_style_y(root, 0);
+    for(int i = -1; i < NP_BD_MAX; i++){
+        lv_obj_t *img = i < 0 ? g_np_art : g_np_bd[i].img, *dim = i < 0 ? g_np_dim : g_np_bd[i].dim;
+        if(!img || lv_obj_get_parent(img) != root) continue;
+        lv_obj_set_pos(img, x, y);
+        if(dim) lv_obj_set_pos(dim, x, y);
+    }
+}
 /* Shows what fits the state (stopping a fade): the art alone, the art dimmed under the controls, or the no-art disc
  * (with the title while the controls are hidden). */
 static void np_show_now(void)

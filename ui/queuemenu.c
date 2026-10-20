@@ -97,8 +97,8 @@ static void last_run(const im_item *it){ run(it, QM_LAST); }
 static int q_first(const im_item *it){   /* the row's first song in the queue, -1 = gone */
     if(it->where != IM_IN_QUEUE || !it->row_id) return -1;
     if(it->kind == IM_SONG) return queue_find(it->row_id);
-    int f;
-    return it->kind == IM_ALBUM && queue_unit_range(it->row_id, &f) > 0 ? f : -1;
+    int f;   /* the playing album: its songs after the playing one (its row stands for those) */
+    return it->kind == IM_ALBUM && queue_unit_later(it->row_id, &f) > 0 ? f : -1;
 }
 static int q_later(const im_item *it){ int f = q_first(it); return f >= 0 && f > queue_current(); }
 static int q_album(const im_item *it){ return it->kind == IM_ALBUM && q_first(it) >= 0; }

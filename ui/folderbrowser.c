@@ -60,6 +60,7 @@
 #define FB_K_AUDIO 0
 #define FB_K_ISO   1     /* SACD image the library has IS_ISO rows for: opens its tracks */
 #define FB_K_CUE   2     /* .cue sheet: opens the tracks of the file(s) it names */
+#define FB_K_LIST  3     /* choosing a playlist (folderbrowser_pick_playlist): a .m3u / .m3u8 file */
 typedef struct {
     char name[FB_NAMELEN];
     int  is_dir;
@@ -113,13 +114,17 @@ typedef struct {
     fb_entry_t *ent;
     int nent, cap, opened, cancelled;
     unsigned gen;
+    int pick;            /* list playlist files, not songs */
 } fb_result_t;
 static pthread_mutex_t g_fb_mu = PTHREAD_MUTEX_INITIALIZER;
 static unsigned g_fb_gen;
 static int g_fb_running, g_fb_requested, g_fb_ready, g_fb_waiting;
 static int g_fb_error_shown;
 static char g_fb_path[FB_MAXPATH];
+static int g_fb_pick;                       /* the request lists playlist files (g_pick) */
 static fb_result_t g_fb_res;
+static void (*g_pick)(const char *path);    /* choosing a playlist file: gets the one tapped (UI thread) */
+static const char *fb_root_title(void){ return g_pick ? "Import Playlist" : "Files"; }
 static lv_timer_t *g_fb_poll;
 
 static int fb_current(unsigned gen){
@@ -175,7 +180,10 @@ static void fb_scan_leased(const char *dir, fb_result_t *res){
             }
             if(is_dir != (pass == 0)) continue;               /* pass 0 = dirs only, pass 1 = files only */
             int kind = FB_K_AUDIO;
-            if(!is_dir && !fb_is_audio(nm)){                  /* files: audio we can play, indexed .iso images, .cue sheets */
+            if(!is_dir && res->pick){                         /* choosing a playlist: only its files */
+                if(!fb_has_ext(nm, ".m3u") && !fb_has_ext(nm, ".m3u8")) continue;
+                kind = FB_K_LIST;
+            } else if(!is_dir && !fb_is_audio(nm)){                  /* files: audio we can play, indexed .iso images, .cue sheets */
                 if(fb_has_ext(nm, ".cue")) kind = FB_K_CUE;
                 else if(fb_has_ext(nm, ".iso")){
                     char ip[FB_MAXPATH];
@@ -216,6 +224,7 @@ static void *fb_worker(void *arg){
             return NULL;
         }
         res.gen = g_fb_gen;
+        res.pick = g_fb_pick;
         snprintf(dir, sizeof dir, "%s", g_fb_path);
         pthread_mutex_unlock(&g_fb_mu);
         if(sd_io_begin()){
@@ -282,11 +291,12 @@ static void fb_scan(void){
     fb_fill_stop();
     free(g_ent); g_ent = NULL; g_nent = 0;
     if(g_list) lv_obj_clean(g_list);   /* blank while loading, as before */
-    if(g_title) theme_title_text(g_title, strcmp(g_dir, FB_ROOT) == 0 ? "Files" : fb_basename(g_dir));
+    if(g_title) theme_title_text(g_title, strcmp(g_dir, FB_ROOT) == 0 ? fb_root_title() : fb_basename(g_dir));
     pthread_mutex_lock(&g_fb_mu);
     g_fb_gen++;
     free(g_fb_res.ent); memset(&g_fb_res, 0, sizeof g_fb_res); g_fb_ready = 0;
     snprintf(g_fb_path, sizeof g_fb_path, "%s", g_dir);
+    g_fb_pick = g_pick != NULL;
     g_fb_requested = 1;
     int start = !g_fb_running;
     if(start) g_fb_running = 1;
@@ -338,7 +348,7 @@ static void fb_add_row(int i){
         kit_row_layout(r, KIT_ROW_ICON);
 
         lv_obj_t *ic = lv_label_create(r);
-        lv_label_set_text(ic, en->is_dir ? LV_SYMBOL_DIRECTORY : LV_SYMBOL_AUDIO);
+        lv_label_set_text(ic, en->is_dir ? LV_SYMBOL_DIRECTORY : en->kind == FB_K_LIST ? LV_SYMBOL_LIST : LV_SYMBOL_AUDIO);
         lv_obj_set_pos(ic, 10, 14);
         lv_obj_set_style_text_font(ic, TF(UI_16), 0);
         lv_obj_set_style_text_color(ic, en->is_dir ? TC(FOLDER_ICON) : TC(TEXT_MUTED), 0);
@@ -377,7 +387,7 @@ static void fb_rebuild(void){
     fb_fill_stop();
     if(g_title){
         int at_root = (strcmp(g_dir, FB_ROOT) == 0);
-        theme_title_text(g_title, at_root ? "Files" : fb_basename(g_dir));
+        theme_title_text(g_title, at_root ? fb_root_title() : fb_basename(g_dir));
     }
     if(!g_list) return;
     lv_obj_clean(g_list);
@@ -388,7 +398,7 @@ static void fb_rebuild(void){
             fb_empty_label(strcmp(g_dir, FB_ROOT) == 0 ? "No SD card" : "Can't open folder");
             return;
         }
-        fb_empty_label("Empty folder");
+        fb_empty_label(g_pick ? "No playlists here" : "Empty folder");
         return;
     }
 
@@ -473,6 +483,13 @@ static void fb_play_iso(const char *name){
     fb_play_tracks(paths, 1);
 }
 
+static void fb_pick_file(const char *name){
+    char full[FB_MAXPATH];
+    int n = snprintf(full, sizeof full, "%s/%s", g_dir, name);
+    if(n <= 0 || n >= (int)sizeof full){ ui_toast("Path too long"); return; }
+    if(g_pick) g_pick(full);
+}
+
 /* A song file's hold menu (itemmenu), as a song row in Library: any file can go to a playlist, and one in the library
  * also knows its album and artist. */
 static void fb_hold(const fb_entry_t *en){
@@ -496,6 +513,7 @@ static void fb_row_cb(lv_event_t *e){
     if(en->is_dir) fb_descend(en->name);
     else if(en->kind == FB_K_ISO) fb_play_iso(en->name);
     else if(en->kind == FB_K_CUE) fb_play_sheet(en->name);
+    else if(en->kind == FB_K_LIST) fb_pick_file(en->name);
     else           fb_play(en->name);
 }
 
@@ -521,9 +539,12 @@ void folderbrowser_create(lv_obj_t *root){
     snprintf(g_dir, sizeof g_dir, "%s", FB_ROOT);   /* first content built on open() */
 }
 
-void folderbrowser_open(void){
+static void fb_open(void (*pick)(const char *path)){
+    g_pick = pick;
     snprintf(g_dir, sizeof g_dir, "%s", FB_ROOT);   /* always (re)enter at the SD root */
     g_fb_depth = 0; g_fb_restore_y = -1;
     fb_scan();
     screen_show(SCR_FOLDER);
 }
+void folderbrowser_open(void){ fb_open(NULL); }
+void folderbrowser_pick_playlist(void (*picked)(const char *path)){ fb_open(picked); }

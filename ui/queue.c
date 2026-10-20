@@ -135,6 +135,20 @@ static int64_t gap_unit(int p){
 }
 
 static int64_t cur_id(void) { return g_cur >= 0 ? g_it[g_cur]->id : 0; }
+static int64_t cur_unit(void) { return g_cur >= 0 && g_cur < g_n ? g_it[g_cur]->unit_id : 0; }
+
+/* The unit's songs after the playing one: all of them for a unit still to come, the later ones for the unit holding
+ * the playing song, none for a played unit. */
+static int later_of(int64_t uid, int *first){
+    int f, c = range_of(uid, &f);
+    if(c && f <= g_cur){
+        int e = f + c;
+        f = g_cur + 1;
+        c = e > f ? e - f : 0;
+    }
+    if(first) *first = c ? f : -1;
+    return c;
+}
 
 /* ---------- memory changes (called only after the database committed) ---------- */
 
@@ -175,6 +189,13 @@ static void mem_move(int a, int c, int t, queue_item **tmp){
 }
 
 static void unit_push(queue_unit *u) { g_un[g_nu++] = u; }
+
+/* The songs of unit uid from index `from` on (all but `skip`) go to the new unit u2 (memory half of a split). */
+static void mem_split(int64_t uid, int from, int skip, queue_unit *u2){
+    for(int i = from; i < g_n && g_it[i]->unit_id == uid; i++)
+        if(i != skip) g_it[i]->unit_id = u2->id;
+    unit_push(u2);
+}
 
 static queue_unit *unit_take(int64_t id){
     int i = unit_idx(id);
@@ -302,6 +323,14 @@ static int sql_state(int64_t list, int64_t current){
     return DBX("INSERT OR REPLACE INTO queue_state (id, queue_id, current_item_id, position_ms, paused, "
                "repeat, shuffle) VALUES (1, NULLIF(?, 0), NULLIF(?, 0), ?, ?, ?, ?)",
                list, current, g_pos_ms, g_paused, g_repeat, g_shuffle);
+}
+
+/* Database half of mem_split: creates u2 and moves the songs to it. */
+static int sql_split(int64_t uid, int from, int skip, queue_unit *u2){
+    int rc = sql_new_unit(g_list, u2);
+    for(int i = from; !rc && i < g_n && g_it[i]->unit_id == uid; i++)
+        if(i != skip) rc = sql_set_unit(g_it[i]->id, u2->id);
+    return rc;
 }
 
 /* Block [a, a+c) moves to start at index t of the new list. */
@@ -519,18 +548,29 @@ int queue_find(int64_t id){
 }
 
 int queue_unit_range(int64_t id, int *first) { return range_of(id, first); }
+int queue_unit_later(int64_t id, int *first) { return later_of(id, first); }
 
+static int rows_reserve(int extra){
+    if(g_nrows + extra <= g_rcap) return 0;
+    int cap = g_rcap ? g_rcap : 256;
+    while(cap < g_nrows + extra) cap *= 2;
+    queue_row *v = realloc(g_rows, (size_t)cap * sizeof *v);
+    if(!v) return QERR_NOMEM;
+    g_rows = v; g_rcap = cap;
+    return 0;
+}
+
+/* The playing song comes first, on its own; its album's later songs follow under the album's header. */
 static int rows_build(void){
     if(g_rows_ver == g_ver) return 0;
     g_nrows = 0;
-    for(int i = g_cur < 0 ? g_n : g_cur; i < g_n;){
-        if(g_nrows + 2 > g_rcap) {   /* a unit header and its first song at most per step below */
-            int cap = g_rcap ? g_rcap * 2 : 256;
-            queue_row *v = realloc(g_rows, (size_t)cap * sizeof *v);
-            if(!v) return QERR_NOMEM;
-            g_rows = v; g_rcap = cap;
-        }
+    if(g_cur >= 0 && g_cur < g_n){
+        if(rows_reserve(1)) return QERR_NOMEM;
+        g_rows[g_nrows++] = (queue_row){ QROW_ITEM, g_cur, 1, g_it[g_cur]->unit_id };
+    }
+    for(int i = g_cur < 0 ? g_n : g_cur + 1; i < g_n;){
         queue_item *it = g_it[i];
+        if(rows_reserve(1)) return QERR_NOMEM;
         if(!it->unit_id){
             g_rows[g_nrows++] = (queue_row){ QROW_ITEM, i, 1, 0 };
             i++;
@@ -540,20 +580,9 @@ static int rows_build(void){
         while(i + c < g_n && g_it[i + c]->unit_id == it->unit_id) c++;
         g_rows[g_nrows++] = (queue_row){ QROW_UNIT, i, c, it->unit_id };
         int u = unit_idx(it->unit_id);
-        if(u >= 0 && g_un[u]->collapsed) {   /* the playing album, collapsed, still shows its playing song */
-            if(i == g_cur) g_rows[g_nrows++] = (queue_row){ QROW_ITEM, i, 1, it->unit_id };
-            i += c;
-            continue;
-        }
-        for(int k = 0; k < c; k++, i++){
-            if(g_nrows + 1 > g_rcap){
-                int cap = g_rcap * 2;
-                queue_row *v = realloc(g_rows, (size_t)cap * sizeof *v);
-                if(!v) return QERR_NOMEM;
-                g_rows = v; g_rcap = cap;
-            }
-            g_rows[g_nrows++] = (queue_row){ QROW_ITEM, i, 1, it->unit_id };
-        }
+        if(u >= 0 && g_un[u]->collapsed){ i += c; continue; }
+        if(rows_reserve(c)) return QERR_NOMEM;
+        for(int k = 0; k < c; k++, i++) g_rows[g_nrows++] = (queue_row){ QROW_ITEM, i, 1, it->unit_id };
     }
     g_rows_ver = g_ver;
     return 0;
@@ -699,16 +728,40 @@ static int red_touches(int q, int a, int c, int64_t uid){
     return (q > 0 && red_at(q - 1, a, c)->unit_id == uid) || (q < m && red_at(q, a, c)->unit_id == uid);
 }
 
-static int move_item_impl(int index, int q, int64_t into, int64_t from_unit, int unit_size){
+/* The gap right after the playing song is never inside its album, so something can play next ahead of the album's
+ * later songs: landing there (gap q, counted without the moved songs) splits the album, as add next does. Returns
+ * the album to split, or 0. */
+static int64_t cur_split(int q, int64_t gap_uid){
+    return q == g_cur + 1 && gap_uid && gap_uid == cur_unit() ? gap_uid : 0;
+}
+
+/* A new unit for the songs of `split` after the playing one (0 = none). */
+static int split_new(int64_t split, queue_unit **u2){
+    *u2 = NULL;
+    if(!split) return 0;
+    queue_unit *su = g_un[unit_idx(split)];
+    if(!(*u2 = unit_new(su->album_artist, su->album, su->collapsed)) || mem_reserve(0, 1)){
+        unit_free(*u2); *u2 = NULL;
+        return QERR_NOMEM;
+    }
+    return 0;
+}
+
+static int move_item_impl(int index, int q, int64_t into, int64_t from_unit, int unit_size, int64_t split){
     queue_item *tmp[1];
+    queue_unit *u2;
     int leaving = from_unit && into != from_unit;
-    int rc = tx_begin();
+    int rc = split_new(split, &u2);
+    if(rc) return rc;
+    rc = tx_begin();
+    if(!rc && u2) rc = sql_split(split, g_cur + 1, index, u2);
     if(!rc && leaving) rc = sql_set_unit(g_it[index]->id, 0);
     if(!rc && leaving && unit_size == 1) rc = sql_del_unit(from_unit);
     if(!rc && q != index) rc = sql_move(index, 1, q);
     rc = tx_end(rc);
-    if(rc) return rc;
+    if(rc){ unit_free(u2); return rc; }
 
+    if(u2) mem_split(split, g_cur + 1, index, u2);
     if(leaving){
         g_it[index]->unit_id = 0;
         if(unit_size == 1) unit_free(unit_take(from_unit));
@@ -720,66 +773,86 @@ static int move_item_impl(int index, int q, int64_t into, int64_t from_unit, int
     return 0;
 }
 
-/* 0 = the move is allowed (or changes nothing), else QERR_*; *q = where the song lands without it in the list. */
-static int move_item_check(int index, int before, int64_t into_unit, int *q){
+/* 0 = the move is allowed (or changes nothing), else QERR_*; *q = where the song lands without it in the list,
+ * *split = the playing album it splits (0 = none). */
+static int move_item_check(int index, int before, int64_t into_unit, int *q, int64_t *split){
     if(index <= g_cur || index >= g_n || before < 0 || before > g_n) return QERR_ARG;
     int64_t own = g_it[index]->unit_id;
     if(into_unit && into_unit != own) return QERR_ARG;
     *q = before > index ? before - 1 : before;
     if(*q <= g_cur) return QERR_PLACE;
     int64_t gu = red_gap_unit(*q, index, 1);
-    if(gu && gu != into_unit) return QERR_PLACE;
+    *split = gu != into_unit ? cur_split(*q, gu) : 0;
+    if(gu && gu != into_unit && !*split) return QERR_PLACE;
     if(into_unit && range_of(own, NULL) > 1 && !red_touches(*q, index, 1, into_unit)) return QERR_PLACE;
     return 0;
 }
 
 int queue_can_move_item(int index, int before, int64_t into_unit){
     int q;
-    return move_item_check(index, before, into_unit, &q) == 0;
+    int64_t split;
+    return move_item_check(index, before, into_unit, &q, &split) == 0;
 }
 
 int queue_move_item(int index, int before, int64_t into_unit){
-    int q, rc = move_item_check(index, before, into_unit, &q);
+    int q;
+    int64_t split;
+    int rc = move_item_check(index, before, into_unit, &q, &split);
     if(rc) return rc;
     int64_t own = g_it[index]->unit_id;
     if(q == index && into_unit == own) return 0;
-    WITH_RETRY(move_item_impl(index, q, into_unit, own, range_of(own, NULL)));
+    WITH_RETRY(move_item_impl(index, q, into_unit, own, range_of(own, NULL), split));
 }
 
-static int move_unit_impl(int f, int c, int q){
+/* split: the album whose songs after the playing one get a unit of their own (the moved songs themselves when the
+ * playing album's later songs move, else the ones a drop right after the playing song goes ahead of). */
+static int move_unit_impl(int f, int c, int q, int64_t split){
+    queue_unit *u2;
     queue_item **tmp = malloc((size_t)c * sizeof *tmp);
     if(!tmp) return QERR_NOMEM;
-    int rc = tx_begin();
+    int rc = split_new(split, &u2);
+    if(!rc) rc = tx_begin();
+    if(!rc && u2) rc = sql_split(split, g_cur + 1, -1, u2);
     if(!rc) rc = sql_move(f, c, q);
     rc = tx_end(rc);
     if(!rc){
+        if(u2) mem_split(split, g_cur + 1, -1, u2);
         mem_move(f, c, q, tmp);
         g_edit_ver++;
         emit(QEV_MOVE, f, c, q);
-    }
+    } else unit_free(u2);
     free(tmp);
     return rc;
 }
 
-/* 0 = allowed, 1 = dropped onto itself (nothing to do), else QERR_*. */
-static int move_unit_check(int64_t uid, int before, int *f, int *c, int *q){
-    *c = range_of(uid, f);
-    if(!*c || *f <= g_cur || before < 0 || before > g_n) return QERR_ARG;
+/* 0 = allowed, 1 = dropped onto itself (nothing to do), else QERR_*. The playing album moves its later songs. */
+static int move_unit_check(int64_t uid, int before, int *f, int *c, int *q, int64_t *split){
+    *c = later_of(uid, f);
+    *split = *c && uid == cur_unit() ? uid : 0;
+    if(!*c || before < 0 || before > g_n) return QERR_ARG;
     if(before >= *f && before <= *f + *c) return 1;
     *q = before > *f ? before - *c : before;
-    if(*q <= g_cur || red_gap_unit(*q, *f, *c)) return QERR_PLACE;
+    if(*q <= g_cur) return QERR_PLACE;
+    int64_t gu = red_gap_unit(*q, *f, *c);
+    if(gu){
+        if(*split || !cur_split(*q, gu)) return QERR_PLACE;
+        *split = gu;
+    }
     return 0;
 }
 
 int queue_can_move_unit(int64_t uid, int before){
     int f, c, q;
-    return move_unit_check(uid, before, &f, &c, &q) >= 0;
+    int64_t split;
+    return move_unit_check(uid, before, &f, &c, &q, &split) >= 0;
 }
 
 int queue_move_unit(int64_t uid, int before){
-    int f, c, q, rc = move_unit_check(uid, before, &f, &c, &q);
+    int f, c, q;
+    int64_t split;
+    int rc = move_unit_check(uid, before, &f, &c, &q, &split);
     if(rc) return rc > 0 ? 0 : rc;
-    WITH_RETRY(move_unit_impl(f, c, q));
+    WITH_RETRY(move_unit_impl(f, c, q, split));
 }
 
 /* Removes [p, p+c); whole = the unit uid goes with them. */
@@ -813,10 +886,11 @@ int queue_remove_item(int index){
     WITH_RETRY(remove_impl(index, 1, uid, uid && range_of(uid, NULL) == 1));
 }
 
+/* The playing album keeps its playing (and played) songs; undo puts the later ones back in it. */
 int queue_remove_unit(int64_t uid){
-    int f, c = range_of(uid, &f);
-    if(!c || f <= g_cur) return QERR_ARG;
-    WITH_RETRY(remove_impl(f, c, uid, 1));
+    int f, c = later_of(uid, &f);
+    if(!c) return QERR_ARG;
+    WITH_RETRY(remove_impl(f, c, uid, uid != cur_unit()));
 }
 
 int queue_can_undo(void){

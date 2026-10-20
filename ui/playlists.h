@@ -25,8 +25,9 @@ void playlists_mark_missing(ldb_list *l);
 /* Write a playlist to /tmp/sdcard/Playlists/<name>.m3u8, its paths relative to that file. 1 = written; file gets the
  * file's name. */
 int playlists_export(long long id, const char *name, char *file, int cap);
-/* Read every .m3u / .m3u8 on the card into playlists; a file whose playlist name exists is skipped. Returns how many
- * playlists were made, -1 = the card can't be read. *skipped (may be NULL) = files left out. */
-int playlists_import_card(int *skipped);
+/* Read one .m3u / .m3u8 file (the one the owner picked; nothing searches the card for them) into a new playlist at the
+ * end of folder_id (0 = the top). A name in use gets " (2)" and so on. Returns its id, with its name, the songs added
+ * (found) and the songs not on the card (missed); 0 = none of its songs are on the card, -1 = can't read it. */
+long long playlists_import_file(const char *file, long long folder_id, char *name, int cap, int *found, int *missed);
 
 #endif
