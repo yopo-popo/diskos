@@ -3475,7 +3475,7 @@ int main(int argc, char **argv){
         if(g_settle_armed) (void)ui_player_settling();   /* service the settle expiry every loop so a dormant armed flag can never wrap (~24.9d) into a false "settling" */
         opus_title_tick();
         ipc_get_state(&st);
-        wifi_supervise();   /* keep wpa_supplicant alive when Wi-Fi should be on (auto-reconnect) */
+        wifi_supervise();   /* Wi-Fi follows its setting: checked after start and on the Wi-Fi pages only */
         /* NOTE: the MAIN LOOP never re-sends audio settings per-tick. Managed settings are (re)applied
          * only by ui_reapply_audio() on a CONFIRMED player reconnect (the ipc_take_reconnected() gate
          * above) and by the live apply_* handlers on a user change. Sending 0666 (output route) to an

@@ -181,5 +181,10 @@ int  ldb_read_favourites(ldb_list *out);
 /* A playlist's songs in its order, each with its entry as row_id; a song not in the library as in Favourites. The
  * caller opens shelves.db first. 0 = empty, -1 = can't read. */
 int  ldb_read_playlist(long long id, ldb_list *out);
+/* A collection's albums that are in the library, sorted as ldb_read_albums (count = their songs). The caller opens
+ * shelves.db first. 0 = none, -1 = can't read. */
+int  ldb_read_collection(long long id, ldb_list *out);
+/* The albums in no collection, sorted as ldb_read_albums. The caller opens shelves.db first. -1 = can't read. */
+int  ldb_read_uncollected(ldb_list *out);
 
 #endif

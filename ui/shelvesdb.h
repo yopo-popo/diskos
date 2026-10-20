@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 diskOS contributors */
-/* shelvesdb - /usr/data/diskos/db/shelves.db, what the owner puts together: favourites and playlists now; album
- * collections and their own genres later. It changes only when they edit something, so it lives apart from
+/* shelvesdb - /usr/data/diskos/db/shelves.db, what the owner puts together: favourites, playlists and album
+ * collections now; their own genres later. It changes only when they edit something, so it lives apart from
  * listening.db (written on every song).
  *
  * A song is a track_refs row: its file path and its start in the file (CUE/ISO), with a snapshot of its title and
@@ -69,6 +69,28 @@ long long shdb_parent(int is_folder, long long id);
  * order. 1 = done, 0 = failed or no such item. */
 int shdb_place(int is_folder, long long id, int to);
 int shdb_pl_item_place(long long item_id, int to);
+
+/* ---- album collections ----
+ * A collection is a name and a set of albums, in the order the owner arranges them; an album can be in any number.
+ * Albums are kept as library.db keys them, album artist ("" = none) + album title, so a rescan never breaks a
+ * collection. Names are unique, ignoring case. */
+typedef struct {
+    long long id;
+    char name[LDB_NAME];
+    int count;                 /* its albums, also those no longer in the library */
+    int has;                   /* the album shdb_coll_list was asked about is in it */
+} shdb_coll;
+/* Every collection, in order; has = the album (album_artist, album) is in it (album NULL = never). Returns how many
+ * (*out is malloc'd: free it), -1 = can't read. */
+int shdb_coll_list(const char *album_artist, const char *album, shdb_coll **out);
+long long shdb_coll_create(const char *name);              /* a new, empty one at the end: its id; 0 = the name is taken, -1 = failed */
+int shdb_coll_name(long long id, char *out, int cap);      /* 1 = found, 0 = none, -1 = can't read */
+int shdb_coll_rename(long long id, const char *name);      /* 1 = done, 0 = the name is taken, -1 = failed */
+int shdb_coll_delete(long long id);                        /* its albums stay in the library. 1 = done */
+int shdb_coll_count(void);                                 /* how many there are, -1 = can't read */
+int shdb_coll_place(long long id, int to);                 /* Reorder: to place `to` (0 = first). 1 = done */
+/* Put the album in the collection (on) or take it out. 1 = done (also when it already was, or wasn't, in it). */
+int shdb_coll_set(long long id, const char *album_artist, const char *album, int on);
 
 /* Open shelves.db now (taking in the SD card's copy when it is new). 1 = open. */
 int shdb_ready(void);

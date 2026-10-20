@@ -8,13 +8,15 @@
  * own copy of the item, so the row and its list may already be gone.
  *
  * Order bands, so entries from different modules sit together: 100 play (Play now, Play next, Add to queue,
- * Play from here), 200 go to (album, artist), 300 collect (Add to playlist, Favourites, Move to folder),
+ * Play from here), 200 go to (album, artist), 300 collect (Add to playlist, Add to collection, Favourites, Move to folder),
  * 400 edit (Rename, Export), 900 remove (Remove from playlist / queue, Delete). */
 #ifndef DISKOS_ITEMMENU_H
 #define DISKOS_ITEMMENU_H
 
-/* IM_PLAYLISTS_PAGE: the Playlists page itself (a hold on its title) */
-typedef enum { IM_SONG, IM_ALBUM, IM_ARTIST, IM_GENRE, IM_PLAYLIST, IM_FOLDER, IM_PLAYLISTS_PAGE } im_kind;
+/* IM_PLAYLISTS_PAGE: the Playlists page itself (a hold on its title); IM_COLLECTION: an album collection;
+ * IM_COLLECTIONS_PAGE: the Collections sheet (a hold on its title) */
+typedef enum { IM_SONG, IM_ALBUM, IM_ARTIST, IM_GENRE, IM_PLAYLIST, IM_FOLDER, IM_PLAYLISTS_PAGE, IM_COLLECTION,
+               IM_COLLECTIONS_PAGE } im_kind;
 /* where the row is listed */
 typedef enum { IM_IN_LIBRARY, IM_IN_PLAYLIST, IM_IN_FAVOURITES, IM_IN_QUEUE, IM_IN_NOWPLAYING, IM_IN_PLAYLISTS } im_where;
 
@@ -25,7 +27,8 @@ typedef struct {
     long long start_ms;                   /* song: its start in the file (CUE/ISO), else 0 */
     char     album_artist[256], album[256];   /* song: its album ("" = none); album row: the album's key */
     char     key[256];                    /* artist row: the artist ("" = unknown); genre row: the genre */
-    long long id;                         /* playlist / folder row: its shelves.db id; Playlists page: the folder shown (0 = top) */
+    long long id;                         /* playlist / folder / collection: its shelves.db id; Playlists page: the folder shown (0 = top) */
+    int      on_art;                      /* album: held by its cover (the album page's, the cover flow's), not a row */
     im_where where;
     long long where_id;                   /* the list the row is in: a playlist's or folder's id, else 0 */
     long long row_id;                     /* the row's own id in that list (a playlist entry), else 0 */

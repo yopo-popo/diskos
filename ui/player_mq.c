@@ -8,7 +8,11 @@
  *
  * The other play paths (search, files, playlists, books) still have mq_player build a list of its own; they call
  * player_release first, and LIST_SONG_0 is then left alone until the next play of our queue. A list the player loads by
- * itself (Play Through Folders, after ours ends) is noticed when the playing row stops holding our song.
+ * itself (Play Through Folders, after ours ends) is noticed when it plays a song that isn't in our queue.
+ *
+ * LIST_SONG_0 is only ever written, never read back: our queue is the truth (yopo 2026-10-20). At boot the saved queue
+ * is loaded into it, whatever it holds. The player may hold song.db for a while as it starts: the load is retried
+ * rather than waited for.
  *
  * Assumed, not yet checked on the Disc (yopo 2026-10-20: check later): the player plays a row whose file has no SONG
  * row, and the jump starts a freshly written LIST_SONG_0 from a stopped player too. CUE and ISO rows are untested.
@@ -32,6 +36,9 @@
 #define PMQ_TICK_MS  250
 #define PMQ_START_MS 10000   /* after a start, how long the old song may still be reported */
 #define PMQ_FOREVER  86400000   /* DURATION for a song of unknown length: a 0 row is skipped as already played */
+#define PMQ_WAIT_MS  2000    /* how long a write waits for the player's lock on song.db */
+#define PMQ_BOOT_RETRY_MS 2000
+#define PMQ_BOOT_MS  120000  /* after this, a song.db that still can't be written is given up on */
 
 int ui_play_row(int ord1, int fresh);   /* main.c: type-0 jump to row ord1; fresh = a new list. 1 = sent */
 
@@ -39,7 +46,10 @@ static sqlite3 *g_db;
 static int g_owned;              /* LIST_SONG_0 holds our queue */
 static int g_want = -1;          /* after a start: the item jumped to, until the player reports it */
 static uint32_t g_want_at;
-static unsigned g_checked_seq;   /* the track change last checked against LIST_SONG_0 */
+static int g_miss;               /* the song of track change g_miss_seq isn't in our queue */
+static unsigned g_miss_seq;
+static int g_boot;               /* the saved queue still has to be loaded: song.db was busy */
+static uint32_t g_boot_at, g_boot_try;
 
 static int db_open(void){
     if(g_db) return 1;
@@ -49,7 +59,7 @@ static int db_open(void){
         g_db = NULL;
         return 0;
     }
-    sqlite3_busy_timeout(g_db, 2000);   /* mq_player writes song.db too */
+    sqlite3_busy_timeout(g_db, PMQ_WAIT_MS);   /* mq_player writes song.db too */
     return 1;
 }
 
@@ -128,25 +138,22 @@ static int rows_change(int op, int a, int b){
     return 1;
 }
 
-/* Does LIST_SONG_0 hold exactly our queue? 1 yes, 0 no, -1 can't read it. */
-static int rows_match(void){
-    if(!db_open()) return -1;
-    sqlite3_stmt *st;
-    if(sqlite3_prepare_v2(g_db, "SELECT ID, PATH FROM LIST_SONG_0 ORDER BY ID", -1, &st, NULL) != SQLITE_OK) return -1;
-    int n = queue_count(), i = 0, rc;
-    while((rc = sqlite3_step(st)) == SQLITE_ROW){
-        const char *p = (const char *)sqlite3_column_text(st, 1);
-        if(i >= n || sqlite3_column_int(st, 0) != i + 1 || !p || strcmp(p, queue_get(i)->path)) break;
-        i++;
-    }
-    sqlite3_finalize(st);
-    if(rc == SQLITE_ROW) return 0;
-    return rc == SQLITE_DONE ? i == n : -1;
+/* Boot: the saved queue goes into LIST_SONG_0 without waiting for the player's lock (this runs on the UI thread and is
+ * retried). 0 = song.db is busy: try again later. */
+static int boot_load(void){
+    if(!queue_count()) return 1;   /* nothing saved: the player's list is left as it is */
+    if(!db_open()) return 0;
+    sqlite3_busy_timeout(g_db, 0);
+    g_owned = rows_change(ROWS_FROM, 0, 0);
+    sqlite3_busy_timeout(g_db, PMQ_WAIT_MS);
+    if(g_owned) fprintf(stderr, "player_mq: loaded our queue of %d into the player's list\n", queue_count());
+    return g_owned;
 }
 
 /* Make the player play queue item index, writing its list first when it isn't ours. 1 = sent. */
 static int start(int index, int fresh){
     if(index < 0 || index >= queue_count()) return 0;
+    g_boot = 0;
     if(!g_owned){
         if(!rows_change(ROWS_FROM, 0, 0)){ ui_toast("Couldn't start playback"); return 0; }
         g_owned = 1;
@@ -169,6 +176,7 @@ static void edited(int op, int a, int b){
 
 static void on_queue(const queue_event *ev, void *ctx){
     (void)ctx;
+    g_miss = 0;   /* the song may be in the queue now */
     switch(ev->type){
     case QEV_RESET:  edited(ROWS_FROM, 0, 0); break;
     case QEV_INSERT:
@@ -185,32 +193,49 @@ static int same_path(const char *ours, const char *player){
     return n >= sizeof ((track_state_t *)0)->path - 1 ? !strncmp(ours, player, n) : !strcmp(ours, player);
 }
 
-/* Which queue item the player plays: the reported row, else the current or the next item when it holds this song. */
+/* Which queue item the player plays: the reported row when it holds this song, else the current item, else the first
+ * one after it with this song (the reported row can lag a quick skip). -1 = not in our queue. */
 static int playing_index(const track_state_t *st){
     int n = queue_count(), i = st->pos_id - 1, c = queue_current();
     if(i >= 0 && i < n && same_path(queue_get(i)->path, st->path)) return i;
     if(c >= 0 && same_path(queue_get(c)->path, st->path)) return c;
-    if(c >= 0 && c + 1 < n && same_path(queue_get(c + 1)->path, st->path)) return c + 1;
+    for(int k = 1; k <= n; k++){
+        int j = (c + k) % n;
+        if(same_path(queue_get(j)->path, st->path)) return j;
+    }
     return -1;
 }
 
 static void tick(lv_timer_t *t){
     (void)t;
+    if(g_boot && lv_tick_elaps(g_boot_try) >= PMQ_BOOT_RETRY_MS){
+        g_boot_try = lv_tick_get();
+        if(boot_load()) g_boot = 0;
+        else if(lv_tick_elaps(g_boot_at) >= PMQ_BOOT_MS){
+            g_boot = 0;
+            fprintf(stderr, "player_mq: song.db stayed busy; our queue goes to the player at the next play\n");
+        }
+    }
     if(!g_owned) return;
     track_state_t st;
     ipc_get_state(&st);
     if(!st.have_track || st.provisional || !st.path[0]) return;
-    int i = playing_index(&st);
+    int i = -1;
+    if(!g_miss || st.path_seq != g_miss_seq){
+        i = playing_index(&st);
+        g_miss = i < 0;
+        g_miss_seq = st.path_seq;
+    }
     if(g_want >= 0){
         if(i != g_want && lv_tick_elaps(g_want_at) < PMQ_START_MS) return;   /* the old song until the jump lands */
         g_want = -1;
     }
     if(i < 0){
-        if(st.path_seq == g_checked_seq) return;
-        g_checked_seq = st.path_seq;
-        if(rows_match() == 0){
+        /* Only a song that plays: after a boot the player still shows the song it stopped on, which may be from
+         * another list. */
+        if(ui_is_playing()){
             g_owned = 0;
-            fprintf(stderr, "player_mq: the player loaded a list of its own; leaving it alone\n");
+            fprintf(stderr, "player_mq: the player plays a song that isn't in our queue; leaving its list alone\n");
         }
         return;
     }
@@ -224,10 +249,10 @@ void player_init(void){
         queue_listen(on_queue, NULL);
         ticker = lv_timer_create(tick, PMQ_TICK_MS, NULL);
     }
-    int m = rows_match();
-    g_owned = m == 1;
-    fprintf(stderr, "player_mq: the player's list %s our queue of %d\n",
-            m == 1 ? "is" : m == 0 ? "isn't" : "can't be read, taken as not", queue_count());
+    g_owned = 0;
+    g_boot = !boot_load();
+    g_boot_at = g_boot_try = lv_tick_get();
+    if(g_boot) fprintf(stderr, "player_mq: song.db is busy; loading our queue into the player's list later\n");
 }
 
 int player_play(const queue_track *t, int n, const queue_album *unit, int start_at){
@@ -257,6 +282,7 @@ int player_owns(void){ return g_owned; }
 int player_release(void){
     int was = g_owned;
     g_owned = 0;
+    g_boot = 0;
     g_want = -1;
     return was;
 }

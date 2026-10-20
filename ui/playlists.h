@@ -10,6 +10,9 @@
 void playlists_add_songs(const ldb_item *v, int n);
 void playlists_add_current(void);
 
+/* A small dialog over the screen: a question, a line under it (NULL = none) and up to three buttons, labels[i] running
+ * fns[i] (NULL only closes); button danger (-1 = none) is drawn as destructive. A tap outside is Cancel. */
+void playlists_dialog(const char *title, const char *sub, int n, const char *const *labels, void (*const *fns)(void), int danger);
 /* Close the picker's dialogs (a screen change). */
 void plpick_close_transients(void);
 /* playlistview.c: the playlist shown (0 = none), and its rows or name changed (reread, keeping the place) */

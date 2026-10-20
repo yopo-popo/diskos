@@ -88,6 +88,9 @@ static void dialog(const char *title, const char *sub, int n, const char *const 
     }
 }
 void plpick_close_transients(void){ dlg_close(); }
+void playlists_dialog(const char *title, const char *sub, int n, const char *const *labels, void (*const *fns)(void), int danger){
+    dialog(title, sub, n, labels, fns, danger);
+}
 
 /* ---- the songs Add to playlist adds: copies, so the list they came from may go ---- */
 static shdb_song *g_songs;

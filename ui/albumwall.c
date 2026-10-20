@@ -9,6 +9,7 @@
 #include "theme_kit.h"
 #include "i18n.h"
 #include "itemmenu.h"
+#include "collections.h"   /* the wall of every album shows a collection */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -48,6 +49,7 @@ static lv_obj_t *g_initial;
 static lv_obj_t *g_name, *g_artist, *g_counter;
 
 static ldb_list g_alb;            /* the albums, from library.db (title, album artist, first song's file) */
+static coll_key g_coll;           /* what the full wall's g_alb was read for: every album or a collection */
 /* What the wall shows: every album, or one artist's. The full wall keeps its own centre album while an artist's is up. */
 static int  g_scope = -1;         /* -1 = every album, else the artist's LDB_SCOPE_ARTIST / LDB_SCOPE_GROUP */
 static char g_scope_key[LDB_NAME];   /* that artist ("" = Unknown artist) */
@@ -371,7 +373,7 @@ void albumwall_hold(void){
     const ldb_item *a = &g_alb.v[g_cur];
     im_item it;
     memset(&it, 0, sizeof it);
-    it.kind = IM_ALBUM; it.where = IM_IN_LIBRARY;
+    it.kind = IM_ALBUM; it.where = IM_IN_LIBRARY; it.on_art = 1;
     snprintf(it.title, sizeof it.title, "%s", a->title ? a->title : "");
     snprintf(it.album_artist, sizeof it.album_artist, "%s", a->artist ? a->artist : "");
     snprintf(it.album, sizeof it.album, "%s", a->title ? a->title : "");
@@ -611,18 +613,28 @@ void albumwall_refresh(void){
     lv_obj_set_style_bg_opa(g_root, LV_OPA_COVER, 0);
     lv_obj_t *title = library_header(g_root, "Albums");   /* back arrow / title: Library's top page */
     if(g_scope >= 0) theme_title_text(title, g_scope_key[0] ? g_scope_key : "Unknown artist");   /* an artist's wall */
+    else if(collections_in_use()) theme_title_text(title, collections_name());   /* the collection it shows */
 
-    /* the album list, read again only when a scan replaced library.db (the sprites were dropped above either way) */
+    /* the album list, read again only when a scan replaced library.db or the collection shown changed (the sprites
+     * were dropped above either way) */
     int rd = 0;
-    if(!ldb_list_current(&g_alb)){
+    if(g_scope < 0){
+        if(collections_changed(&g_coll) == 2) g_cur = 0;   /* another collection: from its first album */
+        rd = collections_albums(&g_alb, &g_coll);
+    } else if(!ldb_list_current(&g_alb)){
         ldb_list_free(&g_alb);
-        rd = g_scope < 0 ? ldb_read_albums(&g_alb) : ldb_read_scope_albums(g_scope, g_scope_key, &g_alb);
+        rd = ldb_read_scope_albums(g_scope, g_scope_key, &g_alb);
     }
     g_nalb = g_alb.n;
+    lv_obj_t *cap_count = NULL;
     if(g_scope >= 0) aw_all_songs_pill();   /* the artist's songs stay one tap away, even if a rescan left no albums */
+    else collections_cap(g_root, &cap_count);   /* every album: the cap that opens the Collections sheet */
     if(g_nalb <= 0){
         lv_obj_t *e = lv_label_create(g_root);
-        lv_label_set_text(e, rd < 0 ? "Scan the library to see albums" : "No albums found");
+        if(g_scope < 0 && g_coll.id){       /* a collection with none of its albums in the library */
+            lv_label_set_text(e, tr(rd < 0 ? "Couldn't read this collection" : collections_empty()));
+            lv_obj_set_width(e, 240); lv_obj_set_style_text_align(e, LV_TEXT_ALIGN_CENTER, 0);
+        } else lv_label_set_text(e, rd < 0 ? "Scan the library to see albums" : "No albums found");
         lv_obj_center(e); lv_obj_set_style_text_color(e, TC(TEXT_MUTED), 0);
         return;
     }
@@ -642,8 +654,9 @@ void albumwall_refresh(void){
     lv_obj_align(g_initial, LV_ALIGN_TOP_MID, 0, 72 + AW_SRC/2 - 12);
     lv_obj_add_flag(g_initial, LV_OBJ_FLAG_HIDDEN);
 
-    /* name, album artist, counter; an artist's wall lifts them a little for the All Songs pill under the counter */
-    const int y_name = g_scope < 0 ? 266 : 261, y_artist = g_scope < 0 ? 292 : 284, y_counter = g_scope < 0 ? 318 : 303;
+    /* name, album artist, counter; an artist's wall lifts them a little for the All Songs pill under the counter, and
+     * every album's wall has its counter in the collections cap */
+    const int y_name = g_scope < 0 ? 266 : 261, y_artist = g_scope < 0 ? 292 : 284, y_counter = 303;
     g_name = lv_label_create(g_root);
     lv_label_set_long_mode(g_name, LV_LABEL_LONG_DOT); lv_obj_set_size(g_name, 260, 24);
     lv_obj_set_style_text_align(g_name, LV_TEXT_ALIGN_CENTER, 0); lv_obj_align(g_name, LV_ALIGN_TOP_MID, 0, y_name);
@@ -654,9 +667,12 @@ void albumwall_refresh(void){
     lv_obj_set_style_text_align(g_artist, LV_TEXT_ALIGN_CENTER, 0); lv_obj_align(g_artist, LV_ALIGN_TOP_MID, 0, y_artist);
     lv_obj_set_style_text_font(g_artist, TF(USER_16), 0); lv_obj_set_style_text_color(g_artist, TC(TEXT_MUTED), 0);
 
-    g_counter = lv_label_create(g_root);
-    lv_obj_align(g_counter, LV_ALIGN_TOP_MID, 0, y_counter);
-    lv_obj_set_style_text_font(g_counter, TF(UI_14), 0); lv_obj_set_style_text_color(g_counter, TC(TEXT_DISABLED), 0);
+    if(cap_count) g_counter = cap_count;
+    else {
+        g_counter = lv_label_create(g_root);
+        lv_obj_align(g_counter, LV_ALIGN_TOP_MID, 0, y_counter);
+        lv_obj_set_style_text_font(g_counter, TF(UI_14), 0); lv_obj_set_style_text_color(g_counter, TC(TEXT_DISABLED), 0);
+    }
 
     aw_render_all(); aw_labels();
 }

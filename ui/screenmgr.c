@@ -50,7 +50,7 @@ static const unsigned char s_figure[SCR_COUNT] = {
     [SCR_QSCONFIG] = 25, [SCR_COLORPICK] = 26, [SCR_DATETIME] = 27,
     [SCR_WIFI] = 28, [SCR_WIFI_INFO] = 29, [SCR_BT] = 30,
     [SCR_BT_INFO] = 31, [SCR_WORKMODE] = 32, [SCR_LASTFM] = 33,
-    [SCR_DEBUG] = 34,
+    [SCR_DEBUG] = 34, [SCR_COLLECTIONS] = 35,
 };
 int screen_figure_number(int which){
     return which >= 0 && which < SCR_COUNT ? s_figure[which] : 0;
@@ -79,9 +79,7 @@ static lv_obj_t *screen_make_root(lv_obj_t *parent)
     /* full black square; the physical round bezel masks the shape. Clipping to a
      * circle here just exposed the lighter screen behind at the corners. */
     lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
-    /* Slide is the only GPU-less-smooth transition (a blit, not a resample). Each root carries a
-     * 1px leading-edge hairline so the sliding boundary reads as a card edge. */
-    anim_panel_shadow(root);
+    /* No edge line: the old 1 px left hairline showed as a grey line at the screen's left (yopo 2026-10-20) */
     return root;
 }
 
@@ -151,6 +149,10 @@ static void anim_done_push(lv_anim_t *a)
     ui_np_title_scroll(ui_screen_backlight_on());
     scrim_off();
 }
+
+/* A sheet comes up from the bottom over the page it opened from, and goes back down: the Collections sheet, from the
+ * cap at the bottom of Albums. */
+static int is_sheet(int scr){ return scr == SCR_COLLECTIONS; }
 
 /* Now Playing's strip: -1 Options, 0 Now Playing, +1 Lyrics; 2 = not in it. */
 static int np_strip(int scr){ return scr == SCR_NPHUB ? -1 : scr == SCR_NOWPLAYING ? 0 : scr == SCR_LYRICS ? 1 : 2; }
@@ -228,6 +230,16 @@ static void transition(int from, int to, int dir)
         s_push_hide = from;
         anim_page_slide(od, 0, -x, PUSH_MS, NULL);
         anim_page_slide(nw, x, 0, PUSH_MS, anim_done_push);
+        ui_np_title_scroll(ui_screen_backlight_on());
+        return;
+    }
+
+    if (dir == 1 && is_sheet(to)) dir = 2;          /* a sheet comes up from below, as the section below would */
+    else if (dir == -1 && is_sheet(from) && od) {   /* and goes back down, uncovering the page under it */
+        lv_obj_clear_flag(nw, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(od, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(od);
+        anim_page_slide_y(od, 0, SCR_H, POP_MS, anim_done_hide);
         ui_np_title_scroll(ui_screen_backlight_on());
         return;
     }
@@ -513,10 +525,7 @@ void screens_init(void)
     s_roots[SCR_ALBUMWALL] = screen_make_root(parent);
     s_roots[SCR_UPNEXT] = screen_make_root(parent);
     s_roots[SCR_DATETIME] = screen_make_root(parent);
-    /* Now Playing's strip has no card edge: its pages scroll side by side */
-    lv_obj_set_style_border_opa(s_roots[SCR_NOWPLAYING], LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_opa(s_roots[SCR_NPHUB], LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_opa(s_roots[SCR_LYRICS], LV_OPA_TRANSP, 0);
+    s_roots[SCR_COLLECTIONS] = screen_make_root(parent);
 
     /* depth scrim: a full-screen translucent-black overlay, created LAST so it sits above the
      * roots in sibling order; re-parented in z during a transition to dim the screen beneath the
@@ -558,6 +567,7 @@ void screens_init(void)
     apps_create(s_roots[SCR_APPS]);
     nphub_create(s_roots[SCR_NPHUB]);
     plpick_create(s_roots[SCR_PLPICK]);
+    collections_create(s_roots[SCR_COLLECTIONS]);
     plview_create(s_roots[SCR_PLVIEW]);
     wifi_create(s_roots[SCR_WIFI]);
     wifi_info_create(s_roots[SCR_WIFI_INFO]);

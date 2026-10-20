@@ -922,6 +922,19 @@ static const char *READ_FAVOURITES =
 static const char *READ_PLAYLIST =
     "SELECT " SHELF_SONG_COLS ", NULL, x.id FROM sh.playlist_items x " SHELF_SONG_JOIN
     " WHERE x.playlist_id=?1 ORDER BY x.position, x.id;";
+/* An album a's row, as READ_ALBUMS reads it (its first song's file, its song count) */
+#define ALBUM_COLS "a.title, a.album_artist," \
+    " (SELECT t.path FROM tracks t WHERE t.album_artist=a.album_artist AND t.album_title=a.title " ALBUM_ORDER " LIMIT 1)," \
+    " NULL, NULL, 0, 0, 0, 0, 0," \
+    " (SELECT count(*) FROM tracks t WHERE t.album_artist=a.album_artist AND t.album_title=a.title), a.title_key, a.year"
+/* A collection's albums (?1 = its id) that are in the library, as the Albums list sorts them */
+static const char *READ_COLLECTION =
+    "SELECT " ALBUM_COLS " FROM sh.collection_albums c JOIN albums a ON a.album_artist=c.album_artist AND a.title=c.album_title"
+    " WHERE c.collection_id=?1 ORDER BY " ALBUMS_BY_TITLE ";";
+/* The albums in no collection (Unsorted), as the Albums list sorts them */
+static const char *READ_UNCOLLECTED =
+    "SELECT " ALBUM_COLS " FROM albums a WHERE NOT EXISTS (SELECT 1 FROM sh.collection_albums c"
+    " WHERE c.album_artist=a.album_artist AND c.album_title=a.title) ORDER BY " ALBUMS_BY_TITLE ";";
 static const char *scope_cond(int kind, const char *key){
     switch(kind){
     case LDB_SCOPE_GENRE: return "t.id IN (SELECT g.track_id FROM track_file_genres g WHERE g.genre=?1)";
@@ -1210,4 +1223,11 @@ int ldb_read_favourites(ldb_list *out){
 }
 int ldb_read_playlist(long long id, ldb_list *out){
     return read_with(SHELVESDB_PATH, "ATTACH DATABASE ?1 AS sh;", READ_PLAYLIST, id, out);
+}
+int ldb_read_collection(long long id, ldb_list *out){
+    return read_with(SHELVESDB_PATH, "ATTACH DATABASE ?1 AS sh;", READ_COLLECTION, id, out);
+}
+int ldb_read_uncollected(ldb_list *out){
+    if(access(SHELVESDB_PATH, F_OK) != 0 && errno == ENOENT) return ldb_read_albums(out);   /* no shelves.db: no collections */
+    return read_with(SHELVESDB_PATH, "ATTACH DATABASE ?1 AS sh;", READ_UNCOLLECTED, 0, out);
 }

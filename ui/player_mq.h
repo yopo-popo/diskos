@@ -7,7 +7,7 @@
 
 #include "queue.h"
 
-/* After queue_open: follow the queue's changes and check whether the player's list is still our queue. */
+/* After queue_open: load the saved queue into the player's list and follow the queue's changes. */
 void player_init(void);
 
 /* Play these songs as the new queue, from t[start]. unit = an album played as one block (NULL = loose songs). With

@@ -22,9 +22,6 @@ void anim_fade(lv_obj_t *o, lv_opa_t from, lv_opa_t to, uint32_t ms, lv_anim_com
 void anim_scale(lv_obj_t *o, int from_pct, int to_pct, uint32_t ms); /* 256 = 1.0 (LVGL zoom) */
 void anim_press(lv_obj_t *o);  /* quick 100%->94%->100% tactile feedback */
 
-/* Give a full-screen panel a crisp 1px hairline on its LEADING (left) edge - the card boundary for
- * a push transition, visible on a near-black UI where a drop-shadow would not be. */
-void anim_panel_shadow(lv_obj_t *root);
 /* iOS-style ease-in-out page slide (gentle start + stop). */
 void anim_page_slide(lv_obj_t *o, int from, int to, uint32_t ms, lv_anim_completed_cb_t done);
 void anim_page_slide_y(lv_obj_t *o, int from, int to, uint32_t ms, lv_anim_completed_cb_t done);

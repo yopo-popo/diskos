@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 diskOS contributors */
-/* shelvesdb - favourites and playlists in shelves.db, and its copy on the SD card (see shelvesdb.h). */
+/* shelvesdb - favourites, playlists and album collections in shelves.db, and its copy on the SD card (see shelvesdb.h). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -49,6 +49,18 @@ static const char *SCHEMA =
     "CREATE INDEX IF NOT EXISTS playlists_in_folder ON playlists (folder_id);"
     "CREATE INDEX IF NOT EXISTS playlist_folders_in_folder ON playlist_folders (parent_id);"
     "PRAGMA user_version = 2;";
+/* Album collections came after version 2 without a new version, so a build from before them still opens the file and
+ * leaves these tables alone. Run on every open; each statement is whole on its own. */
+static const char *COLLECTIONS =
+    "CREATE TABLE IF NOT EXISTS collections ("
+    " id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,"
+    " position INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);"
+    /* an album as library.db keys it: no album artist is '' */
+    "CREATE TABLE IF NOT EXISTS collection_albums ("
+    " id INTEGER PRIMARY KEY,"
+    " collection_id INTEGER NOT NULL REFERENCES collections (id) ON DELETE CASCADE,"
+    " album_artist TEXT NOT NULL DEFAULT '', album_title TEXT NOT NULL, added_at INTEGER NOT NULL,"
+    " UNIQUE (collection_id, album_artist, album_title));";
 
 /* The card's copy (attached as b) into this file: its songs, then its favourites in its order, older than the ones made
  * here before the card came (those stay newest; one in both moves up to its newer place). */
@@ -81,6 +93,17 @@ static const char *MERGE_PLAYLISTS_SQL =
     " JOIN b.track_refs br ON br.id = bi.track_ref_id JOIN main.track_refs r ON r.path = br.path AND r.start_ms = br.start_ms"
     " WHERE bi.playlist_id + o.p IN (SELECT id FROM main.playlists) ORDER BY bi.id;"
     "DROP TABLE merge_off;";
+/* The copy's collections, when it has them: they go before the ones made here, and one with the name of a collection
+ * here is combined with it (its albums are added to that one). */
+static const char *MERGE_COLLECTIONS_SQL =
+    "CREATE TEMP TABLE merge_coff AS SELECT IFNULL(MAX(position), -1) + 1 AS top FROM b.collections;"
+    "UPDATE main.collections SET position = position + (SELECT top FROM merge_coff);"
+    "INSERT OR IGNORE INTO main.collections (name, position, created_at, updated_at)"
+    " SELECT name, position, created_at, updated_at FROM b.collections ORDER BY position, id;"
+    "INSERT OR IGNORE INTO main.collection_albums (collection_id, album_artist, album_title, added_at)"
+    " SELECT m.id, IFNULL(ba.album_artist, ''), ba.album_title, ba.added_at FROM b.collection_albums ba"
+    " JOIN b.collections bc ON bc.id = ba.collection_id JOIN main.collections m ON m.name = bc.name ORDER BY ba.id;"
+    "DROP TABLE merge_coff;";
 /* songs nothing uses any more */
 static const char *PRUNE_REFS =
     "DELETE FROM track_refs WHERE id NOT IN (SELECT track_ref_id FROM favourites)"
@@ -143,9 +166,13 @@ static int merge_attached(sqlite3 *d, int attach_rc){
         fprintf(stderr, "shelvesdb: %s can't be read; the next copy replaces it\n", SHELVES_BACKUP);
         return sqlite3_exec(d, "UPDATE meta SET value = 1 WHERE key = 'backup_seen';", 0, 0, 0) == SQLITE_OK;
     }
+    /* a copy from a build before collections has no collections tables */
+    int colls = query_int(d, "SELECT count(*) FROM b.sqlite_master WHERE type = 'table'"
+                             " AND name IN ('collections', 'collection_albums');") == 2;
     if(sqlite3_exec(d, "BEGIN IMMEDIATE;", 0, 0, 0) != SQLITE_OK) return 0;
     if(sqlite3_exec(d, MERGE_SQL, 0, 0, 0) == SQLITE_OK
        && (v < 2 || sqlite3_exec(d, MERGE_PLAYLISTS_SQL, 0, 0, 0) == SQLITE_OK)
+       && (!colls || sqlite3_exec(d, MERGE_COLLECTIONS_SQL, 0, 0, 0) == SQLITE_OK)
        && sqlite3_exec(d, "UPDATE meta SET value = 1 WHERE key = 'backup_seen';", 0, 0, 0) == SQLITE_OK
        && sqlite3_exec(d, "COMMIT;", 0, 0, 0) == SQLITE_OK){
         fprintf(stderr, "shelvesdb: took in %s\n", SHELVES_BACKUP);
@@ -252,6 +279,8 @@ static sqlite3 *db_locked(void){
         sqlite3_close(d);
         return NULL;
     }
+    if(sqlite3_exec(d, COLLECTIONS, 0, 0, 0) != SQLITE_OK)   /* then only collections fail; the rest still works */
+        fprintf(stderr, "shelvesdb: can't add the collections tables: %s\n", sqlite3_errmsg(d));
     g_db = d;
     g_seen = query_int(d, "SELECT value FROM meta WHERE key = 'backup_seen';") == 1;
     merge_backup_locked(d);
@@ -289,7 +318,7 @@ static int end_change(sqlite3 *d, int ok){
 }
 
 /* Prepares sql with its parameters ?1.. from fmt: 'i' a long long, 'n' a long long with 0 bound as NULL (the top
- * folder), 't' a string (NULL or "" bound as NULL). NULL = can't. */
+ * folder), 't' a string (NULL or "" bound as NULL), 's' a string as it is (NULL bound as ""). NULL = can't. */
 static sqlite3_stmt *prep(sqlite3 *d, const char *sql, const char *fmt, va_list ap){
     sqlite3_stmt *st = NULL;
     if(!d || sqlite3_prepare_v2(d, sql, -1, &st, NULL) != SQLITE_OK){ sqlite3_finalize(st); return NULL; }
@@ -297,6 +326,9 @@ static sqlite3_stmt *prep(sqlite3 *d, const char *sql, const char *fmt, va_list 
         if(fmt[i] == 't'){
             const char *t = va_arg(ap, const char *);
             if(t && t[0]) sqlite3_bind_text(st, i + 1, t, -1, SQLITE_TRANSIENT); else sqlite3_bind_null(st, i + 1);
+        } else if(fmt[i] == 's'){
+            const char *t = va_arg(ap, const char *);
+            sqlite3_bind_text(st, i + 1, t ? t : "", -1, SQLITE_TRANSIENT);
         } else {
             long long v = va_arg(ap, long long);
             if(fmt[i] == 'n' && v <= 0) sqlite3_bind_null(st, i + 1); else sqlite3_bind_int64(st, i + 1, v);
@@ -429,15 +461,13 @@ long long shdb_pl_find(const char *name){
     pthread_mutex_unlock(&g_mu);
     return id;
 }
-int shdb_name(int is_folder, long long id, char *out, int cap){
+/* The name a query (?1 = an id) finds, into out. 1 = found, 0 = none, -1 = can't read. */
+static int name_of(const char *sql, long long id, char *out, int cap){
     if(cap > 0) out[0] = 0;
     pthread_mutex_lock(&g_mu);
-    sqlite3 *d = db_locked();
-    sqlite3_stmt *st = NULL;
+    sqlite3_stmt *st = stmtf(db_locked(), sql, "i", id);
     int r = -1;
-    if(d && sqlite3_prepare_v2(d, is_folder ? "SELECT name FROM playlist_folders WHERE id = ?1;"
-                                            : "SELECT name FROM playlists WHERE id = ?1;", -1, &st, NULL) == SQLITE_OK){
-        sqlite3_bind_int64(st, 1, id);
+    if(st){
         int rc = sqlite3_step(st);
         if(rc == SQLITE_ROW){ snprintf(out, (size_t)cap, "%s", (const char *)sqlite3_column_text(st, 0)); r = 1; }
         else if(rc == SQLITE_DONE) r = 0;
@@ -445,6 +475,10 @@ int shdb_name(int is_folder, long long id, char *out, int cap){
     sqlite3_finalize(st);
     pthread_mutex_unlock(&g_mu);
     return r;
+}
+int shdb_name(int is_folder, long long id, char *out, int cap){
+    return name_of(is_folder ? "SELECT name FROM playlist_folders WHERE id = ?1;" : "SELECT name FROM playlists WHERE id = ?1;",
+                   id, out, cap);
 }
 int shdb_pl_rename(long long id, const char *name){
     if(!name || !name[0]) return -1;
@@ -614,5 +648,92 @@ int shdb_pl_item_place(long long item_id, int to){
     int ok = upd[0] && place_in(sel, upd, 0, item_id, to)
           && execf(d, "UPDATE playlists SET updated_at = " NOW " WHERE id = ?1;", "i", pid);
     sqlite3_finalize(sel); sqlite3_finalize(upd[0]);
+    return end_change(d, ok);
+}
+
+/* ---- album collections ---- */
+int shdb_coll_list(const char *album_artist, const char *album, shdb_coll **out){
+    *out = NULL;
+    pthread_mutex_lock(&g_mu);
+    sqlite3_stmt *st = stmtf(db_locked(),
+        "SELECT c.id, c.name, (SELECT count(*) FROM collection_albums a WHERE a.collection_id = c.id),"
+        " EXISTS (SELECT 1 FROM collection_albums a WHERE a.collection_id = c.id AND a.album_artist = ?1 AND a.album_title = ?2)"
+        " FROM collections c ORDER BY c.position, c.id;", "ss", album_artist, album);
+    int n = -1;
+    if(st){
+        shdb_coll *v = NULL; int cap = 0, rc;
+        n = 0;
+        while((rc = sqlite3_step(st)) == SQLITE_ROW){
+            if(n == cap){
+                int nc = cap ? cap * 2 : 16;
+                shdb_coll *p = realloc(v, (size_t)nc * sizeof *v);
+                if(!p){ rc = SQLITE_NOMEM; break; }
+                v = p; cap = nc;
+            }
+            shdb_coll *c = &v[n++];
+            c->id = sqlite3_column_int64(st, 0);
+            const unsigned char *name = sqlite3_column_text(st, 1);
+            snprintf(c->name, sizeof c->name, "%s", name ? (const char *)name : "");
+            c->count = sqlite3_column_int(st, 2);
+            c->has = album && sqlite3_column_int(st, 3);
+        }
+        if(rc != SQLITE_DONE){ free(v); v = NULL; n = -1; }
+        *out = v;
+    }
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&g_mu);
+    return n;
+}
+long long shdb_coll_create(const char *name){
+    if(!name || !name[0]) return -1;
+    sqlite3 *d = begin_change();
+    long long taken = intf(d, 0, "SELECT 1 FROM collections WHERE name = ?1;", "t", name), id = -1;
+    int ok = taken == 0
+          && execf(d, "INSERT INTO collections (name, position, created_at, updated_at)"
+                      " VALUES (?1, (SELECT IFNULL(MAX(position), -1) + 1 FROM collections), " NOW ", " NOW ");", "t", name);
+    if(ok) id = sqlite3_last_insert_rowid(d);
+    if(!end_change(d, ok)) return taken == 1 ? 0 : -1;
+    return id;
+}
+int shdb_coll_name(long long id, char *out, int cap){
+    return name_of("SELECT name FROM collections WHERE id = ?1;", id, out, cap);
+}
+int shdb_coll_rename(long long id, const char *name){
+    if(!name || !name[0]) return -1;
+    sqlite3 *d = begin_change();
+    long long taken = intf(d, 0, "SELECT 1 FROM collections WHERE name = ?1 AND id <> ?2;", "ti", name, id);
+    int ok = taken == 0 && execf(d, "UPDATE collections SET name = ?1, updated_at = " NOW " WHERE id = ?2;", "ti", name, id)
+          && sqlite3_changes(d) == 1;
+    if(!end_change(d, ok)) return taken == 1 ? 0 : -1;
+    return 1;
+}
+int shdb_coll_delete(long long id){
+    sqlite3 *d = begin_change();
+    int ok = execf(d, "DELETE FROM collections WHERE id = ?1;", "i", id) && sqlite3_changes(d) == 1;   /* its rows go too */
+    return end_change(d, ok);
+}
+int shdb_coll_count(void){
+    pthread_mutex_lock(&g_mu);
+    long long n = intf(db_locked(), -1, "SELECT count(*) FROM collections;", "");
+    pthread_mutex_unlock(&g_mu);
+    return (int)n;
+}
+int shdb_coll_place(long long id, int to){
+    sqlite3 *d = begin_change();
+    sqlite3_stmt *sel = stmtf(d, "SELECT 0, id, position FROM collections ORDER BY position, id;", "");   /* shdb_coll_list's order */
+    sqlite3_stmt *upd[2] = { stmtf(d, "UPDATE collections SET position = ?1 WHERE id = ?2;", ""), NULL };
+    upd[1] = upd[0];
+    int ok = upd[0] && place_in(sel, upd, 0, id, to);
+    sqlite3_finalize(sel); sqlite3_finalize(upd[0]);
+    return end_change(d, ok);
+}
+int shdb_coll_set(long long id, const char *album_artist, const char *album, int on){
+    if(!album || !album[0]) return 0;
+    sqlite3 *d = begin_change();
+    int ok = on ? execf(d, "INSERT OR IGNORE INTO collection_albums (collection_id, album_artist, album_title, added_at)"
+                           " SELECT id, ?2, ?3, " NOW " FROM collections WHERE id = ?1;", "iss", id, album_artist, album)
+                : execf(d, "DELETE FROM collection_albums WHERE collection_id = ?1 AND album_artist = ?2 AND album_title = ?3;",
+                        "iss", id, album_artist, album);
+    ok = ok && execf(d, "UPDATE collections SET updated_at = " NOW " WHERE id = ?1;", "i", id) && sqlite3_changes(d) == 1;
     return end_change(d, ok);
 }

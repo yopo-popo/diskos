@@ -66,18 +66,6 @@ void anim_press(lv_obj_t *o){
     start(o, exec_zoom, 256, 240, 90, anim_path_spring, press_up);
 }
 
-/* Leading-edge card definition for a sliding full-screen panel. On a near-black UI a black drop-
- * shadow is invisible, so a slide reads as "content sprites sliding," not a clean card. Instead we
- * put a crisp 1px hairline (white @ ~10%) on the panel's LEFT edge: it's the card's leading edge as
- * it slides in, and at rest (x=0) it sits on the round bezel's extreme-left column (masked). */
-void anim_panel_shadow(lv_obj_t *root){
-    lv_obj_set_style_border_side(root, LV_BORDER_SIDE_LEFT, 0);
-    lv_obj_set_style_border_width(root, 1, 0);
-    lv_obj_set_style_border_color(root, TC(OUTLINE_BRIGHT), 0);
-    lv_obj_set_style_border_opa(root, 26, 0);   /* ~10% */
-    lv_obj_set_style_pad_left(root, -1, 0);     /* the hairline must not indent the screen: content stays truly centred */
-}
-
 /* Like start(), but with a cubic EASE-OUT path (cubic-bezier 0.33,1,0.68,1) - the "confident arrival"
  * curve: most of the distance is covered fast, then a gentle settle, but LESS front-loaded than expo so
  * it doesn't cram the motion into a couple of frames on this ~30fps software renderer. One curve for

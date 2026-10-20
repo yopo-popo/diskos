@@ -5,7 +5,7 @@
 #include "lvgl/lvgl.h"
 #include "ipc.h"
 #include <stdbool.h>
-enum { SCR_HOME, SCR_LIBRARY, SCR_NOWPLAYING, SCR_SETTINGS, SCR_SETTING_DETAIL, SCR_SEARCH, SCR_QUICK, SCR_SONGINFO, SCR_NPMENU, SCR_TUNE, SCR_EQ, SCR_APPS, SCR_NPHUB, SCR_PLPICK, SCR_PLVIEW, SCR_WIFI, SCR_WIFI_INFO, SCR_BT, SCR_BT_INFO, SCR_LYRICS, SCR_COLORPICK, SCR_LASTFM, SCR_WORKMODE, SCR_DEBUG, SCR_FOLDER, SCR_BOOKS, SCR_CHAPTERS, SCR_SETLIST, SCR_QSCONFIG, SCR_ALBUMWALL, SCR_UPNEXT, SCR_DATETIME, SCR_COUNT };
+enum { SCR_HOME, SCR_LIBRARY, SCR_NOWPLAYING, SCR_SETTINGS, SCR_SETTING_DETAIL, SCR_SEARCH, SCR_QUICK, SCR_SONGINFO, SCR_NPMENU, SCR_TUNE, SCR_EQ, SCR_APPS, SCR_NPHUB, SCR_PLPICK, SCR_PLVIEW, SCR_WIFI, SCR_WIFI_INFO, SCR_BT, SCR_BT_INFO, SCR_LYRICS, SCR_COLORPICK, SCR_LASTFM, SCR_WORKMODE, SCR_DEBUG, SCR_FOLDER, SCR_BOOKS, SCR_CHAPTERS, SCR_SETLIST, SCR_QSCONFIG, SCR_ALBUMWALL, SCR_UPNEXT, SCR_DATETIME, SCR_COLLECTIONS, SCR_COUNT };
 void screens_init(void);
 void screen_show(int which);
 void screen_back(void);
@@ -98,6 +98,7 @@ void npmenu_close_transients(void);   /* dismiss lv_layer_top popups on navigati
 void ui_set_favorite(int on);   /* love/unlove the current song (0104) */
 /* add-to-playlist picker (npmenus.c) */
 void plpick_create(lv_obj_t *root);
+void collections_create(lv_obj_t *root);   /* SCR_COLLECTIONS: the sheet that picks the collection Albums shows (collections.c) */
 /* playlist detail (playlistview.c) */
 void plview_create(lv_obj_t *root);
 void plview_open(long pid, const char *name);
@@ -111,7 +112,7 @@ void debug_open(void);                     /* Settings -> System -> Debug Mode (
 void debug_create(lv_obj_t *root);
 void lastfm_create(lv_obj_t *parent);
 void wifi_init_intent(void);   /* seed wifi_on intent from stock WIFI_STATUS (first run only) */
-void wifi_supervise(void);     /* keepalive: (re)start supplicant if Wi-Fi should be on but isn't */
+void wifi_supervise(void);     /* Wi-Fi follows its setting: checked after start and on the Wi-Fi pages only */
 void wifi_info_create(lv_obj_t *root);
 void wifi_info_open(void);
 /* bluetooth settings (bt.c) */

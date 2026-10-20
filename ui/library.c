@@ -9,6 +9,7 @@
 #include "listeningdb.h"   /* Most Played / Recent */
 #include "shelvesdb.h"     /* Favourites, Playlists */
 #include "playlists.h"
+#include "collections.h"   /* Albums shows a collection */
 #include "itemmenu.h"
 #include "rowdrag.h"      /* Playlists: Reorder */
 #include "player_mq.h"     /* play a list as our queue */
@@ -40,6 +41,7 @@ static lv_obj_t *g_title;
 static lv_obj_t *g_back;   /* the header's back arrow: hidden on the top page, where it leads nowhere */
 static lv_obj_t *g_status;   /* the clock and battery line: shown on the Library root only */
 static lv_obj_t *g_az_btn;    /* "A-Z" button -> opens the letter grid */
+static lv_obj_t *g_cap, *g_cap_count;   /* Albums: the cap at the bottom that opens the Collections sheet, its count */
 static lv_obj_t *g_grid;      /* full alphabet grid overlay */
 static lv_obj_t *g_az_page[2];  /* the grid's letter pages: 0 English, 1 Hebrew */
 static int       g_az_lang = 0; /* the page the grid shows: 0 English, 1 Hebrew */
@@ -92,6 +94,7 @@ static int g_vrows;
  * Hebrew, then '#'. The rows on screen carry their index into these lists. They play as our queue (player_play), in
  * that same order. */
 static ldb_list g_lsongs, g_lalbums, g_lalbum;
+static coll_key g_lalbums_key;          /* what g_lalbums was read for: every album or a collection */
 static ldb_list g_lartists, g_lgenres;  /* the Artists and Genres views */
 static ldb_list g_lhist;                /* Most Played / Recent */
 static ldb_list g_lfavs;                /* Favourites (shelves.db); count 1 = not in the library, 2 = its file is gone */
@@ -375,10 +378,10 @@ static void im_song(im_item *it, const ldb_item *s, im_where where){
         snprintf(it->album, sizeof it->album, "%s", s->album);
     }
 }
-static void hold_album(const char *album_artist, const char *album){
+static void hold_album(const char *album_artist, const char *album, int on_art){
     im_item it;
     memset(&it, 0, sizeof it);
-    it.kind = IM_ALBUM; it.where = IM_IN_LIBRARY;
+    it.kind = IM_ALBUM; it.where = IM_IN_LIBRARY; it.on_art = on_art;
     snprintf(it.title, sizeof it.title, "%s", album ? album : "");
     snprintf(it.album_artist, sizeof it.album_artist, "%s", album_artist ? album_artist : "");
     snprintf(it.album, sizeof it.album, "%s", album ? album : "");
@@ -404,7 +407,7 @@ static void lalbum_hold_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_LONG_PRESSED) return;
     int i = (int)(uintptr_t)lv_event_get_user_data(e);
     if(g_view!=VIEW_ALBUMS || i < 0 || i >= g_lalbums.n) return;
-    hold_album(g_lalbums.v[i].artist, g_lalbums.v[i].title);
+    hold_album(g_lalbums.v[i].artist, g_lalbums.v[i].title, 0);
 }
 static void group_hold_cb(lv_event_t *e){   /* an Artists or Genres row */
     if(lv_event_get_code(e)!=LV_EVENT_LONG_PRESSED) return;
@@ -552,7 +555,7 @@ static void scope_album_hold_cb(lv_event_t *e){   /* hold an album row of an art
     if(lv_event_get_code(e)!=LV_EVENT_LONG_PRESSED) return;
     int ai=(int)(uintptr_t)lv_event_get_user_data(e);
     if(g_view!=VIEW_GROUP || g_scope_lvl!=1 || ai<0 || ai>=g_lscope.n) return;
-    hold_album(g_lscope.v[ai].artist, g_lscope.v[ai].title);
+    hold_album(g_lscope.v[ai].artist, g_lscope.v[ai].title, 0);
 }
 
 /* ---- A-Z grid ----------------------------------------------------------- */
@@ -864,8 +867,8 @@ static void hdr_btn(lv_obj_t *row, int x, const char *txt, lv_event_cb_t cb){
 static int g_hdr_cover_ctr;
 static void cover_hold_cb(lv_event_t *e){   /* hold the album page's cover: the album's menu, as a hold on its row */
     if(lv_event_get_code(e)!=LV_EVENT_LONG_PRESSED || g_view!=VIEW_GROUP) return;
-    if(g_drill_kind==1) hold_album(g_alb_artist, g_alb_title);
-    else hold_album(g_scope_album_artist, g_scope_album);
+    if(g_drill_kind==1) hold_album(g_alb_artist, g_alb_title, 1);
+    else hold_album(g_scope_album_artist, g_scope_album, 1);
 }
 static void add_album_cover_header(const char *album, const char *artist, const char *const *paths, int n){
     lv_obj_t *r = lv_obj_create(g_list);
@@ -982,7 +985,9 @@ static void library_reload(void){
 
     const char *ttl = (g_view==VIEW_GROUP) ? ((g_drill_kind!=1 && g_scope_lvl==2) ? g_scope_album : g_drill_kind==1 ? g_alb_title : g_drill) : VIEW_TITLE[g_view];
     if(g_view==VIEW_GROUP && g_drill_kind==2 && g_scope_lvl!=2 && !g_drill[0]) ttl = "Unknown artist";
-    theme_title_text(g_title, (g_view==VIEW_GROUP) ? ttl : tr(ttl));
+    const char *coll = g_view==VIEW_ALBUMS ? collections_name() : "";   /* Albums is titled with the collection it shows */
+    theme_title_text(g_title, coll[0] ? coll : (g_view==VIEW_GROUP) ? ttl : tr(ttl));
+    if(g_cap){ if(g_view==VIEW_ALBUMS) lv_obj_remove_flag(g_cap, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(g_cap, LV_OBJ_FLAG_HIDDEN); }
     if(g_status){ if(g_view==VIEW_MENU) lv_obj_remove_flag(g_status, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN); }
     if(g_back){ if(g_view==VIEW_MENU) lv_obj_add_flag(g_back, LV_OBJ_FLAG_HIDDEN); else lv_obj_remove_flag(g_back, LV_OBJ_FLAG_HIDDEN); }
     ui_np_backdrop_on(SCR_LIBRARY, g_view == VIEW_MENU);   /* only the top page shows it */
@@ -1090,12 +1095,15 @@ static void library_reload(void){
         for(int i=0;i<n;i++) g_first[i]=az_code(l->v[i].letter);
         g_count=n; fill_start(n);
         if(g_view==VIEW_SONGS) az_show(1);
-    } else if(g_view==VIEW_ALBUMS){                                    /* library.db */
-        int n;
-        if(ldb_list_current(&g_lalbums)) n = g_lalbums.n;
-        else { ldb_list_free(&g_lalbums); n = ldb_read_albums(&g_lalbums); }
+    } else if(g_view==VIEW_ALBUMS){                                    /* library.db: every album, or a collection's */
+        int n = collections_albums(&g_lalbums, &g_lalbums_key);
+        char cc[32] = "";
+        if(n == 1) snprintf(cc, sizeof cc, "%s", tr("1 album"));
+        else if(n > 1) snprintf(cc, sizeof cc, tr("%d albums"), n);
+        lv_label_set_text(g_cap_count, cc);
         lib_ensure_first_cap(n);
         if(n > g_first_cap) n = g_first_cap;
+        if(n<=0 && g_lalbums_key.id){ empty_label(tr(n==0 ? collections_empty() : "Couldn't read this collection")); return; }
         if(n<=0){ empty_scan(tr("No albums found")); return; }
         for(int i=0;i<n;i++) g_first[i]=az_code(g_lalbums.v[i].letter);
         g_count=n; fill_start(n); az_show(1);
@@ -1204,10 +1212,11 @@ void library_enter(void){
      * are rebuilt at that scroll; rows a cover flow set while Library was hidden start at the top. */
     int32_t y = g_list && !g_enter_top ? lv_obj_get_scroll_y(g_list) : 0;
     g_enter_top = 0;
+    int coll = g_view == VIEW_ALBUMS ? collections_changed(&g_lalbums_key) : 0;   /* the Collections sheet picked or edited one */
     if(g_view == VIEW_GROUP || g_view == VIEW_PLAYLISTS || g_view == VIEW_FAVS ||
-       g_view == VIEW_MOSTPLAYED || g_view == VIEW_RECENT){
+       g_view == VIEW_MOSTPLAYED || g_view == VIEW_RECENT || coll){
         library_refresh();
-        if(g_list && y > 0) lv_obj_scroll_to_y(g_list, y, LV_ANIM_OFF);
+        if(g_list && y > 0 && coll != 2) lv_obj_scroll_to_y(g_list, y, LV_ANIM_OFF);   /* another collection: from its top */
     } else if(g_lhint){ lv_obj_add_flag(g_lhint, LV_OBJ_FLAG_HIDDEN); g_lhint_ch = 0; if(g_lhint_timer) lv_timer_pause(g_lhint_timer); }
 }
 /* The Artists grouping changed (Settings): an open artist drill's key may not exist in the new grouping, so step back
@@ -1307,7 +1316,8 @@ int library_link_back(void){
  * elsewhere (favourites from the Now Playing heart, playlists, play stats) are rebuilt, at the same scroll. */
 void library_return(void){
     if(!g_list) return;
-    if(g_view == VIEW_PLAYLISTS || g_view == VIEW_FAVS || g_view == VIEW_MOSTPLAYED || g_view == VIEW_RECENT){
+    if(g_view == VIEW_PLAYLISTS || g_view == VIEW_FAVS || g_view == VIEW_MOSTPLAYED || g_view == VIEW_RECENT ||
+       (g_view == VIEW_ALBUMS && collections_changed(&g_lalbums_key))){
         int32_t y = lv_obj_get_scroll_y(g_list);
         library_refresh();
         lv_obj_scroll_to_y(g_list, y, LV_ANIM_OFF);
@@ -1414,6 +1424,9 @@ void library_create(lv_obj_t *root){
     lv_obj_set_scrollbar_mode(g_list, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_flag(g_list, LV_OBJ_FLAG_SCROLL_MOMENTUM);
     lv_obj_add_event_cb(g_list, list_scroll_cb, LV_EVENT_SCROLL, NULL);
+
+    g_cap = collections_cap(root, &g_cap_count);   /* over the list, under the A-Z grid; Albums only */
+    lv_obj_add_flag(g_cap, LV_OBJ_FLAG_HIDDEN);
 
     /* "A-Z" button (bottom-right) opens the alphabet grid */
     g_az_btn = lv_button_create(root);

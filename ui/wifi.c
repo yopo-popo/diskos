@@ -166,10 +166,23 @@ static int wifi_status(char *ssid, int scap, char *ip, int icap){
     return connected && wifi_lease_ready(buf);
 }
 
+/* Is wpa_supplicant running? Read from /proc here: starting pidof from the UI thread copied the whole UI process and
+ * froze the screen for a moment each time (yopo 2026-10-20). */
 static int wifi_radio_on(void){
-    char buf[256];
-    run_cap("pidof wpa_supplicant 2>/dev/null", buf, sizeof buf);
-    return buf[0] ? 1 : 0;
+    DIR *d = opendir("/proc");
+    if(!d) return 0;
+    struct dirent *e; int on = 0;
+    while(!on && (e = readdir(d))){
+        if(e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        char path[64], comm[32];
+        snprintf(path, sizeof path, "/proc/%s/comm", e->d_name);
+        FILE *f = fopen(path, "r");
+        if(!f) continue;
+        if(fgets(comm, sizeof comm, f)) on = !strcmp(comm, "wpa_supplicant\n");
+        fclose(f);
+    }
+    closedir(d);
+    return on;
 }
 
 /* ---- persistence / auto-reconnect hardening ----------------------------- */
@@ -627,28 +640,38 @@ static int wifi_lease_consume(void){
     fclose(f); return consumed;
 }
 
+/* No Wi-Fi checks in the background (yopo 2026-10-20): each one started wpa_cli from the UI thread, which froze the
+ * screen for a moment every few seconds. Wi-Fi is checked while a Wi-Fi page shows, and after start until it matches
+ * the setting: on, as soon as it runs; off, for WIFI_BOOT_MS, since stock may still bring it up late. A lease step
+ * already under way still finishes, so DHCP is never left released. A dead supplicant is restarted the next time a
+ * Wi-Fi page opens. */
+#define WIFI_BOOT_MS 120000
 void wifi_supervise(void){
     wifi_reconcile_poll();
     if(g_reco_hold) return;                         /* stock's radio decision is still being read: stay passive */
+    int page = screen_current() == SCR_WIFI || screen_current() == SCR_WIFI_INFO;
     static uint32_t lease_check;
-    int event = wifi_lease_consume();
+    int event = page ? wifi_lease_consume() : 0;
     if(!event && lv_tick_elaps(lease_check) >= 100 &&
        (g_lease.phase == LEASE_RELEASE || g_lease.phase == LEASE_ACQUIRE ||
-        g_lease.phase == LEASE_FAILED)){
+        (page && g_lease.phase == LEASE_FAILED))){
         lease_check = lv_tick_get(); wifi_lease_step();
     }
-    static uint32_t last_check = 0;
-    static int      first = 1;
+    static uint32_t last_check = 0, start;
+    static int      first = 1, boot_done;
+    if(first) start = lv_tick_get();
     if(!first && lv_tick_elaps(last_check) < 5000) return;   /* check ~every 5s */
+    if(!first && !page && (boot_done || lv_tick_elaps(start) >= WIFI_BOOT_MS)) return;
     first = 0; last_check = lv_tick_get();
 
-    wifi_lease_step();
+    if(page) wifi_lease_step();
     int up   = wifi_radio_on();
     int want = cfg_get_int("wifi_on", 1);
 
     /* re-enable all nets + clear freq locks + persist once the supplicant is up, unless a
      * user connect is mid-flight (conn_poll_cb sanitizes on its outcome). */
     if(up && g_sanitize_pending && !g_conn_timer && wifi_sanitize_savenets()) g_sanitize_pending = 0;
+    if(up && want && !g_sanitize_pending) boot_done = 1;   /* on and running: nothing left to watch for */
 
     if(!up && want){                        /* should be on but isn't -> (re)start */
         if(!g_wifi_last_start || lv_tick_elaps(g_wifi_last_start) > 30000){  /* 30s backoff */
