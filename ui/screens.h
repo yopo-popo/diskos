@@ -49,9 +49,11 @@ void songinfo_set(const track_state_t *st);
 void npmenu_create(lv_obj_t *root);
 void nphub_create(lv_obj_t *root);   /* Options: Now Playing's left-hand page (a rightward swipe) */
 void nphub_refresh(void);            /* rebuild the hub for the current track (book-aware) */
-void upnext_create(lv_obj_t *root);   /* SCR_UPNEXT: the player queue from the current song on (upnext.c) */
+void upnext_create(lv_obj_t *root);   /* SCR_UPNEXT: the queue from the current song on, edited there (upnext.c) */
 void upnext_open(void);                /* show SCR_UPNEXT */
 void upnext_refresh(void);             /* read the queue fresh (on each SCR_UPNEXT show) */
+lv_obj_t *upnext_scroller(void);        /* its list, for the rim fast-scroll */
+int  upnext_owns_gesture(uint32_t since);/* 1 = a row swipe began with the press made at `since` (lv_tick) */
 void datetime_create(lv_obj_t *root);  /* SCR_DATETIME: set the date + time by hand (datetime.c) */
 void datetime_refresh(void);           /* rebuilt from the current time on each show */
 void ui_rtc_save_now(void);            /* save the system clock to the RTC now (hwclock -w, off the UI thread) */

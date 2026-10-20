@@ -30,8 +30,9 @@ static char g_ltext[16384];        /* their text */
 static char g_lplain[16384];       /* untimed rendering of a .lrc */
 static int g_nll = 0;              /* timed lines shown; 0 = block-text mode */
 static int g_lcur = -2;            /* highlighted line (-1 = before the first, -2 = not drawn yet) */
-static int g_holding = 0;          /* the user scrolled: no auto-scroll until g_hold_until */
-static uint32_t g_hold_until = 0;
+static int g_holding = 0;          /* the user scrolled away: no auto-scroll until a double tap (or the next song) */
+static uint32_t g_tap_at = 0;       /* the last tap, for the double tap */
+#define LYR_DTAP_MS 400             /* two taps this close are a double tap */
 static int32_t g_scroll_target = -1; /* the scroll position last asked for (-1 = none) */
 static unsigned g_last_pos_seq = 0;
 static long g_pos_base = 0;        /* last reported position (a1 frames arrive about once a second) */
@@ -372,8 +373,7 @@ static void lyrics_follow(void)
         if(idx >= 0) lv_obj_set_style_text_color(lv_obj_get_child(g_lines_box, idx), TC(TEXT_LYRICS), 0);
     }
     if(g_lcur < 0) return;
-    if(g_holding && (int32_t)(lv_tick_get() - g_hold_until) < 0) return;   /* the user is reading elsewhere */
-    if(g_holding){ g_holding = 0; g_scroll_target = -1; }                   /* hold over: come back to the line */
+    if(g_holding) return;   /* the user is reading elsewhere until a double tap */
     /* checked every poll, not only when the line changes: the first layout after a rebuild can still be settling */
     lv_obj_update_layout(g_scroll);
     lv_obj_t *l = lv_obj_get_child(g_lines_box, g_lcur);
@@ -384,11 +384,19 @@ static void lyrics_follow(void)
     if(y != g_scroll_target){ g_scroll_target = y; lv_obj_scroll_to_y(g_scroll, y, LV_ANIM_ON); }
 }
 
+/* Synced lyrics (yopo 2026-10-20): a finger scroll leaves the playing line where it is, and the view stays put; a
+ * double tap follows the song again. */
 static void scroll_cb(lv_event_t *e)
 {
     lv_event_code_t c = lv_event_get_code(e);
-    if(c == LV_EVENT_PRESSED || (c == LV_EVENT_SCROLL_BEGIN && lv_indev_active()))
-        { g_holding = 1; g_hold_until = lv_tick_get() + 4000; }
+    if(c == LV_EVENT_SCROLL_BEGIN && lv_indev_active()) g_holding = 1;
+    else if(c == LV_EVENT_CLICKED){
+        uint32_t now = lv_tick_get();
+        if(g_tap_at && now - g_tap_at <= LYR_DTAP_MS){
+            g_tap_at = 0;
+            if(g_holding){ g_holding = 0; g_scroll_target = -1; lyrics_follow(); }
+        } else g_tap_at = now;
+    }
 }
 
 /* Two independent state pieces: g_path/g_req and the local outcome own the
@@ -540,9 +548,9 @@ void lyrics_create(lv_obj_t *root)
     lv_obj_set_style_pad_row(g_lines_box, 10, 0);
     lv_obj_set_style_pad_top(g_lines_box, 100, 0);       /* the first and last lines can reach the middle */
     lv_obj_set_style_pad_bottom(g_lines_box, 110, 0);
-    lv_obj_remove_flag(g_lines_box, LV_OBJ_FLAG_CLICKABLE);   /* presses go to the scroller (manual-scroll hold) */
+    lv_obj_remove_flag(g_lines_box, LV_OBJ_FLAG_CLICKABLE);   /* presses go to the scroller (a scroll holds the view, a double tap follows again) */
     lv_obj_add_flag(g_lines_box, LV_OBJ_FLAG_HIDDEN);
     g_nll = 0; g_lcur = -2;
-    lv_obj_add_event_cb(g_scroll, scroll_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(g_scroll, scroll_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(g_scroll, scroll_cb, LV_EVENT_SCROLL_BEGIN, NULL);
 }

@@ -180,8 +180,8 @@ void books_create(lv_obj_t *root){
 
     g_list = lv_obj_create(root);
     lv_obj_remove_style_all(g_list);
-    lv_obj_set_pos(g_list, 30, 72); lv_obj_set_size(g_list, 300, 272);
-    lv_obj_set_style_pad_bottom(g_list, 44, 0);   /* last row clears the round bottom bezel */
+    lv_obj_set_pos(g_list, 30, 72); lv_obj_set_size(g_list, 300, 288);   /* to the screen's bottom edge */
+    lv_obj_set_style_pad_bottom(g_list, 60, 0);   /* last row clears the round bottom bezel */
     lv_obj_set_style_bg_opa(g_list, LV_OPA_TRANSP, 0);
     lv_obj_set_flex_flow(g_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(g_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -297,8 +297,8 @@ void chapters_create(lv_obj_t *root){
 
     g_chap_list = lv_obj_create(root);
     lv_obj_remove_style_all(g_chap_list);
-    lv_obj_set_pos(g_chap_list, 30, 72); lv_obj_set_size(g_chap_list, 300, 272);
-    lv_obj_set_style_pad_bottom(g_chap_list, 44, 0);
+    lv_obj_set_pos(g_chap_list, 30, 72); lv_obj_set_size(g_chap_list, 300, 288);
+    lv_obj_set_style_pad_bottom(g_chap_list, 60, 0);
     lv_obj_set_style_bg_opa(g_chap_list, LV_OPA_TRANSP, 0);
     lv_obj_set_flex_flow(g_chap_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(g_chap_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);

@@ -49,7 +49,7 @@ typedef struct {
 } queue_unit;
 
 /* Rows for the queue screen: the playing item and everything after it. A unit shows a header row and,
- * unless collapsed, a row per item. */
+ * unless collapsed, a row per item; the playing unit, collapsed, shows only its playing item. */
 enum { QROW_ITEM, QROW_UNIT };
 typedef struct {
     int kind;
@@ -109,6 +109,9 @@ int  queue_add_last(const queue_track *t, int n, const queue_album *unit);
  * is never dropped inside another unit. */
 int  queue_move_item(int index, int before, int64_t into_unit);
 int  queue_move_unit(int64_t unit_id, int before);
+/* 1 = that drop is allowed (dropping onto itself counts): for showing where a drag can land. */
+int  queue_can_move_item(int index, int before, int64_t into_unit);
+int  queue_can_move_unit(int64_t unit_id, int before);
 int  queue_remove_item(int index);
 int  queue_remove_unit(int64_t unit_id);
 int  queue_undo(void);                             /* brings back the last removal, if nothing else changed */

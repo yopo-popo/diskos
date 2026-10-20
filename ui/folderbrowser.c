@@ -397,7 +397,7 @@ static void fb_rebuild(void){
     g_fb_i = 0;
     int first = g_nent < 20 ? g_nent : 20;
     if(g_fb_restore_y > 0){                       /* back up a level: the rows down to where the list was, at once */
-        int need = (g_fb_restore_y + 272) / FB_ROW_PITCH + 2;
+        int need = (g_fb_restore_y + 288) / FB_ROW_PITCH + 2;
         if(need > first) first = need < g_nent ? need : g_nent;
     }
     for(; g_fb_i < first; g_fb_i++) fb_add_row(g_fb_i);
@@ -508,8 +508,8 @@ void folderbrowser_create(lv_obj_t *root){
     g_list = lv_obj_create(root);
     lv_obj_remove_style_all(g_list);
     lv_obj_set_pos(g_list, 41, 72);   /* its 268 px rows (5 px in) land centred on the screen */
-    lv_obj_set_size(g_list, 290, 272);
-    lv_obj_set_style_pad_bottom(g_list, 44, 0);   /* last row scrolls clear of the round bottom bezel */
+    lv_obj_set_size(g_list, 290, 288);            /* to the screen's bottom edge */
+    lv_obj_set_style_pad_bottom(g_list, 60, 0);   /* last row scrolls clear of the round bottom bezel */
     lv_obj_set_style_bg_opa(g_list, LV_OPA_TRANSP, 0);
     lv_obj_set_flex_flow(g_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(g_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);

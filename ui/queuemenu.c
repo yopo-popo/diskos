@@ -3,7 +3,10 @@
 /* queuemenu - the queue's entries in the hold menu: Play now (a new queue), Play next and Add to queue, on a song, an
  * album, an artist, a genre or a playlist. An album goes in as one unit; an artist's, a genre's or a playlist's songs go
  * in as loose songs, in the order the Library lists them. Play next and Add to queue are offered only while the player
- * plays our queue: on another list (a book, a search result) they would change nothing that plays. */
+ * plays our queue: on another list (a book, a search result) they would change nothing that plays.
+ * On a row of the queue itself (Up Next; row_id = the song's queue id, or the album's unit id): Play from here, Go to
+ * album (for a song the Library's own entry does it), Ungroup (the album's songs become loose songs) and Remove from
+ * queue. The playing song and the album holding it are neither played from nor removed. */
 #include "queuemenu.h"
 #include "itemmenu.h"
 #include "player_mq.h"
@@ -90,12 +93,42 @@ static void now_run(const im_item *it){ run(it, QM_NOW); }
 static void next_run(const im_item *it){ run(it, QM_NEXT); }
 static void last_run(const im_item *it){ run(it, QM_LAST); }
 
+/* ---- a row of the queue ---- */
+static int q_first(const im_item *it){   /* the row's first song in the queue, -1 = gone */
+    if(it->where != IM_IN_QUEUE || !it->row_id) return -1;
+    if(it->kind == IM_SONG) return queue_find(it->row_id);
+    int f;
+    return it->kind == IM_ALBUM && queue_unit_range(it->row_id, &f) > 0 ? f : -1;
+}
+static int q_later(const im_item *it){ int f = q_first(it); return f >= 0 && f > queue_current(); }
+static int q_album(const im_item *it){ return it->kind == IM_ALBUM && q_first(it) >= 0; }
+static void here_run(const im_item *it){
+    int f = q_first(it);
+    if(f <= queue_current()) return;
+    if(queue_jump(f) == 0) screen_show(SCR_NOWPLAYING);
+    else ui_toast("Couldn't play that");
+}
+static void album_run(const im_item *it){ library_open_album(it->album_artist, it->album); }
+static void ungroup_run(const im_item *it){ if(queue_pop_unit(it->row_id) < 0) ui_toast("Couldn't do that"); }
+static void remove_run(const im_item *it){
+    int rc = it->kind == IM_ALBUM ? queue_remove_unit(it->row_id) : queue_remove_item(queue_find(it->row_id));
+    if(rc < 0) ui_toast("Couldn't remove that");
+}
+
 static const im_entry E_NOW  = { "Play now", now_shown, now_run, 100 };
+static const im_entry E_HERE = { "Play from here", q_later, here_run, 100 };
 static const im_entry E_NEXT = { "Play next", add_shown, next_run, 110 };
 static const im_entry E_LAST = { "Add to queue", add_shown, last_run, 120 };
+static const im_entry E_ALBUM = { "Go to album", q_album, album_run, 200 };
+static const im_entry E_UNGROUP = { "Ungroup", q_album, ungroup_run, 400 };
+static const im_entry E_REMOVE = { "Remove from queue", q_later, remove_run, 900 };
 
 void queuemenu_init(void){
     itemmenu_add(&E_NOW);
+    itemmenu_add(&E_HERE);
     itemmenu_add(&E_NEXT);
     itemmenu_add(&E_LAST);
+    itemmenu_add(&E_ALBUM);
+    itemmenu_add(&E_UNGROUP);
+    itemmenu_add(&E_REMOVE);
 }

@@ -389,9 +389,20 @@ static void folder_delete_run(const im_item *it){
     library_refresh();
 }
 
+/* Reorder: the list the row is in gets its handles: a playlist's songs (a song's menu, or the playlist's own menu on its
+ * screen), else the Playlists list */
+static int reorder_shown(const im_item *it){
+    return (it->kind == IM_SONG && it->where == IM_IN_PLAYLIST && it->row_id > 0)
+        || ((it->kind == IM_PLAYLIST || it->kind == IM_FOLDER) && it->where == IM_IN_PLAYLISTS);
+}
+static void reorder_run(const im_item *it){
+    if(it->kind == IM_SONG || screen_current() == SCR_PLVIEW) plview_reorder(1);
+    else library_pl_reorder(1);
+}
 static const im_entry E_ADD = { "Add to playlist", add_shown, add_run, 300 };
 static const im_entry E_MOVE = { "Move to folder", either_shown, move_run, 310 };
 static const im_entry E_RENAME = { "Rename", either_shown, rename_run, 400 };
+static const im_entry E_REORDER = { "Reorder", reorder_shown, reorder_run, 405 };
 static const im_entry E_EXPORT = { "Save to the card", list_shown, export_run, 410 };
 static const im_entry E_REMOVE = { "Remove from playlist", remove_shown, remove_run, 900 };
 static const im_entry E_DELETE = { "Delete playlist", list_shown, delete_run, 910 };
@@ -403,8 +414,8 @@ void plpick_create(lv_obj_t *root){
     g_title = ui_header(root, "Add to Playlist");
     g_list = lv_obj_create(root);
     lv_obj_remove_style_all(g_list);
-    lv_obj_set_pos(g_list, 46, 76); lv_obj_set_size(g_list, 280, 250);
-    lv_obj_set_style_pad_bottom(g_list, 44, 0);   /* the last row scrolls clear of the round bottom bezel */
+    lv_obj_set_pos(g_list, 46, 76); lv_obj_set_size(g_list, 280, 284);   /* down to the screen's bottom edge */
+    lv_obj_set_style_pad_bottom(g_list, 78, 0);   /* the last row scrolls clear of the round bottom bezel */
     lv_obj_set_style_bg_opa(g_list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_row(g_list, 10, 0);
     lv_obj_set_flex_flow(g_list, LV_FLEX_FLOW_COLUMN);
@@ -413,6 +424,7 @@ void plpick_create(lv_obj_t *root){
     itemmenu_add(&E_ADD);
     itemmenu_add(&E_MOVE);
     itemmenu_add(&E_RENAME);
+    itemmenu_add(&E_REORDER);
     itemmenu_add(&E_EXPORT);
     itemmenu_add(&E_REMOVE);
     itemmenu_add(&E_DELETE);

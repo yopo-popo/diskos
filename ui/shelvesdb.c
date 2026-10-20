@@ -326,6 +326,13 @@ static long long intf(sqlite3 *d, long long dflt, const char *sql, const char *f
     sqlite3_finalize(st);
     return v;
 }
+/* A prepared statement for the caller to run (and finalize); NULL = can't. */
+static sqlite3_stmt *stmtf(sqlite3 *d, const char *sql, const char *fmt, ...){
+    va_list ap; va_start(ap, fmt);
+    sqlite3_stmt *st = prep(d, sql, fmt, ap);
+    va_end(ap);
+    return st;
+}
 #define NOW "CAST(strftime('%s', 'now') AS INTEGER)"
 /* the song's row; a known snapshot value replaces the old one. ?1 path, ?2 start, ?3.. title, album artist, album */
 #define UPSERT_REF \
@@ -548,4 +555,64 @@ long long shdb_parent(int is_folder, long long id){
                                                   : "SELECT IFNULL(folder_id, 0) FROM playlists WHERE id = ?1;", "i", id);
     pthread_mutex_unlock(&g_mu);
     return p;
+}
+
+/* ---- reordering ---- */
+/* One list put in a new order: sel gives its rows as (kind, id, position) in their order, the row (kind, id) goes to
+ * place `to`, the others keeping their order. Positions become 0, 1, 2...; only rows whose position changes are written,
+ * by upd[kind] (?1 position, ?2 id). 1 = done; 0 when the row isn't in the list. */
+typedef struct { int kind; long long id, pos; } place_row;
+static int place_in(sqlite3_stmt *sel, sqlite3_stmt *const upd[2], int kind, long long id, int to){
+    place_row *v = NULL, moved = { -1, 0, 0 };
+    int n = 0, cap = 0, rc = SQLITE_ERROR, ok = sel != NULL;
+    while(ok && (rc = sqlite3_step(sel)) == SQLITE_ROW){
+        place_row r = { sqlite3_column_int(sel, 0), sqlite3_column_int64(sel, 1), sqlite3_column_int64(sel, 2) };
+        if(r.kind == kind && r.id == id){ moved = r; continue; }
+        if(n == cap){
+            int nc = cap ? cap * 2 : 64;
+            place_row *p = realloc(v, (size_t)nc * sizeof *v);
+            if(!p){ ok = 0; break; }
+            v = p; cap = nc;
+        }
+        v[n++] = r;
+    }
+    ok = ok && rc == SQLITE_DONE && moved.kind >= 0;
+    if(to < 0) to = 0;
+    if(to > n) to = n;
+    for(int i = 0; ok && i <= n; i++){
+        const place_row *r = i < to ? &v[i] : i == to ? &moved : &v[i - 1];
+        if(r->pos == i) continue;
+        sqlite3_stmt *u = upd[r->kind != 0];
+        sqlite3_reset(u);
+        sqlite3_bind_int64(u, 1, i);
+        sqlite3_bind_int64(u, 2, r->id);
+        ok = sqlite3_step(u) == SQLITE_DONE;
+    }
+    free(v);
+    return ok;
+}
+int shdb_place(int is_folder, long long id, int to){
+    sqlite3 *d = begin_change();
+    long long here = intf(d, -1, is_folder ? "SELECT IFNULL(parent_id, 0) FROM playlist_folders WHERE id = ?1;"
+                                           : "SELECT IFNULL(folder_id, 0) FROM playlists WHERE id = ?1;", "i", id);
+    sqlite3_stmt *sel = here < 0 ? NULL   /* in shdb_pl_list's order */
+        : stmtf(d, "SELECT 1, id, position FROM playlist_folders WHERE parent_id IS ?1"
+                   " UNION ALL SELECT 0, id, position FROM playlists WHERE folder_id IS ?1 ORDER BY 3, 1 DESC, 2;", "n", here);
+    sqlite3_stmt *upd[2] = { stmtf(d, "UPDATE playlists SET position = ?1 WHERE id = ?2;", ""),
+                             stmtf(d, "UPDATE playlist_folders SET position = ?1 WHERE id = ?2;", "") };
+    int ok = upd[0] && upd[1] && place_in(sel, upd, is_folder != 0, id, to);
+    sqlite3_finalize(sel); sqlite3_finalize(upd[0]); sqlite3_finalize(upd[1]);
+    return end_change(d, ok);
+}
+int shdb_pl_item_place(long long item_id, int to){
+    sqlite3 *d = begin_change();
+    long long pid = intf(d, 0, "SELECT playlist_id FROM playlist_items WHERE id = ?1;", "i", item_id);
+    sqlite3_stmt *sel = pid <= 0 ? NULL   /* in ldb_read_playlist's order */
+        : stmtf(d, "SELECT 0, id, position FROM playlist_items WHERE playlist_id = ?1 ORDER BY position, id;", "i", pid);
+    sqlite3_stmt *upd[2] = { stmtf(d, "UPDATE playlist_items SET position = ?1 WHERE id = ?2;", ""), NULL };
+    upd[1] = upd[0];
+    int ok = upd[0] && place_in(sel, upd, 0, item_id, to)
+          && execf(d, "UPDATE playlists SET updated_at = " NOW " WHERE id = ?1;", "i", pid);
+    sqlite3_finalize(sel); sqlite3_finalize(upd[0]);
+    return end_change(d, ok);
 }

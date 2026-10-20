@@ -540,7 +540,11 @@ static int rows_build(void){
         while(i + c < g_n && g_it[i + c]->unit_id == it->unit_id) c++;
         g_rows[g_nrows++] = (queue_row){ QROW_UNIT, i, c, it->unit_id };
         int u = unit_idx(it->unit_id);
-        if(u >= 0 && g_un[u]->collapsed) { i += c; continue; }
+        if(u >= 0 && g_un[u]->collapsed) {   /* the playing album, collapsed, still shows its playing song */
+            if(i == g_cur) g_rows[g_nrows++] = (queue_row){ QROW_ITEM, i, 1, it->unit_id };
+            i += c;
+            continue;
+        }
         for(int k = 0; k < c; k++, i++){
             if(g_nrows + 1 > g_rcap){
                 int cap = g_rcap * 2;
@@ -716,18 +720,30 @@ static int move_item_impl(int index, int q, int64_t into, int64_t from_unit, int
     return 0;
 }
 
-int queue_move_item(int index, int before, int64_t into_unit){
+/* 0 = the move is allowed (or changes nothing), else QERR_*; *q = where the song lands without it in the list. */
+static int move_item_check(int index, int before, int64_t into_unit, int *q){
     if(index <= g_cur || index >= g_n || before < 0 || before > g_n) return QERR_ARG;
     int64_t own = g_it[index]->unit_id;
     if(into_unit && into_unit != own) return QERR_ARG;
-    int q = before > index ? before - 1 : before;
-    if(q <= g_cur) return QERR_PLACE;
-    int64_t gu = red_gap_unit(q, index, 1);
+    *q = before > index ? before - 1 : before;
+    if(*q <= g_cur) return QERR_PLACE;
+    int64_t gu = red_gap_unit(*q, index, 1);
     if(gu && gu != into_unit) return QERR_PLACE;
-    int size = range_of(own, NULL);
-    if(into_unit && size > 1 && !red_touches(q, index, 1, into_unit)) return QERR_PLACE;
+    if(into_unit && range_of(own, NULL) > 1 && !red_touches(*q, index, 1, into_unit)) return QERR_PLACE;
+    return 0;
+}
+
+int queue_can_move_item(int index, int before, int64_t into_unit){
+    int q;
+    return move_item_check(index, before, into_unit, &q) == 0;
+}
+
+int queue_move_item(int index, int before, int64_t into_unit){
+    int q, rc = move_item_check(index, before, into_unit, &q);
+    if(rc) return rc;
+    int64_t own = g_it[index]->unit_id;
     if(q == index && into_unit == own) return 0;
-    WITH_RETRY(move_item_impl(index, q, into_unit, own, size));
+    WITH_RETRY(move_item_impl(index, q, into_unit, own, range_of(own, NULL)));
 }
 
 static int move_unit_impl(int f, int c, int q){
@@ -745,12 +761,24 @@ static int move_unit_impl(int f, int c, int q){
     return rc;
 }
 
+/* 0 = allowed, 1 = dropped onto itself (nothing to do), else QERR_*. */
+static int move_unit_check(int64_t uid, int before, int *f, int *c, int *q){
+    *c = range_of(uid, f);
+    if(!*c || *f <= g_cur || before < 0 || before > g_n) return QERR_ARG;
+    if(before >= *f && before <= *f + *c) return 1;
+    *q = before > *f ? before - *c : before;
+    if(*q <= g_cur || red_gap_unit(*q, *f, *c)) return QERR_PLACE;
+    return 0;
+}
+
+int queue_can_move_unit(int64_t uid, int before){
+    int f, c, q;
+    return move_unit_check(uid, before, &f, &c, &q) >= 0;
+}
+
 int queue_move_unit(int64_t uid, int before){
-    int f, c = range_of(uid, &f);
-    if(!c || f <= g_cur || before < 0 || before > g_n) return QERR_ARG;
-    if(before >= f && before <= f + c) return 0;   /* dropped onto itself */
-    int q = before > f ? before - c : before;
-    if(q <= g_cur || red_gap_unit(q, f, c)) return QERR_PLACE;
+    int f, c, q, rc = move_unit_check(uid, before, &f, &c, &q);
+    if(rc) return rc > 0 ? 0 : rc;
     WITH_RETRY(move_unit_impl(f, c, q));
 }
 
@@ -855,11 +883,12 @@ int queue_set_collapsed(int64_t uid, int collapsed){
     WITH_RETRY(collapse_impl(uid, collapsed));
 }
 
-/* The unit holding the new current item opens, as agreed (units show collapsed except the playing one). */
+/* The unit holding the new current item opens when it starts playing, as agreed (units show collapsed except the
+ * playing one). A playing unit the user collapsed stays so while its next songs play. */
 static int current_impl(int index, int type){
     int64_t uid = g_it[index]->unit_id;
     int u = uid ? unit_idx(uid) : -1;
-    int expand = u >= 0 && g_un[u]->collapsed;
+    int expand = u >= 0 && g_un[u]->collapsed && !(g_cur >= 0 && g_cur < g_n && g_it[g_cur]->unit_id == uid);
     int pos = g_pos_ms, paused = g_paused;
     g_pos_ms = 0; g_paused = 0;
     int rc = tx_begin();

@@ -64,6 +64,11 @@ int shdb_folder_delete(long long id);                      /* what it holds move
 int shdb_move(int is_folder, long long id, long long folder_id);
 /* The folder a playlist or folder is in: its id, 0 = the top, -1 = no such item. */
 long long shdb_parent(int is_folder, long long id);
+/* Reordering by hand: put a playlist (is_folder 0) or folder at place `to` (0 = first) among what its folder holds, in
+ * shdb_pl_list's order; or a playlist's entry (ldb_item.row_id) at place `to` among its songs. The rest keep their
+ * order. 1 = done, 0 = failed or no such item. */
+int shdb_place(int is_folder, long long id, int to);
+int shdb_pl_item_place(long long item_id, int to);
 
 /* Open shelves.db now (taking in the SD card's copy when it is new). 1 = open. */
 int shdb_ready(void);

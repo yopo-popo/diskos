@@ -10,6 +10,7 @@
 #include "shelvesdb.h"     /* Favourites, Playlists */
 #include "playlists.h"
 #include "itemmenu.h"
+#include "rowdrag.h"      /* Playlists: Reorder */
 #include "player_mq.h"     /* play a list as our queue */
 #include "sdio.h"
 #include "artcache.h"
@@ -32,7 +33,7 @@ enum { VIEW_MENU, VIEW_SONGS, VIEW_ALBUMS, VIEW_ARTISTS, VIEW_PLAYLISTS, VIEW_FA
 
 #define ROW_H 52
 #define LIST_Y 70
-#define LIST_H 252
+#define LIST_H 290   /* to the screen's bottom edge: rows scroll out under the round bezel */
 
 static lv_obj_t *g_list;
 static lv_obj_t *g_title;
@@ -72,6 +73,9 @@ static shdb_entry *g_plents;
 static int g_npl;
 static long long g_pl_folder;
 static char g_pl_folder_name[LDB_NAME];
+static int g_pl_reorder;                /* Reorder: a handle on each row, and Done in place of New Playlist / New Folder */
+static lv_obj_t **g_pl_rows;            /* Reorder: the rows, by index into g_plents */
+static int g_pl_dropped;
 
 /* A view's rows: only those near the viewport exist as objects. LVGL moves, lays out and styles every child of a list on
  * each scroll step, so building all 10,000 rows of Songs made scrolling crawl (and a streamed fill kept adding to it).
@@ -257,6 +261,7 @@ static void playlist_cb(lv_event_t *e){
     int i=(int)(intptr_t)lv_event_get_user_data(e);
     if(g_view!=VIEW_PLAYLISTS || i < 0 || i >= g_npl) return;
     const shdb_entry *p = &g_plents[i];
+    if(g_pl_reorder) return;                              /* Reorder: rows only move */
     if(c == LV_EVENT_LONG_PRESSED){
         im_item it;
         memset(&it, 0, sizeof it);
@@ -291,8 +296,40 @@ static void pl_folder_done(const char *name){
 static void pl_folder_cb(lv_event_t *e){
     if(lv_event_get_code(e)==LV_EVENT_CLICKED) kbinput_open("Folder name", "", pl_folder_done);
 }
-/* Back inside Playlists: up one folder. 1 = done. */
+/* Playlists' Reorder (yopo 2026-10-20): the hold menu's Reorder puts a handle (rowdrag) on each row of the folder shown;
+ * a drag moves the row there, Done or Back ends it. */
+static int pl_drag_count(void *ctx){ (void)ctx; return g_pl_rows ? g_npl : 0; }
+static lv_obj_t *pl_drag_row(void *ctx, int i){ (void)ctx; return g_pl_rows && i >= 0 && i < g_npl ? g_pl_rows[i] : NULL; }
+static void pl_drag_drop(void *ctx, int from, int to, int above, int below){
+    (void)ctx; (void)above; (void)below;
+    if(from < 0 || from >= g_npl) return;
+    if(shdb_place(g_plents[from].is_folder, g_plents[from].id, to) != 1) ui_toast("Couldn't move that");
+    g_pl_dropped = 1;
+}
+static void pl_reload_keep(void *unused){   /* rebuild the view where it was scrolled to */
+    (void)unused;
+    if(!g_list || g_view != VIEW_PLAYLISTS) return;
+    int32_t y = lv_obj_get_scroll_y(g_list);
+    library_reload();
+    lv_obj_update_layout(g_list);
+    lv_obj_scroll_to_y(g_list, y, LV_ANIM_OFF);
+}
+static void pl_drag_done(void *ctx){
+    (void)ctx;
+    if(g_pl_dropped){ g_pl_dropped = 0; lv_async_call(pl_reload_keep, NULL); }   /* the rows' indexes changed */
+}
+static rowdrag_list g_pl_drag = { .count = pl_drag_count, .row = pl_drag_row, .drop = pl_drag_drop, .done = pl_drag_done };
+void library_pl_reorder(int on){
+    if(g_view != VIEW_PLAYLISTS) return;
+    g_pl_reorder = on;
+    pl_reload_keep(NULL);
+}
+static void pl_done_cb(lv_event_t *e){
+    if(lv_event_get_code(e)==LV_EVENT_CLICKED) library_pl_reorder(0);
+}
+/* Back inside Playlists: Reorder ends, else up one folder. 1 = done. */
 static int pl_folder_back(void){
+    if(g_view==VIEW_PLAYLISTS && g_pl_reorder){ library_pl_reorder(0); return 1; }
     if(g_view!=VIEW_PLAYLISTS || g_pl_folder <= 0) return 0;
     long long p = shdb_parent(1, g_pl_folder);
     g_pl_folder = p > 0 ? p : 0;
@@ -430,7 +467,7 @@ static void menu_cb(lv_event_t *e){
     int v=(int)(uintptr_t)lv_event_get_user_data(e);
     if(v==CAT_FOLDERS){ folderbrowser_open(); return; }   /* opens a screen, not a library view */
     if(v==CAT_BOOKS){ books_open(); return; }             /* audiobooks: a screen, not a library view */
-    if(v==VIEW_PLAYLISTS) g_pl_folder = 0;                /* Playlists opens at its top */
+    if(v==VIEW_PLAYLISTS){ g_pl_folder = 0; g_pl_reorder = 0; }   /* Playlists opens at its top */
     if(v==VIEW_ALBUMS && cfg_get_int("album_view", 0)==1){ albumwall_open_all(); wall_opened(); screen_show(SCR_ALBUMWALL); return; }  /* cover flow */
     keep_y();
     g_view=v;
@@ -631,7 +668,13 @@ static void vlist_sync(void){
         g_vrow[g_vrows].obj = r; g_vrow[g_vrows].idx = i; g_vrows++;
     }
 }
-static void list_scroll_cb(lv_event_t *e){ (void)e; vlist_sync(); }
+/* The top page's title and clock line sit above its first row and scroll away with the list (yopo); other pages keep theirs fixed. */
+static void head_follow(void){
+    int32_t y = (g_view==VIEW_MENU && g_list) ? lv_obj_get_scroll_y(g_list) : 0;
+    if(g_title) lv_obj_set_style_translate_y(g_title, -y, 0);
+    if(g_status) lv_obj_set_style_translate_y(g_status, -y, 0);
+}
+static void list_scroll_cb(lv_event_t *e){ (void)e; vlist_sync(); head_follow(); }
 /* A-Z jumps land at once (every row's place exists), so there is never a pending target for a newer scroll to cancel. */
 void library_jump_cancel(void){}
 /* the view's n rows (g_count), below the headers already in the list */
@@ -946,6 +989,10 @@ static void library_reload(void){
     theme_title_text(g_title, (g_view==VIEW_GROUP) ? ttl : tr(ttl));
     if(g_status){ if(g_view==VIEW_MENU) lv_obj_remove_flag(g_status, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN); }
     if(g_back){ if(g_view==VIEW_MENU) lv_obj_add_flag(g_back, LV_OBJ_FLAG_HIDDEN); else lv_obj_remove_flag(g_back, LV_OBJ_FLAG_HIDDEN); }
+    /* the top page's list starts at the screen's top, under its title (which scrolls with it); the others below theirs */
+    if(g_view==VIEW_MENU){ lv_obj_set_pos(g_list, 30, 0); lv_obj_set_size(g_list, 286, LIST_Y + LIST_H); }
+    else { lv_obj_set_pos(g_list, 30, LIST_Y); lv_obj_set_size(g_list, 286, LIST_H); }
+    head_follow();
     az_show(0);
 
     /* a one-time hint for the hold menu, which nothing on screen shows */
@@ -958,6 +1005,10 @@ static void library_reload(void){
         /* "Most Played" + "Recently Played" are play STATS, not catalog axes -> grouped under History */
         static const char *CATS[] = { "Songs","Albums","Artists","Genres","Playlists","Favourites","Folders","Books","History" };
         static const int   CATV[] = { VIEW_SONGS,VIEW_ALBUMS,VIEW_ARTISTS,VIEW_GENRES,VIEW_PLAYLISTS,VIEW_FAVS,CAT_FOLDERS,CAT_BOOKS,VIEW_HISTORY };
+        lv_obj_t *head = lv_obj_create(g_list);   /* the room the title and clock take above the first row */
+        lv_obj_remove_style_all(head);
+        lv_obj_set_size(head, 268, LIST_Y - 4);   /* + pad_row: the first row lands where it always did */
+        lv_obj_clear_flag(head, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
         /* Search first: today's song search screen (search.c) */
         lv_obj_t *sr = base_row();
         ui_on(sr, search_row_cb, LV_EVENT_CLICKED, NULL, "library.search", UI_CORE);
@@ -1095,19 +1146,29 @@ static void library_reload(void){
     } else { /* VIEW_PLAYLISTS: the folders and playlists of one folder (shelves.db), in their order */
         if(g_pl_folder) theme_title_text(g_title, g_pl_folder_name);
         free(g_plents); g_plents = NULL;
+        free(g_pl_rows); g_pl_rows = NULL;
         g_npl = shdb_pl_list(g_pl_folder, &g_plents);
-        if(g_npl < 0){ g_npl = 0; empty_label(tr("Can't read your playlists")); return; }
-        /* "New Playlist" and "New Folder" come first, so an empty list can still make one */
+        if(g_npl < 0){ g_npl = 0; g_pl_reorder = 0; empty_label(tr("Can't read your playlists")); return; }
+        if(g_pl_reorder && g_npl >= 2) g_pl_rows = calloc((size_t)g_npl, sizeof *g_pl_rows);
+        if(!g_pl_rows) g_pl_reorder = 0;                               /* nothing to reorder */
+        g_pl_drag.list = g_list;
         lv_obj_t *nr=base_row();
-        ui_on(nr, pl_new_cb, LV_EVENT_CLICKED, NULL, "library.pl_new", UI_CORE);
-        kit_row_layout(nr, KIT_ROW_SYMBOL);
-        row_two(nr, tr_sym(LV_SYMBOL_PLUS, "New Playlist"), NULL, NULL, KIT_VALUE_COUNT);
-        theme_list_row(nr);
-        nr=base_row();
-        ui_on(nr, pl_folder_cb, LV_EVENT_CLICKED, NULL, "library.pl_folder", UI_CORE);
-        kit_row_layout(nr, KIT_ROW_SYMBOL);
-        row_two(nr, tr_sym(LV_SYMBOL_DIRECTORY, "New Folder"), NULL, NULL, KIT_VALUE_COUNT);
-        theme_list_row(nr);
+        if(g_pl_reorder){   /* Reorder: Done in place of the two New rows */
+            ui_on(nr, pl_done_cb, LV_EVENT_CLICKED, NULL, "library.pl_done", UI_CORE);
+            kit_row_layout(nr, KIT_ROW_SYMBOL);
+            row_two(nr, tr_sym(LV_SYMBOL_OK, "Done"), NULL, NULL, KIT_VALUE_COUNT);
+            theme_list_row(nr);
+        } else {            /* "New Playlist" and "New Folder" come first, so an empty list can still make one */
+            ui_on(nr, pl_new_cb, LV_EVENT_CLICKED, NULL, "library.pl_new", UI_CORE);
+            kit_row_layout(nr, KIT_ROW_SYMBOL);
+            row_two(nr, tr_sym(LV_SYMBOL_PLUS, "New Playlist"), NULL, NULL, KIT_VALUE_COUNT);
+            theme_list_row(nr);
+            nr=base_row();
+            ui_on(nr, pl_folder_cb, LV_EVENT_CLICKED, NULL, "library.pl_folder", UI_CORE);
+            kit_row_layout(nr, KIT_ROW_SYMBOL);
+            row_two(nr, tr_sym(LV_SYMBOL_DIRECTORY, "New Folder"), NULL, NULL, KIT_VALUE_COUNT);
+            theme_list_row(nr);
+        }
         for(int i=0;i<g_npl;i++){
             lv_obj_t *r=base_row();
             ui_on(r, playlist_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)i, "library.playlist", UI_CORE);
@@ -1115,6 +1176,14 @@ static void library_reload(void){
             char txt[LDB_NAME + 8], cnt[16];
             snprintf(cnt, sizeof cnt, "%d", g_plents[i].count);
             if(g_plents[i].is_folder) snprintf(txt, sizeof txt, LV_SYMBOL_DIRECTORY "  %s", g_plents[i].name);
+            if(g_pl_reorder){   /* the handle on the right, in place of the count */
+                row_two(r, g_plents[i].is_folder ? txt : g_plents[i].name, NULL, NULL, KIT_VALUE_COUNT);
+                lv_obj_set_width(lv_obj_get_child(r, 0), 196);
+                theme_list_row(r);
+                rowdrag_handle(r, i, &g_pl_drag);
+                g_pl_rows[i] = r;
+                continue;
+            }
             row_two(r, g_plents[i].is_folder ? txt : g_plents[i].name, NULL, g_plents[i].is_folder ? NULL : cnt, KIT_VALUE_COUNT);
             theme_list_row(r);
         }
@@ -1341,7 +1410,7 @@ void library_create(lv_obj_t *root){
     lv_obj_remove_style_all(g_list);
     lv_obj_set_pos(g_list, 30, LIST_Y); lv_obj_set_size(g_list, 286, LIST_H);
     lv_obj_set_style_bg_opa(g_list, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_pad_bottom(g_list, 44, 0);   /* round bottom bezel */
+    lv_obj_set_style_pad_bottom(g_list, 82, 0);   /* the last row stops clear of the round bottom bezel (y 278) */
     lv_obj_set_style_pad_row(g_list, 4, 0);
     lv_obj_set_flex_flow(g_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(g_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);

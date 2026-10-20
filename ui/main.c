@@ -39,6 +39,7 @@
 #include "musicdb.h"
 #include "player_mq.h"   /* our queue on the stock player */
 #include "queuemenu.h"   /* its entries in the hold menu */
+#include "rowdrag.h"     /* list rows dragged by their handle */
 #include "prof.h"
 #include "lvgl/src/drivers/evdev/lv_evdev.h"
 #include "config.h"
@@ -2378,6 +2379,7 @@ static lv_obj_t *ui_active_scroller(void){
         case SCR_PLVIEW:  return playlistview_scroller();
         case SCR_SEARCH:  return search_scroller();
         case SCR_APPS:    return apps_scroller();
+        case SCR_UPNEXT:  return upnext_scroller();
         default:          return NULL;
     }
 }
@@ -2392,6 +2394,7 @@ static void rim_press(int x, int y){
         rim_cover=1; rim_sx=x; rim_sy=y; rim_last_ang=rim_ang(x,y);
         rim_accum=0; rim_last_ms=lv_tick_get(); rim_state=RIM_CAND; return;
     }
+    if(rowdrag_handle_at(x, y)) return;               /* a row's drag handle beats the rim */
     lv_obj_t *sc = ui_active_scroller();
     if(!sc) return;                                   /* screen has no long list */
     lv_anim_delete(sc, NULL);                         /* cancel any in-flight spring-back so it won't fight the new drag */
@@ -3657,6 +3660,9 @@ int main(int argc, char **argv){
                     albumwall_hold();
                 }
                 else if(screen_current()==SCR_NOWPLAYING && !sleep_touch) ui_np_seek_move(p.x, p.y);
+                else if(rim_state==RIM_CAND && (rowdrag_owns_gesture(sms) || (s_press_scr==SCR_UPNEXT && upnext_owns_gesture(sms)))){
+                    rim_state = RIM_IDLE;   /* a row drag or swipe has the press (it starts before the rim commits) */
+                }
                 else if(rim_move(p.x, p.y)){ /* rim drag owns the gesture (list or cover flow) */ }
                 else if(screen_current()==SCR_ALBUMWALL && rim_state==RIM_IDLE) albumwall_drag(p.x);  /* linear drag only when no rim gesture is armed */
             } else if(ts==LV_INDEV_STATE_RELEASED && prev_ts==LV_INDEV_STATE_PRESSED){
@@ -3680,7 +3686,8 @@ int main(int argc, char **argv){
                      * merely started there is not LVGL's (its tap ignores slides), so it still falls
                      * through to nav (edge pull / options). */
                     int cover_tap_gesture = cover_tap && adx < 20 && ady < 20;
-                    int lvgl_owned = cover_tap_gesture || sleep_touch || itemmenu_is_open() || wall_held;   /* (a hold menu opened mid-press) */
+                    int lvgl_owned = cover_tap_gesture || sleep_touch || itemmenu_is_open() || wall_held ||   /* (a hold menu opened mid-press) */
+                                     rowdrag_owns_gesture(sms) || (s_press_scr==SCR_UPNEXT && upnext_owns_gesture(sms));   /* a row drag, a queue row swipe */
                     /* a committed seek on Now Playing consumes the gesture. Replay the (fused) final
                      * position through the move handler first so the ring commits the release point, not
                      * the last PRESSED sample. */

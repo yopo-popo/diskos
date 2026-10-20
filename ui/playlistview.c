@@ -8,6 +8,7 @@
 #include "shelvesdb.h"
 #include "playlists.h"
 #include "itemmenu.h"
+#include "rowdrag.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -22,11 +23,25 @@ static char g_name[LDB_NAME];
 static lv_obj_t *g_title_lbl, *g_song_list;
 static lv_obj_t *g_play_btn, *g_shuffle_btn;   /* LV_STATE_DISABLED when the playlist is empty */
 static ldb_list g_pl;                          /* its songs, kept while the rows use them */
+static lv_obj_t *g_menu_btn, *g_done_btn;
+static int g_reorder;                          /* Reorder: a handle on each row, and Done in place of Play / Shuffle */
+static lv_obj_t **g_rowobj;                    /* Reorder: the rows built, by song */
+static int g_dropped;
+static rowdrag_list g_drag;                    /* set up in plview_create */
 
 /* Enable/disable the transport buttons for an empty playlist: at 0 songs Play/Shuffle would only
  * toast, so show them disabled. LV_STATE_DISABLED (not clearing CLICKABLE) so the theme kit still
  * classifies and styles them like a populated playlist's, and LVGL sends no press/click to them.
  * The disabled look (one neutral colour for both labels, faded button) is set up in plview_create. */
+/* Play / Shuffle / the menu, or Done while reordering */
+static void plv_show_mode(void){
+    lv_obj_t *b[4] = { g_play_btn, g_shuffle_btn, g_menu_btn, g_done_btn };
+    for(int i = 0; i < 4; i++){
+        if(!b[i]) continue;
+        if((i == 3) == (g_reorder != 0)) lv_obj_remove_flag(b[i], LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(b[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
 static void pl_set_transport_enabled(int on){
     lv_obj_t *btns[2] = { g_play_btn, g_shuffle_btn };
     for(int i=0;i<2;i++){
@@ -71,7 +86,7 @@ static int plv_play(int i){
 static void plv_reload(void);   /* fwd */
 /* Hold a song: its hold menu, with Remove from playlist. user data = the 1-based row. */
 static void plv_hold_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_LONG_PRESSED) return;
+    if(lv_event_get_code(e)!=LV_EVENT_LONG_PRESSED || g_reorder) return;   /* Reorder: rows only move */
     int i = (int)(intptr_t)lv_event_get_user_data(e) - 1;
     if(i < 0 || i >= g_pl.n) return;
     const ldb_item *s = &g_pl.v[i];
@@ -87,7 +102,7 @@ static void plv_hold_cb(lv_event_t *e){
     itemmenu_open(&it);
 }
 static void plv_song_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_SHORT_CLICKED) return;   /* SHORT_CLICKED so a hold never also plays */
+    if(lv_event_get_code(e)!=LV_EVENT_SHORT_CLICKED || g_reorder) return;   /* SHORT_CLICKED so a hold never also plays */
     if(plv_play((int)(intptr_t)lv_event_get_user_data(e) - 1)) screen_show(SCR_NOWPLAYING);   /* refused: stay (toasted) */
 }
 /* Gaps preserve scroll extent and row-index decoration while rows stream.
@@ -160,17 +175,18 @@ static void plv_add_row(int i){
     lv_obj_t *t = lv_label_create(r);
     lv_label_set_text(t, s->title);
     lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
-    lv_obj_set_pos(t, 12, 5); lv_obj_set_size(t, 244, 19);
+    int w = g_reorder ? 196 : 244;   /* Reorder: clear of the handle */
+    lv_obj_set_pos(t, 12, 5); lv_obj_set_size(t, w, 19);
     lv_obj_set_style_text_font(t, TF(USER_16), 0);   /* CJK titles like Library/Search */
     lv_obj_set_style_text_color(t, TC(TEXT_PRIMARY), 0);
     lv_obj_t *a = lv_label_create(r);
     /* a song not in the library says so: "Missing" when its file is gone too */
     lv_label_set_text(a, s->count == 2 ? tr("Missing") : s->count == 1 ? tr("Not in the library") : s->artist ? s->artist : "");
     lv_label_set_long_mode(a, LV_LABEL_LONG_DOT);
-    lv_obj_set_pos(a, 12, 25); lv_obj_set_size(a, 244, 16);
+    lv_obj_set_pos(a, 12, 25); lv_obj_set_size(a, w, 16);
     lv_obj_set_style_text_font(a, TF(USER_14), 0);
     lv_obj_set_style_text_color(a, TC(TEXT_SECONDARY), 0);
-    if(!strcmp(theme_kit()->id, "terminal") && s->duration_ms > 0){
+    if(!g_reorder && !strcmp(theme_kit()->id, "terminal") && s->duration_ms > 0){
         long long sec = ((long long)s->duration_ms + 500) / 1000;
         char dur[16]; snprintf(dur, sizeof dur, "%lld:%02lld", sec / 60, sec % 60);
         lv_obj_t *d = lv_label_create(r);
@@ -181,6 +197,7 @@ static void plv_add_row(int i){
         kit_row_value(r, t, a, d, KIT_VALUE_DURATION);
     }
     theme_list_row(r);
+    if(g_rowobj){ rowdrag_handle(r, i, &g_drag); g_rowobj[i] = r; }
 
     g_built[i] = 1;
     if(i == gap->lo){
@@ -228,9 +245,11 @@ static void plv_reload(void){
     theme_title_text(g_title_lbl, g_name);
     if(!g_song_list) return;
     g_loading = 1;
+    if(rowdrag_active(&g_drag)) rowdrag_cancel();
     plv_fill_stop();
     plv_gaps_free();
     lv_obj_clean(g_song_list);   /* existing entry/removal scroll reset */
+    free(g_rowobj); g_rowobj = NULL;
     memset(g_built, 0, sizeof g_built);
     g_fill_i = g_fill_n = g_two_line = 0;
     ldb_list_free(&g_pl);
@@ -240,6 +259,9 @@ static void plv_reload(void){
     if(n > 8192) n = 8192;   /* display cap only; playback and Shuffle still use the full playlist */
     if(n > 0) g_gaps = calloc(1, sizeof *g_gaps);
     if(n > 0 && !g_gaps) n = 0;
+    if(g_reorder && n >= 2) g_rowobj = calloc((size_t)n, sizeof *g_rowobj);
+    if(!g_rowobj) g_reorder = 0;   /* nothing to reorder */
+    plv_show_mode();
     pl_set_transport_enabled(n > 0);
     if(n<=0){
         plv_fill_stop();
@@ -265,7 +287,7 @@ static void plv_reload(void){
 /* Public: rebuild the list from the DB. Called by the screen manager on EVERY entry
  * to SCR_PLVIEW (incl. back-nav), so tap positions can't go stale after the playlist's
  * membership changes elsewhere (e.g. add-to-playlist from Now Playing). */
-void plview_refresh(void){ plv_reload(); }
+void plview_refresh(void){ g_reorder = 0; plv_reload(); }
 long long plview_current(void){ return g_pid; }
 /* A song removed or the playlist renamed while it shows: read it again where it was. */
 void plview_changed(void){
@@ -279,6 +301,36 @@ void plview_open(long pid, const char *name){
     g_pid = pid;
     snprintf(g_name, sizeof g_name, "%s", name ? name : "");
     screen_show(SCR_PLVIEW);   /* transition() calls plview_refresh() -> plv_reload() */
+}
+
+/* ---- Reorder (yopo 2026-10-20) ------------------------------------------ */
+/* The hold menu's Reorder puts a handle (rowdrag) on each song; a drag moves the song there, Done ends it. */
+static int plv_drag_count(void *ctx){ (void)ctx; return g_rowobj ? g_fill_n : 0; }
+static lv_obj_t *plv_drag_row(void *ctx, int i){ (void)ctx; return g_rowobj && i >= 0 && i < g_fill_n ? g_rowobj[i] : NULL; }
+static void plv_drag_prepare(void *ctx, int from){   /* every row built (no spacers left) before the drag measures */
+    (void)ctx; (void)from;
+    g_loading = 1;
+    for(int i = 0; i < g_fill_n; i++) plv_add_row(i);
+    g_loading = 0;
+    plv_fill_stop();
+}
+static void plv_drag_drop(void *ctx, int from, int to, int above, int below){
+    (void)ctx; (void)above; (void)below;
+    if(from < 0 || from >= g_pl.n) return;
+    if(shdb_pl_item_place(g_pl.v[from].row_id, to) != 1) ui_toast("Couldn't move that");
+    g_dropped = 1;
+}
+static void plv_changed_async(void *unused){ (void)unused; plview_changed(); }
+static void plv_drag_done(void *ctx){
+    (void)ctx;
+    if(g_dropped){ g_dropped = 0; lv_async_call(plv_changed_async, NULL); }   /* the rows' indexes changed */
+}
+void plview_reorder(int on){
+    g_reorder = on;
+    plview_changed();
+}
+static void done_cb(lv_event_t *e){
+    if(lv_event_get_code(e)==LV_EVENT_CLICKED) plview_reorder(0);
 }
 
 /* ---- play / shuffle ----------------------------------------------------- */
@@ -350,7 +402,7 @@ void plview_create(lv_obj_t *root){
     }
     /* "more/options" (edit/rename/delete). Drawn "three dots" - Apple-Music-style More - because the
      * bullet glyph isn't in this tree's montserrat; LV_SYMBOL_LIST misread as a track list. */
-    lv_obj_t *menu_btn = icon_btn(root, 264, 68, 36, "", TC(TEXT_SECONDARY), open_menu_cb);
+    lv_obj_t *menu_btn = g_menu_btn = icon_btn(root, 264, 68, 36, "", TC(TEXT_SECONDARY), open_menu_cb);
     for(int i=0;i<3;i++){
         lv_obj_t *d = lv_obj_create(menu_btn);
         lv_obj_remove_style_all(d);
@@ -365,8 +417,8 @@ void plview_create(lv_obj_t *root){
     g_song_list = lv_obj_create(root);
     lv_obj_remove_style_all(g_song_list);
     lv_obj_set_pos(g_song_list, 41, 118);   /* its 268 px rows (5 px in) land centred on the screen */
-    lv_obj_set_size(g_song_list, 290, 226);
-    lv_obj_set_style_pad_bottom(g_song_list, 44, 0);   /* last row scrolls clear of the round bottom bezel */
+    lv_obj_set_size(g_song_list, 290, 242);   /* down to the screen's bottom edge */
+    lv_obj_set_style_pad_bottom(g_song_list, 60, 0);   /* last row scrolls clear of the round bottom bezel */
     lv_obj_set_style_bg_opa(g_song_list, LV_OPA_TRANSP, 0);
     lv_obj_set_flex_flow(g_song_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(g_song_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -375,6 +427,12 @@ void plview_create(lv_obj_t *root){
     lv_obj_set_scrollbar_mode(g_song_list, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_flag(g_song_list, LV_OBJ_FLAG_SCROLL_MOMENTUM);
     lv_obj_add_event_cb(g_song_list, plv_scroll_cb, LV_EVENT_SCROLL, NULL);
+
+    /* Reorder: Done takes the place of Play / Shuffle / the menu */
+    g_done_btn = icon_btn(root, 60, 68, 240, tr_sym(LV_SYMBOL_OK, "Done"), TC(ACCENT_PRIMARY), done_cb);
+    lv_obj_add_flag(g_done_btn, LV_OBJ_FLAG_HIDDEN);
+    g_drag = (rowdrag_list){ .list = g_song_list, .count = plv_drag_count, .row = plv_drag_row,
+                             .prepare = plv_drag_prepare, .drop = plv_drag_drop, .done = plv_drag_done };
 }
 
 lv_obj_t *playlistview_scroller(void){ return g_song_list; }

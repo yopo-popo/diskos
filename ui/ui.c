@@ -44,7 +44,7 @@ LV_FONT_DECLARE(font_icons_28)
 #define MOON_ICON     "\xEF\x86\x86"   /* FA f186 moon (audiobook sleep timer) */
 #define MODE_ARROW    "\xEF\x85\xB8"   /* FA f178 long-arrow-right (sequential) */
 
-#define ARC_D        332
+#define ARC_D        312
 #define ARC_SWEEP    286
 #define ARC_ROT      127
 
@@ -303,6 +303,12 @@ static int32_t seek_pt_to_value(int x, int y){
     return v;
 }
 
+/* A ring drag moves along the ring: more travel around it than in or out, from where the press landed. */
+static int seek_along_ring(int dx, int dy){
+    double rx = g_seek_sx - RING_CX, ry = g_seek_sy - RING_CY, r = sqrt(rx*rx + ry*ry);
+    if(r < 1) return 0;
+    return fabs((dx*ry - dy*rx) / r) >= fabs((dx*rx + dy*ry) / r);
+}
 /* press: returns 1 if this touch could be a seek (and arms the recognizer) */
 int ui_np_seek_press(int x, int y){
     g_seek_cand = 0; g_seek_on = 0; g_scrubbing = 0;   /* also clears a stuck scrub from a missed release */
@@ -327,8 +333,8 @@ int ui_np_seek_move(int x, int y){
         g_seek_cand = 0; return 0;
     }
     if(!g_seek_on){
-        if(adx < 26 && ady < 26) return 0;            /* not enough travel to classify; hold the arc */
-        if(!g_seek_bar && adx > ady*2){ g_seek_cand = 0; return 0; } /* ring: straight horizontal -> nav swipe (top-of-arc is ambiguous; bias to no-glitch); a line seek IS horizontal */
+        if(adx < 10 && ady < 10) return 0;            /* not enough travel to classify; hold the arc */
+        if(!g_seek_bar && !seek_along_ring(dx, dy)){ g_seek_cand = 0; return 0; } /* ring: mostly in or out across it -> a nav swipe (along it, even sideways at the top, is a seek); a line seek IS horizontal */
         g_seek_on = 1; g_scrubbing = 1;               /* confirmed: a deliberate ring drag */
         g_scrub_lo = g_seek_lo; g_scrub_hi = g_seek_hi;   /* latch the window NOW so it can't shift under the finger */
         if(g_scrub_hi <= g_scrub_lo){ g_scrub_lo = 0; g_scrub_hi = g_track_dur; }
@@ -965,24 +971,25 @@ static int g_np_small_valid, g_np_cover_loading;
 
 /* ---- Now Playing: two states -------------------------------------------------------------------
  * The cover art fills the round screen and turns slowly while music plays. A tap shows the controls (g_np_ov)
- * over a blurred, dimmed copy of the same art, which keeps turning; a tap on an empty spot, or NP_OV_IDLE_MS
+ * over the same art dimmed (yopo 2026-10-20: sharp, not blurred), which keeps turning; a tap on an empty spot, or NP_OV_IDLE_MS
  * without a touch, hides them again. The picture is the shared sharp 360 px cover (sharpart.c's sharp_cover_*);
- * until it lands, the small 148 px cover is enlarged in its place. diskOS turns both pictures itself
+ * until it lands, the small 148 px cover is enlarged in its place. diskOS turns it (and the side pages' blurred copy)
  * (sharp_rotate, ~6 ms a frame) into opaque images, with sharp_spin_start's spin (27 s a turn, 30 frames a
  * second). */
 #define NP_W              360
 #define NP_OV_IDLE_MS     5000
 #define NP_OV_FADE_MS     220
 #define NP_BLUR_TINT      150     /* how far the blurred art leans to the theme's image tint (of 255), as the old backdrop */
+#define NP_DIM_OPA        NP_BLUR_TINT   /* the sharp art under the controls leans to the image tint as far */
 #define NP_BS             (NP_W / 4)   /* the blur works on a quarter-size copy */
 #define NP_LOG_MS         10000   /* the frame cost goes to diskos_boot.log ("NP spin") this often while turning */
-static lv_obj_t *g_np_art, *g_np_blur_img;      /* the turning sharp and blurred pictures */
+static lv_obj_t *g_np_art, *g_np_dim;           /* the turning art, and its dimming under the controls */
 static lv_obj_t *g_np_noart, *g_np_noart_title; /* no cover: a dark disc with the song title */
 static lv_obj_t *g_np_tap;                       /* full-screen tap target under the controls */
 static lv_obj_t *g_np_ov;                        /* the controls and the song's info */
 static uint32_t *g_np_up;                        /* the small cover enlarged to NP_W, while there is no sharp one */
 static uint32_t *g_np_blur;                      /* the blurred, dimmed copy of the current picture */
-static uint32_t *g_np_out, *g_np_outb;           /* what g_np_art and g_np_blur_img show */
+static uint32_t *g_np_out, *g_np_outb;           /* what g_np_art and the side pages' backdrops show */
 static lv_image_dsc_t g_np_out_dsc, g_np_outb_dsc;
 static const uint32_t *g_np_src;                 /* the unturned picture; NULL = no art */
 static int32_t g_np_angle;                       /* 0.1 degree */
@@ -1041,7 +1048,7 @@ static void np_box(const uint8_t *in, uint8_t *out, int horiz)
         }
     }
 }
-/* The soft copy for under the controls: shrink 4x, blur that (three box passes each way, close to a gaussian),
+/* The soft copy behind the side pages (Lyrics, Options): shrink 4x, blur that (three box passes each way, close to a gaussian),
  * grow it back and lean it towards the theme's image tint so the text over it reads. */
 __attribute__((optimize("O2")))
 static void np_make_blur(const uint32_t *src, uint32_t *dst)
@@ -1112,24 +1119,30 @@ static void np_turn(lv_obj_t *img, const uint32_t *src, uint32_t *out, lv_image_
     sharp_rotate(src, out, g_np_angle);
     g_np_turn_us += np_us() - t; g_np_turn_n++;
     lv_image_cache_drop(dsc);
-    lv_obj_invalidate(img);
+    if(img) lv_obj_invalidate(img);
 }
-/* Now Playing's side pages (Lyrics, Options) show the same blurred art turning behind them: each page has its own
- * image of g_np_outb, which np_draw turns while that page is the screen. */
+/* Now Playing's side pages show its art turning behind them: Lyrics the blurred copy (g_np_outb), Options the sharp
+ * one (g_np_out) under a dimming like the controls' (yopo 2026-10-20). Each page has its own image, which np_draw
+ * turns while that page is the screen. */
 #define NP_BD_MAX 4
-static struct { lv_obj_t *img; int scr; } g_np_bd[NP_BD_MAX];
-static void np_bd_bind(lv_obj_t *o)
+#define NP_BD_BLUR  1
+#define NP_BD_SHARP 2
+static struct { lv_obj_t *img, *dim; int scr, kind; } g_np_bd[NP_BD_MAX];
+static void np_bd_bind(int i)
 {
     int art = g_np_src != NULL;
-    if(art && lv_image_get_src(o) != &g_np_outb_dsc) lv_image_set_src(o, &g_np_outb_dsc);
-    np_vis(o, art);   /* no art: the page's own canvas */
+    const lv_image_dsc_t *d = g_np_bd[i].kind == NP_BD_SHARP ? &g_np_out_dsc : &g_np_outb_dsc;
+    if(art && lv_image_get_src(g_np_bd[i].img) != d) lv_image_set_src(g_np_bd[i].img, d);
+    np_vis(g_np_bd[i].img, art);   /* no art: the page's own canvas */
+    if(g_np_bd[i].dim) np_vis(g_np_bd[i].dim, art);
 }
+/* Which kinds of backdrop the current screen shows (NP_BD_* bits; 0 without art). */
 static int np_bd_shown(void)
 {
     if(!g_np_src) return 0;
-    int cur = screen_current();
-    for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img && g_np_bd[i].scr == cur) return 1;
-    return 0;
+    int cur = screen_current(), k = 0;
+    for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img && g_np_bd[i].scr == cur) k |= g_np_bd[i].kind;
+    return k;
 }
 static void np_bd_invalidate(void)
 {
@@ -1139,62 +1152,76 @@ static void np_bd_invalidate(void)
 static void np_bd_deleted(lv_event_t *e)
 {
     lv_obj_t *o = lv_event_get_target(e);
-    for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img == o) g_np_bd[i].img = NULL;
+    for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img == o) g_np_bd[i].img = g_np_bd[i].dim = NULL;
 }
-/* Turns the pictures that show to the current angle: Now Playing's own while it is the screen, and the blurred one
- * also for a side page's backdrop. */
+/* Turns the pictures that show to the current angle: the sharp one for Now Playing or the Options backdrop, the
+ * blurred one for the Lyrics backdrop. */
 static void np_draw(void)
 {
     if(!g_np_src || !g_np_art) return;
     int np = screen_current() == SCR_NOWPLAYING, bd = np_bd_shown();
-    if(np && !lv_obj_has_flag(g_np_art, LV_OBJ_FLAG_HIDDEN)) np_turn(g_np_art, g_np_src, g_np_out, &g_np_out_dsc);
-    if(bd || (np && !lv_obj_has_flag(g_np_blur_img, LV_OBJ_FLAG_HIDDEN)))
-        np_turn(g_np_blur_img, g_np_blur, g_np_outb, &g_np_outb_dsc);
+    int art = np && !lv_obj_has_flag(g_np_art, LV_OBJ_FLAG_HIDDEN);
+    if(art || (bd & NP_BD_SHARP)) np_turn(art ? g_np_art : NULL, g_np_src, g_np_out, &g_np_out_dsc);
+    if(bd & NP_BD_BLUR) np_turn(NULL, g_np_blur, g_np_outb, &g_np_outb_dsc);
     if(bd) np_bd_invalidate();
 }
-/* A side page's backdrop: the bottom child of its root. */
+/* A side page's backdrop: the bottom children of its root (the picture, and for Options its dimming above it). */
 void ui_np_backdrop(lv_obj_t *root, int scr)
 {
     int i = 0;
     while(i < NP_BD_MAX && g_np_bd[i].img) i++;
     if(i == NP_BD_MAX) return;
+    g_np_bd[i].scr = scr;
+    g_np_bd[i].kind = scr == SCR_NPHUB ? NP_BD_SHARP : NP_BD_BLUR;
+    g_np_bd[i].dim = NULL;
+    if(g_np_bd[i].kind == NP_BD_SHARP){
+        lv_obj_t *d = lv_obj_create(root);
+        lv_obj_remove_style_all(d);
+        lv_obj_set_pos(d, 0, 0);
+        lv_obj_set_size(d, NP_W, NP_W);
+        lv_obj_set_style_bg_color(d, TC(IMAGE_TINT), 0);
+        lv_obj_set_style_bg_opa(d, NP_DIM_OPA, 0);
+        lv_obj_remove_flag(d, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_move_background(d);
+        g_np_bd[i].dim = d;
+    }
     lv_obj_t *o = lv_image_create(root);
     lv_obj_set_pos(o, 0, 0);
     lv_obj_set_size(o, NP_W, NP_W);
     lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_move_background(o);
     lv_obj_add_event_cb(o, np_bd_deleted, LV_EVENT_DELETE, NULL);
-    g_np_bd[i].img = o; g_np_bd[i].scr = scr;
-    np_bd_bind(o);
+    g_np_bd[i].img = o;
+    np_bd_bind(i);
 }
-/* Entering a side page, or the picture changed: bind every backdrop and turn the blurred art to the current angle. */
+/* Entering a side page, or the picture changed: bind every backdrop and turn its art to the current angle. */
 void ui_np_backdrop_sync(void)
 {
-    for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img) np_bd_bind(g_np_bd[i].img);
+    for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img) np_bd_bind(i);
     if(np_bd_shown()) np_draw();
 }
 /* The screens on which the art turns: Now Playing and its side pages. */
 int ui_np_turns_on(int scr){ return scr == SCR_NOWPLAYING || scr == SCR_LYRICS || scr == SCR_NPHUB; }
-/* Shows what fits the state (stopping a fade): the sharp art alone, the blurred art under the controls, or the
- * no-art disc (with the title while the controls are hidden). */
+/* Shows what fits the state (stopping a fade): the art alone, the art dimmed under the controls, or the no-art disc
+ * (with the title while the controls are hidden). */
 static void np_show_now(void)
 {
     if(!g_np_ov) return;
     lv_anim_delete(g_np_ov, NULL);
-    lv_anim_delete(g_np_blur_img, NULL);
+    lv_anim_delete(g_np_dim, NULL);
     lv_obj_set_style_opa(g_np_ov, LV_OPA_COVER, 0);
-    lv_obj_set_style_opa(g_np_blur_img, LV_OPA_COVER, 0);
+    lv_obj_set_style_opa(g_np_dim, LV_OPA_COVER, 0);
     int art = g_np_src != NULL, ov = g_np_ov_on;
-    np_vis(g_np_art, art && !ov);
-    np_vis(g_np_blur_img, art && ov);
+    np_vis(g_np_art, art);
+    np_vis(g_np_dim, art && ov);
     np_vis(g_np_noart, !art);
     np_vis(g_np_noart_title, !art && !ov);
     np_vis(g_np_ov, ov);
     np_draw();
 }
 static void np_ov_faded(lv_anim_t *a){ (void)a; np_show_now(); }
-/* Shows (on) or hides the controls. Animated: both pictures show and turn while the blurred one and the
- * controls fade, then np_show_now settles the end state. */
+/* Shows (on) or hides the controls. Animated: the art keeps turning while the dimming and the controls fade, then
+ * np_show_now settles the end state. */
 static void np_ov_set(int on, int animate)
 {
     if(!g_np_ov) { g_np_ov_on = 0; return; }
@@ -1209,10 +1236,10 @@ static void np_ov_set(int on, int animate)
     lv_opa_t from = on ? LV_OPA_TRANSP : LV_OPA_COVER, to = on ? LV_OPA_COVER : LV_OPA_TRANSP;
     np_vis(g_np_noart_title, 0);
     np_vis(g_np_art, art);
-    np_vis(g_np_blur_img, art);
+    np_vis(g_np_dim, art);
     np_vis(g_np_ov, 1);
     np_draw();
-    if(art){ lv_obj_set_style_opa(g_np_blur_img, from, 0); anim_fade(g_np_blur_img, from, to, NP_OV_FADE_MS, NULL); }
+    if(art){ lv_obj_set_style_opa(g_np_dim, from, 0); anim_fade(g_np_dim, from, to, NP_OV_FADE_MS, NULL); }
     lv_obj_set_style_opa(g_np_ov, from, 0);
     anim_fade(g_np_ov, from, to, NP_OV_FADE_MS, np_ov_faded);
 }
@@ -1297,7 +1324,6 @@ void ui_np_cover_changed(void)
     if(src){
         np_make_blur(src, g_np_blur);
         if(lv_image_get_src(g_np_art) != &g_np_out_dsc) lv_image_set_src(g_np_art, &g_np_out_dsc);
-        if(lv_image_get_src(g_np_blur_img) != &g_np_outb_dsc) lv_image_set_src(g_np_blur_img, &g_np_outb_dsc);
     }
     if(!src) ui_np_spin(0);
     np_show_now();
@@ -2185,7 +2211,7 @@ void ui_create(lv_obj_t *root)
         lv_display_add_event_cb(lv_display_get_default(), np_render_cb, LV_EVENT_RENDER_READY, NULL);
     }
 
-    /* ---- the art: a dark disc with the title when there is none; the turning picture, sharp alone, blurred under the controls ---- */
+    /* ---- the art: a dark disc with the title when there is none; the turning picture, dimmed under the controls ---- */
     g_np_noart = lv_obj_create(scr);
     lv_obj_remove_style_all(g_np_noart);
     lv_obj_set_size(g_np_noart, NP_W, NP_W);
@@ -2202,8 +2228,11 @@ void ui_create(lv_obj_t *root)
     lv_obj_center(g_np_noart_title);
 
     g_np_art = lv_image_create(scr);
-    g_np_blur_img = lv_image_create(scr);
-    lv_obj_t *pics[2] = { g_np_art, g_np_blur_img };
+    g_np_dim = lv_obj_create(scr);   /* over the art while the controls show, so their text reads */
+    lv_obj_remove_style_all(g_np_dim);
+    lv_obj_set_style_bg_color(g_np_dim, TC(IMAGE_TINT), 0);
+    lv_obj_set_style_bg_opa(g_np_dim, NP_DIM_OPA, 0);
+    lv_obj_t *pics[2] = { g_np_art, g_np_dim };
     for(int i = 0; i < 2; i++){
         lv_obj_set_size(pics[i], NP_W, NP_W);
         lv_obj_center(pics[i]);
@@ -2256,7 +2285,7 @@ void ui_create(lv_obj_t *root)
 
     title = lv_label_create(ov);
     g_title_scroll_mode = LV_LABEL_LONG_CLIP;
-    lv_obj_set_width(title, 250);
+    lv_obj_set_width(title, 236);   /* clear of the ring at its height */
     style_text(title, TF(USER_20), TC(TEXT_PRIMARY));
     lv_label_set_long_mode(title, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_label_set_text(title, tr("No Track"));

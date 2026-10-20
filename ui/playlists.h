@@ -15,6 +15,9 @@ void plpick_close_transients(void);
 /* playlistview.c: the playlist shown (0 = none), and its rows or name changed (reread, keeping the place) */
 long long plview_current(void);
 void plview_changed(void);
+/* Reorder (a handle on each row, until Done): a playlist's songs (playlistview.c), the Playlists list shown (library.c) */
+void plview_reorder(int on);
+void library_pl_reorder(int on);
 
 /* Mark the songs of a playlist list whose file is gone: count 1 (not in the library) becomes 2. */
 void playlists_mark_missing(ldb_list *l);
