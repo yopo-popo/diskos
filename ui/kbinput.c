@@ -3,32 +3,38 @@
 #include "screens.h"
 #include "theme.h"
 #include "theme_kit.h"
+#include "config.h"
+#include "fonts_hebrew.h"
+#include "fonts_icons.h"
 #include <stdio.h>
 #include <string.h>
 
 /* On-screen keyboard shaped to the bottom SEMICIRCLE of the 360px round panel
  * the natural QWERTY taper (10/9/7 keys) already
  * follows the circle's narrowing chord, so each row is centred to the chord at
- * its bottom edge and every key stays >=32px and fully inside the circle. The
- * top half holds the field + Cancel/Save. Individually-positioned lv_buttons -
- * no per-touch math, cheap on MIPS. */
+ * its bottom edge and every key stays >=32px and fully inside the circle (the
+ * Hebrew page's 10/10/9 rows need 30/29px keys in the lower two rows). The
+ * top half holds the field + Cancel/Save, with the language globe between them.
+ * Individually-positioned lv_buttons - no per-touch math, cheap on MIPS. */
 
 /* ---- semicircle keyboard ------------------------------------------------- */
 #define SKB_W 360
 #define SKB_Y 180            /* keyboard occupies y 180..360 (bottom half)      */
 #define SKB_H 180
 #define SKB_ROW_H 32
-#define SKB_MAX_KEYS 31
+#define SKB_MAX_KEYS 34      /* the most any page needs: Hebrew 10/10/9 + 5 utility keys */
 
-typedef enum { SKB_LOWER, SKB_UPPER, SKB_NUM, SKB_SYM } skb_mode_t;
+typedef enum { SKB_LOWER, SKB_UPPER, SKB_NUM, SKB_SYM, SKB_HEB } skb_mode_t;
 typedef enum { SKB_CHAR, SKB_SHIFT, SKB_MODE, SKB_SPACE, SKB_BKSP, SKB_OK } skb_kind_t;
 
 typedef struct skb_s skb_t;
-typedef struct { skb_t *ctx; skb_kind_t kind; uint8_t row, col; lv_obj_t *btn, *label; } skb_key_t;
+typedef struct { skb_t *ctx; skb_kind_t kind; uint8_t row, col; lv_obj_t *btn, *label;
+                 const lv_font_t *font; /* the label's Latin font while it shows Hebrew */ } skb_key_t;
 struct skb_s {
     lv_obj_t *kb, *ta;
     void (*submit)(void);
     skb_mode_t mode;
+    uint8_t heb;     /* the letters are Hebrew: "abc" on the number pages goes back to SKB_HEB */
     skb_key_t keys[SKB_MAX_KEYS];
     uint8_t key_count;
 };
@@ -40,6 +46,15 @@ static const char skb_numr [3][11] = { "1234567890", "-/:;()$&@", ".,?!'\"+" };
  * incl. the ones Wi-Fi passwords commonly need: _ # % = * ^ etc. All printable
  * ASCII, so montserrat renders them. Row lengths must match skb_rows (10/9/7). */
 static const char skb_syms [3][11] = { "[]{}#%^*+=", "_\\|~<>/-:", ";()&$!?" };
+/* Hebrew page: the standard Israeli layout (SI-1452), each letter on the key it has on a computer keyboard.
+ * HEB(n) is alef+n (U+05D0+n, UTF-8 D7 90+n); the final forms have their own Unicode offsets. Row lengths
+ * must match skb_rows_heb (10/10/9). */
+#define HEB(n) (char)(0x80 + (n))
+static const char skb_heb  [3][11] = {
+    { '/', '\'', HEB(23), HEB(24), HEB(0), HEB(8), HEB(5), HEB(15), HEB(13), HEB(20) },        /* / ' qof resh alef tet vav final-nun final-mem pe */
+    { HEB(25), HEB(3), HEB(2), HEB(11), HEB(18), HEB(9), HEB(7), HEB(12), HEB(10), HEB(19) },  /* shin dalet gimel kaf ayin yod het lamed final-kaf final-pe */
+    { HEB(6), HEB(17), HEB(1), HEB(4), HEB(16), HEB(14), HEB(22), HEB(26), HEB(21) },          /* zayin samekh bet he nun mem tsadi tav final-tsadi */
+};
 
 typedef struct { int16_t y; uint8_t count, gap, key_w; const uint8_t *widths; } skb_rowl_t;
 static const uint8_t skb_util_w[5] = { 32, 32, 52, 32, 32 };  /* Aa 123 space bksp OK */
@@ -49,6 +64,15 @@ static const skb_rowl_t skb_rows[4] = {
     {260,  7, 4, 36, NULL},          /* zxcvbnm     total 276 (chord ~283) */
     {298,  5, 3,  0, skb_util_w},    /* utility     total 192 (chord ~199) */
 };
+/* Hebrew has 27 letters in 10/10/9 keys: the lower two rows take narrower keys and 2px gaps to stay inside
+ * the circle (corners at most 178.5 px from the centre). */
+static const skb_rowl_t skb_rows_heb[4] = {
+    {184, 10, 3, 32, NULL},          /* / ' + 8 letters  total 347 (chord ~353) */
+    {222, 10, 2, 30, NULL},          /* 10 letters       total 318 (chord ~329) */
+    {260,  9, 2, 29, NULL},          /* 9 letters        total 277 (chord ~283) */
+    {298,  5, 3,  0, skb_util_w},    /* utility          total 192 (chord ~199) */
+};
+static const uint8_t skb_row_keys[4] = { 10, 10, 9, 5 };   /* keys created per row: the most any page shows */
 
 static int16_t skb_row_w(const skb_rowl_t *r){
     int16_t w = 0;
@@ -56,20 +80,52 @@ static int16_t skb_row_w(const skb_rowl_t *r){
     if(r->count>1) w += (int16_t)(r->count-1)*r->gap;
     return w;
 }
-static char skb_char(const skb_t *c, uint8_t row, uint8_t col){
-    if(c->mode==SKB_SYM)   return skb_syms [row][col];
-    if(c->mode==SKB_NUM)   return skb_numr [row][col];
-    if(c->mode==SKB_UPPER) return skb_upper[row][col];
-    return skb_lower[row][col];
+/* The text a character key shows and types; returns 1 for a Hebrew letter. */
+static int skb_text(const skb_t *c, uint8_t row, uint8_t col, char s[3]){
+    char ch;
+    if(c->mode==SKB_HEB)        ch = skb_heb  [row][col];
+    else if(c->mode==SKB_SYM)   ch = skb_syms [row][col];
+    else if(c->mode==SKB_NUM)   ch = skb_numr [row][col];
+    else if(c->mode==SKB_UPPER) ch = skb_upper[row][col];
+    else                        ch = skb_lower[row][col];
+    if((unsigned char)ch >= 0x80){ s[0] = (char)0xD7; s[1] = (char)(0x90 + (unsigned char)ch - 0x80); s[2] = 0; return 1; }
+    s[0] = ch; s[1] = 0;
+    return 0;
+}
+/* Hebrew text needs the Hebrew font; Latin text gets back the font the label had, which a theme kit may have
+ * swapped or stepped down to fit the key. */
+static void skb_label(skb_key_t *k, const char *txt, int heb){
+    const lv_font_t *f = lv_obj_get_style_text_font(k->label, 0);
+    if(heb && f != &font_hebrew_16){ k->font = f; lv_obj_set_style_text_font(k->label, &font_hebrew_16, 0); }
+    else if(!heb && f == &font_hebrew_16 && k->font) lv_obj_set_style_text_font(k->label, k->font, 0);
+    lv_label_set_text(k->label, txt);
+}
+/* Place the keys for the page's geometry: the Hebrew letters use 10/10/9 keys, every other page 10/9/7. */
+static void skb_layout(skb_t *c){
+    const skb_rowl_t *rows = c->mode==SKB_HEB ? skb_rows_heb : skb_rows;
+    for(uint8_t i=0;i<c->key_count;i++){
+        skb_key_t *k=&c->keys[i];
+        const skb_rowl_t *r=&rows[k->row];
+        if(k->col >= r->count){ lv_obj_add_flag(k->btn,LV_OBJ_FLAG_HIDDEN); continue; }
+        int16_t x=(SKB_W - skb_row_w(r))/2;
+        for(uint8_t j=0;j<k->col;j++) x += (r->widths ? r->widths[j] : r->key_w) + r->gap;
+        lv_obj_set_pos(k->btn,x,r->y - SKB_Y);
+        lv_obj_set_size(k->btn,r->widths ? r->widths[k->col] : r->key_w,SKB_ROW_H);
+        lv_obj_remove_flag(k->btn,LV_OBJ_FLAG_HIDDEN);
+    }
 }
 static void skb_refresh(skb_t *c){
     for(uint8_t i=0;i<c->key_count;i++){
         skb_key_t *k=&c->keys[i];
+        if(lv_obj_has_flag(k->btn,LV_OBJ_FLAG_HIDDEN)) continue;
         switch(k->kind){
-        case SKB_CHAR: { char s[2]={ skb_char(c,k->row,k->col), 0 }; lv_label_set_text(k->label,s); break; }
+        case SKB_CHAR: { char s[3]; int heb = skb_text(c,k->row,k->col,s); skb_label(k,s,heb); break; }
         case SKB_SHIFT:
             /* on letter pages = case shift; on number/symbol pages = toggle the
-             * two symbol pages (NUM <-> SYM), iOS "#+=" / "123" style. */
+             * two symbol pages (NUM <-> SYM), iOS "#+=" / "123" style. Hebrew has
+             * no case, so there the key is greyed out. */
+            if(c->mode==SKB_HEB) lv_obj_add_state(k->btn,LV_STATE_DISABLED);
+            else                 lv_obj_remove_state(k->btn,LV_STATE_DISABLED);
             if(c->mode==SKB_NUM){      lv_label_set_text(k->label,"#+="); lv_obj_remove_state(k->btn,LV_STATE_CHECKED); }
             else if(c->mode==SKB_SYM){ lv_label_set_text(k->label,"123"); lv_obj_remove_state(k->btn,LV_STATE_CHECKED); }
             else {
@@ -78,14 +134,22 @@ static void skb_refresh(skb_t *c){
                 else                   lv_obj_remove_state(k->btn,LV_STATE_CHECKED);
             }
             break;
-        case SKB_MODE:  lv_label_set_text(k->label,
-                            (c->mode==SKB_NUM||c->mode==SKB_SYM)?"abc":"123"); break;
+        case SKB_MODE:   /* back to the letters: "abc", or alef-bet-gimel when they are Hebrew */
+            if(c->mode==SKB_NUM||c->mode==SKB_SYM) skb_label(k, c->heb ? "\xD7\x90\xD7\x91\xD7\x92" : "abc", c->heb);
+            else                                   skb_label(k, "123", 0);
+            break;
         case SKB_SPACE: lv_label_set_text(k->label,"space"); break;
         case SKB_BKSP:  lv_label_set_text(k->label,LV_SYMBOL_BACKSPACE); break;
         case SKB_OK:    lv_label_set_text(k->label,LV_SYMBOL_OK); break;
         }
         lv_obj_center(k->label);
     }
+}
+static void skb_set_mode(skb_t *c, skb_mode_t mode){
+    int relayout = (mode==SKB_HEB) != (c->mode==SKB_HEB);
+    c->mode = mode;
+    if(relayout) skb_layout(c);
+    skb_refresh(c);
 }
 static void skb_key_cb(lv_event_t *e){
     lv_event_code_t code = lv_event_get_code(e);
@@ -97,33 +161,32 @@ static void skb_key_cb(lv_event_t *e){
     if(code != LV_EVENT_CLICKED) return;
     switch(k->kind){
     case SKB_CHAR: {
-        char s[2]={ skb_char(c,k->row,k->col), 0 };
+        char s[3];
+        skb_text(c,k->row,k->col,s);
         lv_textarea_add_text(c->ta,s);
         if(c->mode==SKB_UPPER){ c->mode=SKB_LOWER; skb_refresh(c); }
         break; }
     case SKB_SHIFT:
+        if(c->mode==SKB_HEB) break;                             /* no case in Hebrew (the key is disabled anyway) */
         if(c->mode==SKB_NUM)      c->mode = SKB_SYM;            /* number page -> symbol page */
         else if(c->mode==SKB_SYM) c->mode = SKB_NUM;            /* symbol page -> number page */
         else c->mode = (c->mode==SKB_UPPER)?SKB_LOWER:SKB_UPPER;/* letter case shift */
         skb_refresh(c); break;
-    case SKB_MODE:  /* "123"/"abc": jump between letters and the number/symbol pages */
-        c->mode = (c->mode==SKB_NUM||c->mode==SKB_SYM)?SKB_LOWER:SKB_NUM; skb_refresh(c); break;
+    case SKB_MODE:  /* "123"/"abc": jump between the letters (English or Hebrew) and the number/symbol pages */
+        skb_set_mode(c, (c->mode==SKB_NUM||c->mode==SKB_SYM) ? (c->heb ? SKB_HEB : SKB_LOWER) : SKB_NUM); break;
     case SKB_SPACE: lv_textarea_add_text(c->ta," "); break;
     case SKB_BKSP:  lv_textarea_delete_char(c->ta); break;
     case SKB_OK:    if(c->submit) c->submit(); break;
     }
 }
 static void skb_del_cb(lv_event_t *e){ lv_free(lv_event_get_user_data(e)); }
-static void skb_add(skb_t *c, skb_kind_t kind, uint8_t row, uint8_t col,
-                    int16_t x, int16_t y, int16_t w){
+static void skb_add(skb_t *c, skb_kind_t kind, uint8_t row, uint8_t col){
     if(c->key_count>=SKB_MAX_KEYS) return;
     skb_key_t *k=&c->keys[c->key_count++];
     memset(k,0,sizeof *k);
     k->ctx=c; k->kind=kind; k->row=row; k->col=col;
     k->btn=lv_button_create(c->kb);
-    lv_obj_set_pos(k->btn,x,y);
-    lv_obj_set_size(k->btn,w,SKB_ROW_H);
-    lv_obj_set_ext_click_area(k->btn,1);   /* easier taps; 1px keeps zero overlap inside the 3-4px row gaps */
+    lv_obj_set_ext_click_area(k->btn,1);   /* easier taps; 1px keeps zero overlap inside the 2-4px row gaps */
     lv_obj_remove_flag(k->btn,LV_OBJ_FLAG_SCROLLABLE);
     ui_on(k->btn, skb_key_cb, LV_EVENT_CLICKED, k, "kbinput.skb_key", UI_CORE);
     if(kind==SKB_BKSP) ui_on(k->btn, skb_key_cb, LV_EVENT_LONG_PRESSED, k, "kbinput.skb_key.long", UI_CORE);   /* hold to clear all */
@@ -133,16 +196,17 @@ static void skb_add(skb_t *c, skb_kind_t kind, uint8_t row, uint8_t col,
     lv_obj_set_style_bg_color(k->btn,TC(KEY_SURFACE),0);
     lv_obj_set_style_bg_color(k->btn,TC(KEY_PRESSED),LV_STATE_PRESSED);
     lv_obj_set_style_bg_color(k->btn,TC(KEY_SELECTED),LV_STATE_CHECKED);
+    if(kind==SKB_SHIFT) lv_obj_set_style_opa(k->btn,LV_OPA_40,LV_STATE_DISABLED);   /* greyed out on the Hebrew page */
     lv_obj_set_style_pad_all(k->btn,0,0);
     k->label=lv_label_create(k->btn);
     lv_obj_set_style_text_font(k->label,TF(UI_16),0);
     lv_obj_set_style_text_color(k->label,TC(KEY_TEXT),0);
 }
-static lv_obj_t *skb_create(lv_obj_t *parent, lv_obj_t *ta, void (*submit)(void)){
+static skb_t *skb_create(lv_obj_t *parent, lv_obj_t *ta, void (*submit)(void), int heb){
     skb_t *c=lv_malloc(sizeof *c);
     if(!c) return NULL;
     memset(c,0,sizeof *c);
-    c->ta=ta; c->submit=submit; c->mode=SKB_LOWER;
+    c->ta=ta; c->submit=submit; c->heb=(uint8_t)heb; c->mode=heb?SKB_HEB:SKB_LOWER;
     c->kb=lv_obj_create(parent);
     lv_obj_set_size(c->kb,SKB_W,SKB_H);
     lv_obj_set_pos(c->kb,0,SKB_Y);
@@ -151,28 +215,31 @@ static lv_obj_t *skb_create(lv_obj_t *parent, lv_obj_t *ta, void (*submit)(void)
     lv_obj_set_style_border_width(c->kb,0,0);
     lv_obj_set_style_pad_all(c->kb,0,0);
     lv_obj_add_event_cb(c->kb,skb_del_cb,LV_EVENT_DELETE,c);
+    /* every key any page needs is made once; skb_layout() places them per page and hides the extra ones */
     for(uint8_t row=0;row<4;row++){
-        const skb_rowl_t *r=&skb_rows[row];
-        int16_t x=(SKB_W - skb_row_w(r))/2;
-        int16_t y=r->y - SKB_Y;
-        for(uint8_t col=0;col<r->count;col++){
-            int16_t w = r->widths ? r->widths[col] : r->key_w;
+        for(uint8_t col=0;col<skb_row_keys[row];col++){
             skb_kind_t kind=SKB_CHAR;
             if(row==3){
                 switch(col){ case 0:kind=SKB_SHIFT;break; case 1:kind=SKB_MODE;break;
                              case 2:kind=SKB_SPACE;break; case 3:kind=SKB_BKSP;break;
                              default:kind=SKB_OK; }
             }
-            skb_add(c,kind,row,col,x,y,w);
-            x += w + r->gap;
+            skb_add(c,kind,row,col);
         }
     }
+    skb_layout(c);
     skb_refresh(c);
-    return c->kb;
+    return c;
+}
+/* globe button: English <-> Hebrew letters (from a number page too) */
+static void skb_set_lang(skb_t *c, int heb){
+    c->heb = (uint8_t)heb;
+    skb_set_mode(c, heb ? SKB_HEB : SKB_LOWER);
 }
 
 /* ---- modal wrapper ------------------------------------------------------- */
 static lv_obj_t *g_modal, *g_ta;
+static skb_t *g_skb;
 static kbinput_done_cb_t g_done;
 static int g_keep_spaces;   /* password entry: trailing spaces are part of the secret, never stripped */
 
@@ -180,7 +247,7 @@ int kbinput_active(void){ return g_modal != NULL; }
 
 static void finish(const char *result){
     kbinput_done_cb_t cb = g_done; g_done = NULL;
-    if(g_modal){ lv_obj_delete_async(g_modal); g_modal = NULL; g_ta = NULL; }
+    if(g_modal){ lv_obj_delete_async(g_modal); g_modal = NULL; g_ta = NULL; g_skb = NULL; }
     if(cb) cb(result);
 }
 static void do_save(void){
@@ -192,11 +259,16 @@ static void do_save(void){
 }
 static void save_btn(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) do_save(); }
 static void cancel_btn(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) finish(NULL); }
+static void lang_btn(lv_event_t *e){
+    if(lv_event_get_code(e)!=LV_EVENT_CLICKED || !g_skb) return;
+    skb_set_lang(g_skb, !g_skb->heb);
+    cfg_set_int("kb_lang", g_skb->heb);   /* the next keyboard opens in this language */
+}
 
-static void pill(lv_obj_t *parent, int x, int y, const char *sym, lv_color_t col, lv_event_cb_t cb){
+static lv_obj_t *pill(lv_obj_t *parent, int x, int y, int w, const char *sym, lv_color_t col, lv_event_cb_t cb){
     lv_obj_t *b = lv_button_create(parent);
     lv_obj_remove_style_all(b);
-    lv_obj_set_size(b, 60, 36);
+    lv_obj_set_size(b, w, 36);
     lv_obj_align(b, LV_ALIGN_TOP_MID, x, y);
     lv_obj_set_ext_click_area(b, 8);   /* Save/Cancel sit in open space - generous hit area */
     lv_obj_set_style_radius(b, 18, 0);
@@ -208,6 +280,7 @@ static void pill(lv_obj_t *parent, int x, int y, const char *sym, lv_color_t col
     lv_label_set_text(l, sym);
     lv_obj_set_style_text_color(l, col, 0);
     lv_obj_center(l);
+    return l;
 }
 
 /* set by kbinput_open_password() for the next open only, then consumed/reset. */
@@ -219,6 +292,7 @@ void kbinput_open_password(const char *title, const char *initial, kbinput_done_
 void kbinput_open(const char *title, const char *initial, kbinput_done_cb_t cb){
     if(g_modal) finish(NULL);
     g_done = cb;
+    int masked = g_mask_next;
 
     g_modal = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(g_modal);
@@ -250,9 +324,14 @@ void kbinput_open(const char *title, const char *initial, kbinput_done_cb_t cb){
     { lv_obj_t *ta_lbl = lv_textarea_get_label(g_ta);   /* pin to the FONT's 24px line height so the text can't clip and centring can't drift */
       if(ta_lbl){ lv_obj_set_style_min_height(ta_lbl, 24, 0); lv_obj_set_style_max_height(ta_lbl, 24, 0); } }
 
-    /* Cancel / Save in the wide mid-band, above the keyboard */
-    pill(g_modal, -66, 108, LV_SYMBOL_CLOSE, TC(TEXT_SECONDARY), cancel_btn);
-    pill(g_modal,  66, 108, LV_SYMBOL_OK,    theme_def() ? TC(ACCENT_PRIMARY) : TC(STATUS_SUCCESS), save_btn);   /* confirm: go colour */
+    /* Cancel / Save in the wide mid-band, above the keyboard, with the language globe between them
+     * (not for a password: those stay English) */
+    pill(g_modal, -66, 108, 60, LV_SYMBOL_CLOSE, TC(TEXT_SECONDARY), cancel_btn);
+    pill(g_modal,  66, 108, 60, LV_SYMBOL_OK,    theme_def() ? TC(ACCENT_PRIMARY) : TC(STATUS_SUCCESS), save_btn);   /* confirm: go colour */
+    if(!masked){
+        lv_obj_t *globe = pill(g_modal, 0, 108, 36, "\xEF\x82\xAC", TC(TEXT_SECONDARY), lang_btn);   /* U+F0AC globe */
+        lv_obj_set_style_text_font(globe, &font_icon_globe_20, 0);
+    }
 
-    skb_create(g_modal, g_ta, do_save);   /* the keyboard's OK key also saves */
+    g_skb = skb_create(g_modal, g_ta, do_save, !masked && cfg_get_int("kb_lang", 0) == 1);   /* the keyboard's OK key also saves */
 }

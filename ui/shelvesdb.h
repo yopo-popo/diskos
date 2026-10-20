@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 diskOS contributors */
-/* shelvesdb - /usr/data/diskos/db/shelves.db, what the owner puts together: favourites now; playlists, album
+/* shelvesdb - /usr/data/diskos/db/shelves.db, what the owner puts together: favourites and playlists now; album
  * collections and their own genres later. It changes only when they edit something, so it lives apart from
  * listening.db (written on every song).
  *
@@ -19,7 +19,7 @@
 #endif
 #define SHELVES_BACKUP   SHELVES_BACKUP_DIR "/shelves.db"
 /* PRAGMA user_version of shelves.db; a file from a newer build is left alone */
-#define SHELVESDB_SCHEMA 1
+#define SHELVESDB_SCHEMA 2
 
 /* Is this song a favourite? 1 = yes, 0 = no, -1 = can't read. */
 int shdb_fav_get(const char *path, long long start_ms);
@@ -28,6 +28,42 @@ int shdb_fav_set(const char *path, long long start_ms, int on, const char *title
                  const char *album);
 /* Grows with every change, so a cache of favourite states knows when to ask again. */
 unsigned shdb_generation(void);
+
+/* ---- playlists and their folders ----
+ * A playlist is a name and its songs in order; a song may be in it more than once. Playlists and folders sit in a
+ * folder (0 = the top), each at a position there, and folders can hold folders. Playlist names are unique: they name
+ * the exported files. */
+typedef struct {
+    const char *path; long long start_ms;
+    const char *title, *album_artist, *album;   /* its snapshot (NULL = unknown) */
+} shdb_song;
+typedef struct {
+    int is_folder;
+    long long id;
+    char name[LDB_NAME];
+    int count;                 /* a playlist: its songs; a folder: the playlists and folders in it */
+} shdb_entry;
+/* The folders and playlists in a folder (0 = the top), in their order there. Returns how many (*out is malloc'd: free
+ * it), -1 = can't read. */
+int shdb_pl_list(long long folder_id, shdb_entry **out);
+/* A new, empty playlist at the end of a folder (0 = the top). Its id; 0 = the name is taken, -1 = failed. */
+long long shdb_pl_create(const char *name, long long folder_id);
+long long shdb_pl_find(const char *name);                  /* the playlist's id; 0 = none, -1 = can't read */
+int shdb_name(int is_folder, long long id, char *out, int cap);   /* a playlist's or folder's name; 1 = found, 0 = none, -1 = can't read */
+int shdb_pl_rename(long long id, const char *name);        /* 1 = done, 0 = the name is taken, -1 = failed */
+int shdb_pl_delete(long long id);                          /* 1 = done */
+/* Add songs at the end, in order: all or none. Returns how many, -1 = failed. */
+int shdb_pl_add(long long id, const shdb_song *songs, int n);
+int shdb_pl_has(long long id, const char *path, long long start_ms);   /* times the song is in it; -1 = can't read */
+int shdb_pl_remove(long long item_id);                     /* one entry (ldb_item.row_id); 1 = done */
+long long shdb_folder_create(const char *name, long long parent_id);   /* its id, -1 = failed */
+int shdb_folder_rename(long long id, const char *name);    /* 1 = done */
+int shdb_folder_delete(long long id);                      /* what it holds moves up to its parent. 1 = done */
+/* Move a playlist (is_folder 0) or a folder to the end of folder_id (0 = the top). A folder never goes into itself
+ * or a folder inside it. 1 = done, 0 = not allowed, -1 = failed. */
+int shdb_move(int is_folder, long long id, long long folder_id);
+/* The folder a playlist or folder is in: its id, 0 = the top, -1 = no such item. */
+long long shdb_parent(int is_folder, long long id);
 
 /* Open shelves.db now (taking in the SD card's copy when it is new). 1 = open. */
 int shdb_ready(void);

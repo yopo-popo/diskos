@@ -37,6 +37,8 @@
 #include "opustitle_worker.h"
 #include "fwcaps.h"
 #include "musicdb.h"
+#include "player_mq.h"   /* our queue on the stock player */
+#include "queuemenu.h"   /* its entries in the hold menu */
 #include "prof.h"
 #include "lvgl/src/drivers/evdev/lv_evdev.h"
 #include "config.h"
@@ -46,6 +48,7 @@
 #include "sdio.h"
 #include "art.h"
 #include "power.h"
+#include "itemmenu.h"   /* the hold menu: modal, like the sleep popover */
 
 void mclock_sync(int backlight_on);
 void ui_np_title_scroll(int visible);
@@ -871,6 +874,7 @@ static int book_session_active(void);   /* fwd: an audiobook is the active playb
  * applied one, which Up Next needs to pick the right order. Every 0102 send goes through send_play_mode. */
 static int g_mode_applied = -2;
 static int send_play_mode(int mode){
+    if(mode == 1 && player_owns()) mode = 0;   /* our queue shuffles itself; the player's Shuffle would play its own order (LIST_SONG_3) */
     char m[16]; snprintf(m, sizeof m, "0102000C%04X", mode & 0xFFFF);
     int rc = ipc_send_cmd(m);
     g_mode_applied = (rc == 0 && mode >= 0 && mode <= 4) ? mode : -1;
@@ -1476,6 +1480,8 @@ static int ui_play_list_ex(int list_type, const char *name, int pos1, int build_
      * UNFILTERED SONG table. If a .m4b hasn't migrated out yet, it would leak into that queue - so ensure
      * migration first, and refuse the play (rather than queue a book) if it still can't complete. */
     if(list_type != 5 && !books_ensure_migrated()){ ui_toast("Library is finishing setup - try again"); return 0; }
+    /* the player builds a list of its own: the queue's adapter leaves it alone, and the player's own Shuffle is back */
+    if(player_release() && !g_book_single_mode) send_play_mode(cfg_get_int("work_mode", 0));
     ui_cancel_book_resume();   /* a new list play supersedes any pending audiobook resume seek */
     ui_disarm_book_eoc();      /* explicit navigation disarms any end-of-chapter sleep (so a later path change can only be an auto-rollover) */
     g_book_noadopt_until = lv_tick_get() + 4000;   /* the player may still report the OLD book while this play loads -> don't adopt it */
@@ -1555,26 +1561,42 @@ int ui_play_playlist(long pid, int pos){
     pos = ppos;
     return ui_play_list(5, "", pos);                        /* seq 0 = reserved slot, now the playlist */
 }
-/* Up Next: play the song at 1-based position ord1 of the CURRENT queue (LIST_SONG_0 ID order - the same index in
- * shuffle, device-verified). A type-0 jump: no rebuild, so the loaded scope stays valid. Refused while a rebuild is
- * pending (the list being jumped in may not be the one on screen). Same local-play preamble rule as ui_play_list. */
-int ui_queue_jump(int ord1){
+/* A type-0 jump to the song at 1-based position ord1 of the player's CURRENT queue (LIST_SONG_0 ID order - the same
+ * index in shuffle, device-verified): no rebuild, so the loaded list stays. fresh = the queue's adapter (player_mq.c) has
+ * just written that list, so this starts a new list: it gets ui_play_list's bookkeeping and the local work-mode a play
+ * from an idle player needs (as ui_play_plan sends it). Otherwise it is refused while a rebuild is pending (the list
+ * being jumped in may not be the one on screen). Same local-play preamble rule as ui_play_list. 0 = sent. */
+static int queue_jump_send(int ord1, int fresh){
     if(modes_output_busy()){ ui_toast("Switching output - try again"); return -1; }
     if(!ui_local_playback_allowed()){ ui_toast("Return to local playback first"); return -1; }
-    if(g_play_pending){ ui_toast("Queue is updating - try again"); return -1; }
+    if(!fresh && g_play_pending){ ui_toast("Queue is updating - try again"); return -1; }
     if(ord1 < 1 || ord1 > 0xFFFF) return -1;
     ui_cancel_book_resume();
     ui_disarm_book_eoc();
+    if(fresh){
+        g_book_noadopt_until = lv_tick_get() + 4000;   /* the player may still report the OLD book while this loads */
+        g_book_single_mode = 0;
+        send_play_mode(cfg_get_int("work_mode", 0));    /* the user's mode (a book left Single); Shuffle goes as Sequential */
+        if(ui_get_source_mode() == 0 && !g_route_mac[0]) ipc_send_cmd("0657000C0008");
+    }
     if(fw_needs_localplayer_init() && ui_get_source_mode() == 0 && !g_route_mac[0] && !g_playing && !play_recent()){
         modes_local_init(0);   /* 0666 local route (6 internal, 4 SPDIF, 3 + 0642 5 USB audio), then 0657 8 LOCALPLAYER work-mode */
     }
     ui_note_transport_sent();
     char f[24]; snprintf(f, sizeof f, "0100%04X%04X0000", 16, (ord1 - 1) & 0xFFFF);
+    track_state_t cur; ipc_get_state(&cur);   /* snapshot BEFORE the send: the player's reply may already update the state */
     int rc = ipc_send_cmd(f);
-    if(rc == 0) play_note_sent();
-    fprintf(stderr, "queue jump pos=%d -> %s (rc=%d)\n", ord1, f, rc); fflush(stderr);
+    if(rc == 0){
+        play_note_sent();
+        if(fresh){ play_request_arm(&cur, g_playing); ui_toast("Starting..."); }
+    } else if(fresh) ui_toast("Couldn't start playback");
+    fprintf(stderr, "queue jump pos=%d%s -> %s (rc=%d)\n", ord1, fresh ? " (new list)" : "", f, rc); fflush(stderr);
     return rc;
 }
+/* Up Next: play the song at 1-based position ord1 of the current queue. 0 = sent. */
+int ui_queue_jump(int ord1){ return queue_jump_send(ord1, 0); }
+/* The queue's adapter starts the list it has written into LIST_SONG_0, at row ord1. 1 = sent. */
+int ui_play_row(int ord1, int fresh){ return queue_jump_send(ord1, fresh) == 0; }
 /* Play `song_id` through a play plan (musicdb mdb_album_plan): a stock queue (type 3/7) when the plan found one that
  * holds exactly the visible songs, else the exact reserved-slot queue (type 5), whose real order is adopted before
  * the position is taken. Returns 1 if a play was sent (0 when ui_play_list_ex refused it or the send failed). Never sends a position computed against a different list. */
@@ -3259,6 +3281,9 @@ int main(int argc, char **argv){
     lv_timer_create(hwclock_save_tick, 300000, NULL); /* write system time back to the RTC every 5 min */
     lv_timer_create(clock_tick, 10000, NULL);   /* refresh wall clock every 10s */
     lv_timer_create(book_tick, 400, NULL);   /* drive the audiobook session: confirm load, resume, checkpoint */
+    queue_open(NULL);                           /* the play queue, in listening.db */
+    player_init();                              /* keep the player's list (LIST_SONG_0) in step with it */
+    queuemenu_init();                           /* Play now, Play next, Add to queue in the hold menu */
     clock_tick(NULL);                           /* set immediately */
     g_t_status = lv_timer_create(status_poll_cb, 3000, NULL); /* charging/battery/wifi every 3s (BT every ~12s inside); paused at screen-off */
     status_poll_cb(NULL);                        /* populate immediately */
@@ -3365,6 +3390,7 @@ int main(int argc, char **argv){
     int sx=0, sy=0, lastx=0, lasty=0; uint32_t sms=0; int s_press_scr=SCR_HOME;   /* swipe tracking + the screen the press began on */
     int cover_tap=0;   /* press on Now Playing's art while its controls are hidden -> LVGL's tap shows them (not a seek) */
     int sleep_touch=0; /* press began while the sleep popover was up -> swallow the whole gesture (no ring seek) */
+    int wall_held=0;   /* this press already held the cover flow's centre cover (its menu opened): the release is not a tap */
     playstate_t g_ps = { -1, 0 }; int last_playing=-1;   /* play/pause inference (playstate.c, host-tested) */
     char np_last_path[256] = "";   /* last track whose art/backdrop was pushed - so a mere position tick doesn't re-invalidate the 360px backdrop */
     /* the Screen Off time comes from the Settings cycler (index -> seconds via TMAP; 0 = never), re-read each
@@ -3542,7 +3568,7 @@ int main(int argc, char **argv){
             npmenu_set(st.have_track ? &st : NULL, playing, ui_current_thumb_src());
         }
         /* turn Now Playing's art only while it's the visible, playing, lit screen */
-        ui_np_spin(playing && screen_current()==SCR_NOWPLAYING && bl_state==0);
+        ui_np_spin(playing && ui_np_turns_on(screen_current()) && bl_state==0);
 
         /* surface silent failures (sticky flags persist until the screen is on, so a
          * failure during screen-off is shown on wake rather than lost). */
@@ -3598,8 +3624,8 @@ int main(int argc, char **argv){
                     sx=p.x; sy=p.y; lastx=p.x; lasty=p.y; sms=lv_tick_get();
                     g_press_sx = g_press_lx = p.x; g_press_sy = g_press_ly = p.y;
                     s_press_scr=screen_current();   /* a gesture belongs to the screen it STARTED on */
-                    cover_tap = 0;
-                    sleep_touch = ui_np_overlay_active(); /* latch: the sleep popover owns this whole gesture */
+                    cover_tap = 0; wall_held = 0;
+                    sleep_touch = ui_np_overlay_active() || itemmenu_is_open(); /* latch: the sleep popover or the hold menu owns this whole gesture */
                     if(sleep_touch){
                         /* a modal overlay is up -> LVGL handles it; arm no ring seek / rim scroll here */
                     } else if(screen_current()==SCR_NOWPLAYING){
@@ -3622,7 +3648,15 @@ int main(int argc, char **argv){
             } else if(ts==LV_INDEV_STATE_PRESSED){
                 last_activity = lv_tick_get();
                 lastx=p.x; lasty=p.y; g_press_lx=p.x; g_press_ly=p.y;
-                if(screen_current()==SCR_NOWPLAYING && !sleep_touch) ui_np_seek_move(p.x, p.y);
+                if(itemmenu_is_open()){ /* the hold menu opened during this press: nothing moves under it */ }
+                else if(!wall_held && !sleep_touch && s_press_scr==SCR_ALBUMWALL && screen_current()==SCR_ALBUMWALL &&
+                        rim_state==RIM_IDLE && p.x-sx < 18 && sx-p.x < 18 && p.y-sy < 18 && sy-p.y < 18 &&
+                        sx>=100 && sx<=260 && sy>=76 && sy<=214 && lv_tick_elaps(sms) >= 400){
+                    wall_held = 1;   /* a still hold on the centre cover: its menu now, finger still down, as list rows do */
+                    albumwall_drag_cancel(); albumwall_settle();
+                    albumwall_hold();
+                }
+                else if(screen_current()==SCR_NOWPLAYING && !sleep_touch) ui_np_seek_move(p.x, p.y);
                 else if(rim_move(p.x, p.y)){ /* rim drag owns the gesture (list or cover flow) */ }
                 else if(screen_current()==SCR_ALBUMWALL && rim_state==RIM_IDLE) albumwall_drag(p.x);  /* linear drag only when no rim gesture is armed */
             } else if(ts==LV_INDEV_STATE_RELEASED && prev_ts==LV_INDEV_STATE_PRESSED){
@@ -3646,7 +3680,7 @@ int main(int argc, char **argv){
                      * merely started there is not LVGL's (its tap ignores slides), so it still falls
                      * through to nav (edge pull / options). */
                     int cover_tap_gesture = cover_tap && adx < 20 && ady < 20;
-                    int lvgl_owned = cover_tap_gesture || sleep_touch;
+                    int lvgl_owned = cover_tap_gesture || sleep_touch || itemmenu_is_open() || wall_held;   /* (a hold menu opened mid-press) */
                     /* a committed seek on Now Playing consumes the gesture. Replay the (fused) final
                      * position through the move handler first so the ring commits the release point, not
                      * the last PRESSED sample. */
@@ -3667,20 +3701,23 @@ int main(int argc, char **argv){
                     } else if(cur==SCR_NOWPLAYING){
                         /* On Now Playing a nav swipe must be a LONG, STRAIGHT,
                          * horizontal slide (so it's not confused with a seek drag
-                         * along the ring): right = hub, left = back. */
+                         * along the ring): leftward = Lyrics (music only), rightward = Options. */
                         if(adx >= NP_NAV_DIST && adx > ady*NP_NAV_STRAIGHT && dt<900){
-                            if(dx < 0) screen_show(SCR_NPHUB);
-                            else       screen_back();
+                            if(dx > 0) screen_show(SCR_NPHUB);
+                            else if(!(st.path[0] && mdb_is_book_path(st.path))) lyrics_open();
                         }
+                    } else if(((cur==SCR_LYRICS && dx>0) || (cur==SCR_NPHUB && dx<0)) && horiz &&
+                              adx>=g_swipe_thresh && dt<700){
+                        screen_back();   /* Now Playing's side pages: a swipe back toward it, from anywhere */
                     } else if(cur==SCR_ALBUMWALL && s_press_scr==SCR_ALBUMWALL){
                         /* gated on s_press_scr so the very tap that OPENED the cover flow (a click on the
                          * Library "Albums" row) is never re-read here as a cover tap that plays. */
                         if(sx < BACK_START_MAX_X && horiz && dx>0 && adx>=g_swipe_thresh && dt<700){
                             albumwall_drag_cancel();            /* left-edge right-swipe = back (drag wasn't armed here) */
-                            screen_back();
+                            if(!library_link_back()) screen_back();   /* a linked artist's wall: Library's place before */
                         } else if(adx<18 && ady<18 && sx>=100 && sx<=260 && sy>=76 && sy<=214 && dt<900){
                             albumwall_drag_cancel();            /* a still touch on the centre cover = tap */
-                            if(dt >= 500) albumwall_play();     /* long-press the cover = play the whole album */
+                            if(dt >= 400) albumwall_hold();     /* long-press the cover = the album's menu (normally opened while still held, above) */
                             else          albumwall_open();     /* tap the cover = open the album's track list */
                         } else {
                             albumwall_drag(lastx);              /* apply the (fused) final finger position first */
@@ -3689,8 +3726,9 @@ int main(int argc, char **argv){
                     } else if(horiz && dx>0 && adx>=g_swipe_thresh && dt<700 &&
                               sx < BACK_START_MAX_X){
                         fprintf(stderr,"BACK swipe sx=%d dx=%d dy=%d dt=%u\n",sx,dx,dy,dt); fflush(stderr);
-                        /* inside Library, step through its sub-views first */
-                        if(!(cur==SCR_LIBRARY && library_back())) screen_back();
+                        /* inside Library step through its sub-views, in Files up one folder, first */
+                        if(!(cur==SCR_LIBRARY && library_back()) && !(cur==SCR_FOLDER && folderbrowser_back()) &&
+                           !(cur==SCR_ALBUMWALL && library_link_back())) screen_back();
                     }
                     }
                 }

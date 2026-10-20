@@ -151,6 +151,9 @@ static void anim_done_push(lv_anim_t *a)
     scrim_off();
 }
 
+/* Now Playing's strip: -1 Options, 0 Now Playing, +1 Lyrics; 2 = not in it. */
+static int np_strip(int scr){ return scr == SCR_NPHUB ? -1 : scr == SCR_NOWPLAYING ? 0 : scr == SCR_LYRICS ? 1 : 2; }
+
 /* Slide between screens. dir = +1 push (new from right), -1 pop (new from left), +2 / -2 section switch
  * (the new section slides in from below / from above). */
 static void transition(int from, int to, int dir)
@@ -184,6 +187,7 @@ static void transition(int from, int to, int dir)
         if (dir == 2 || dir == -2) library_return();   /* back from another section: keep the scroll too */
         else library_enter();
     }
+    if (to == SCR_LYRICS || to == SCR_NPHUB) ui_np_backdrop_sync();   /* Now Playing's art behind its side pages */
 
     kit_pass(nw);   /* the active theme styles anything new on the incoming screen (no-op for Default) */
     mclock_sync(ui_screen_backlight_on()); /* set the incoming colon before its root becomes visible */
@@ -210,6 +214,21 @@ static void transition(int from, int to, int dir)
     /* Full-screen overlays (the quick-settings pulldown) are takeovers, not hierarchical
      * navigation - show/hide instantly. */
     if (to == SCR_QUICK || from == SCR_QUICK) { show_raw(to); return; }
+
+    /* Now Playing's strip (Options on its left, Lyrics on its right) scrolls as one: both pages move together, and
+     * nothing dims or edges them. */
+    if (od && np_strip(from) != 2 && np_strip(to) != 2) {
+        int x = np_strip(to) > np_strip(from) ? SCR_W : -SCR_W;   /* the page on the right comes in from the right */
+        lv_obj_clear_flag(od, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_x(nw, x);
+        lv_obj_clear_flag(nw, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(nw);
+        s_push_hide = from;
+        anim_page_slide(od, 0, -x, PUSH_MS, NULL);
+        anim_page_slide(nw, x, 0, PUSH_MS, anim_done_push);
+        ui_np_title_scroll(ui_screen_backlight_on());
+        return;
+    }
 
     /* ---- UNIFIED push/pop - ONE motion language for the whole UI ----------------------------
      * The top screen SLIDES horizontally over a STATIC screen beneath (a blit - the only smooth
@@ -383,7 +402,7 @@ void screen_show(int which)
         transition(from, which, -1);
         return;
     }
-    if (which != from) push(s_sec, which);
+    if (s_top[s_sec] != which) push(s_sec, which);   /* (the top is the current screen, unless a link reset the stack) */
     s_current = which;
     transition(from, which, +1);
 }
@@ -396,6 +415,40 @@ void screen_back(void)
     int prev = s_stack[s_sec][--s_sp[s_sec]];
     s_top[s_sec] = s_current = prev;
     transition(from, prev, -1);
+}
+
+/* Unwind the current section's whole stack to its root (back slide). Nothing stacked: no-op. The root can
+ * already be showing on top of its own stack (a cover-flow album opens in SCR_LIBRARY): just drop the stack. */
+void screen_section_home(void)
+{
+    int root = s_sec_root[s_sec], from = s_current;
+    if (s_sp[s_sec] <= 0) return;
+    s_sp[s_sec] = 0;
+    s_top[s_sec] = s_current = root;
+    if (from != root) transition(from, root, -1);
+}
+
+void screen_section_get(int root, int *sp, int *top)
+{
+    int sec = sec_of_root(root);
+    if (sec < 0) return;
+    *sp = s_sp[sec]; *top = s_top[sec];
+}
+void screen_section_set(int root, int sp, int top)
+{
+    int sec = sec_of_root(root);
+    if (sec < 0 || sp < 0 || sp >= STACK_CAP || top < 0 || top >= SCR_COUNT) return;
+    s_sp[sec] = sp; s_top[sec] = top;
+}
+void screen_section_back_to(int root, int sp, int top)
+{
+    int sec = sec_of_root(root);
+    if (sec < 0) return;
+    screen_section_set(root, sp, top);
+    if (sec != s_sec) return;
+    int from = s_current;
+    s_current = s_top[sec];
+    transition(from, s_current, -1);   /* the same screen (a cover flow in place) is rebuilt and shown at once */
 }
 
 lv_obj_t *screen_get_root(int which)
@@ -458,6 +511,10 @@ void screens_init(void)
     s_roots[SCR_ALBUMWALL] = screen_make_root(parent);
     s_roots[SCR_UPNEXT] = screen_make_root(parent);
     s_roots[SCR_DATETIME] = screen_make_root(parent);
+    /* Now Playing's strip has no card edge: its pages scroll side by side */
+    lv_obj_set_style_border_opa(s_roots[SCR_NOWPLAYING], LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(s_roots[SCR_NPHUB], LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(s_roots[SCR_LYRICS], LV_OPA_TRANSP, 0);
 
     /* depth scrim: a full-screen translucent-black overlay, created LAST so it sits above the
      * roots in sibling order; re-parented in z during a transition to dim the screen beneath the

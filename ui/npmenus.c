@@ -9,6 +9,8 @@
 #include "musicdb.h"
 #include "ipc.h"
 #include "favourites.h"
+#include "playlists.h"
+#include "itemmenu.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,7 +26,7 @@ int ui_label_set_changed(lv_obj_t *obj, const char *txt);   /* ui.c: a label's t
 
 /* ---- shared current-track context (set from main.c) --------------------- */
 static char g_path[256];
-static int  g_fav, g_have, g_pos_id;
+static int  g_fav, g_have;
 static lv_obj_t *g_fav_lbl;
 
 static void fav_refresh(void){   /* every playback update: the text only when it changed */
@@ -34,7 +36,6 @@ void npmenu_set(const track_state_t *st, int playing, const void *thumb_src){
     (void)playing; (void)thumb_src;
     g_have = st && st->have_track;
     snprintf(g_path,   sizeof g_path,   "%s", g_have ? st->path   : "");
-    g_pos_id = g_have ? st->pos_id : 0;
     g_fav = g_have ? fav_current(st) : 0;
     fav_refresh();
 }
@@ -79,32 +80,23 @@ static lv_obj_t *panel_list(lv_obj_t *root){
 
 /* ---- context menu (SCR_NPMENU) ------------------------------------------ */
 static void ctx_info_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED){ screen_show(SCR_SONGINFO); } }
-static void ctx_lyrics_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED){ lyrics_open(); } }
 static void ctx_album_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
     /* drill the library's album for this track (its path), not the player's metadata album string, which may
      * not match the library and show an empty list */
     char aa[LDB_NAME], album[LDB_NAME];
     if(!ldb_song_album(g_path, -1, aa, sizeof aa, album, sizeof album)){ ui_toast("No album info"); return; }
-    library_open_album(aa, album); screen_show(SCR_LIBRARY);
+    library_open_album(aa, album);   /* opens Library on it */
 }
 static void ctx_artist_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
     /* the library's artist for this track (its path), as the Artists list names it in its grouping */
     char a[LDB_NAME];
     if(!ldb_song_artist(g_path, -1, mdb_artist_mode(), a, sizeof a)){ ui_toast("No artist info"); return; }
-    library_open_artist(a); screen_show(SCR_LIBRARY);
+    library_open_artist(a);   /* opens Library on their albums */
 }
-static void plpick_reload(void);
 static void ctx_addpl_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    if(!g_path[0]){ ui_toast("No song to add"); return; }   /* nothing playing/loaded */
-    /* read the player's pos_id NOW (not the value cached at the last refresh): a track change since then would name the wrong row */
-    track_state_t now; ipc_get_state(&now);
-    if(now.have_track && strcmp(now.path, g_path) == 0) g_pos_id = now.pos_id; else g_pos_id = 0;
-    plpick_set_song(g_path, g_pos_id, now.have_track ? now.title : "");   /* add the current track (just that CUE/ISO track if it is one) */
-    plpick_reload();                  /* refresh list + clear any old toast */
-    screen_show(SCR_PLPICK);
+    if(lv_event_get_code(e)==LV_EVENT_CLICKED) playlists_add_current();   /* the song playing now (just its CUE/ISO track) */
 }
 static void ctx_fav_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
@@ -128,196 +120,22 @@ void npmenu_create(lv_obj_t *root){
     menu_row(list, "Go to Artist",    ctx_artist_cb, NULL);
 }
 
-/* ---- add-to-playlist picker (SCR_PLPICK) -------------------------------- */
-static char g_pick_path[256];
-/* what the picker adds: one song (g_pick_path; a CUE/ISO sub-track when g_pick_sub, by g_pick_track), or a whole
- * ALBUM/ARTIST/GENRE group (g_pick_col/g_pick_val, set by plpick_set_group) */
-static int  g_pick_sub, g_pick_track;
-static int  g_pick_unsure;   /* a CUE/ISO file whose playing track could not be identified: adding is refused */
-static char g_pick_col[8], g_pick_val[MDB_STR];
-static int *g_pick_ids, g_pick_nids;   /* or exactly these SONG.IDs (set by plpick_set_ids) */
-static lv_obj_t *g_pick_list;
-static lv_obj_t *g_pick_toast;
-void plpick_set_song(const char *path, int pos_id, const char *title){
-    snprintf(g_pick_path, sizeof g_pick_path, "%s", path?path:"");
-    g_pick_col[0] = g_pick_val[0] = 0; free(g_pick_ids); g_pick_ids = NULL; g_pick_nids = 0;
-    g_pick_sub = g_pick_path[0] && mdb_song_subtrack_verified(g_pick_path, pos_id, title, &g_pick_track, NULL, NULL);
-    /* the path alone names several tracks and none was established: never add them all */
-    g_pick_unsure = g_pick_path[0] && !g_pick_sub && mdb_song_multi(g_pick_path);
-}
-void plpick_set_group(const char *col, const char *val){
-    g_pick_path[0] = 0; g_pick_sub = 0; g_pick_unsure = 0; free(g_pick_ids); g_pick_ids = NULL; g_pick_nids = 0;
-    snprintf(g_pick_col, sizeof g_pick_col, "%s", col?col:"");
-    snprintf(g_pick_val, sizeof g_pick_val, "%s", val?val:"");
-    plpick_reload();                  /* refresh list + clear any old toast (the caller then shows SCR_PLPICK) */
-}
-void plpick_set_ids(const int *ids, int n){
-    free(g_pick_ids); g_pick_ids = NULL; g_pick_nids = 0;
-    g_pick_path[0] = 0; g_pick_sub = 0; g_pick_unsure = 0; g_pick_col[0] = g_pick_val[0] = 0;
-    if(ids && n > 0 && (size_t)n <= ((size_t)-1) / sizeof(int) && (g_pick_ids = malloc((size_t)n * sizeof(int)))){
-        memcpy(g_pick_ids, ids, (size_t)n * sizeof(int)); g_pick_nids = n;
-    }
-    plpick_reload();
-}
-static int pick_have(void){ return g_pick_path[0] || g_pick_nids > 0 || (g_pick_col[0] && g_pick_val[0]); }
-static int pick_has_song(long pid){
-    return g_pick_sub ? mdb_playlist_has_subtrack(pid, g_pick_path, g_pick_track) : mdb_playlist_has_song(pid, g_pick_path);
-}
-/* add the pending song or group; returns rows added (a group adds many, a song 0 or 1) */
-static int pick_add_to(long pid){
-    if(g_pick_path[0])
-        return g_pick_sub ? mdb_playlist_add_subtrack(pid, g_pick_path, g_pick_track, NULL) : mdb_playlist_add_song(pid, g_pick_path);
-    if(g_pick_nids > 0){ int r = mdb_playlist_add_ids(pid, g_pick_ids, g_pick_nids); return r < 0 ? 0 : r; }
-    return mdb_playlist_add_group(pid, g_pick_col, g_pick_val);
-}
+/* Public: dismiss transient popups on any screen navigation (the hold menu, Add to playlist's dialogs), so none can
+ * float onto a later screen and act on stale state. Called from the screen-manager transition. */
+void npmenu_close_transients(void){ itemmenu_close(); plpick_close_transients(); }
 
-static lv_timer_t *g_pick_timer;
-static void pick_toast_hide_cb(lv_timer_t *t){
-    if(g_pick_toast) lv_obj_add_flag(g_pick_toast, LV_OBJ_FLAG_HIDDEN);
-    lv_timer_delete(t);
-    g_pick_timer = NULL;
-}
-static void pick_toast(const char *msg){
-    if(!g_pick_toast) return;
-    lv_label_set_text(lv_obj_get_child(g_pick_toast,0), msg);
-    lv_obj_clear_flag(g_pick_toast, LV_OBJ_FLAG_HIDDEN);
-    /* auto-dismiss after 2.2s (one-shot: the cb deletes the timer) */
-    if(g_pick_timer) lv_timer_delete(g_pick_timer);
-    g_pick_timer = lv_timer_create(pick_toast_hide_cb, 2200, NULL);
-}
-/* 1 (after a toast) when the pending song is an unidentified track of a CUE/ISO file */
-static int pick_refuse_unsure(void){
-    if(!g_pick_unsure) return 0;
-    pick_toast("Couldn't identify this track - try again while it plays");
-    return 1;
-}
-static void pick_added_toast(int n, const char *one, const char *fail){
-    if(g_pick_path[0]){ pick_toast(n ? one : fail); return; }
-    if(n > 0){ char m[40]; snprintf(m, sizeof m, "Added %d songs", n); pick_toast(m); }
-    else pick_toast("Nothing new to add");
-}
-/* duplicate-confirm dialog */
-static lv_obj_t *g_dup_dlg;
-static long g_dup_pid;
-static void dup_close(void){ if(g_dup_dlg){ lv_obj_del(g_dup_dlg); g_dup_dlg=NULL; } }
-/* Public: dismiss transient popups on any screen navigation, so the duplicate-add
- * confirm dialog (on lv_layer_top, no scrim) can't float onto a later screen and act
- * on a stale g_dup_pid/g_pick_path. Called from the screen-manager transition. */
-void npmenu_close_transients(void){ dup_close(); }
-static void dup_add_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    dup_close();
-    /* "Add anyway" on a KNOWN duplicate: the song is in the playlist either way, so
-     * "Kept in playlist" is accurate; only invalidate the scope if the row actually changed. */
-    if(g_pick_path[0]) pick_add_to(g_dup_pid);
-    pick_toast("Kept in playlist");
-}
-static void dup_cancel_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) dup_close(); }
-static lv_obj_t *dlg_btn(lv_obj_t *p, int y, const char *txt, lv_color_t bg, lv_color_t fg, lv_event_cb_t cb){
-    lv_obj_t *b = lv_button_create(p);
-    lv_obj_remove_style_all(b);
-    lv_obj_set_size(b, 200, 38);
-    lv_obj_set_ext_click_area(b, 4);   /* 38px pill -> ~46px touch target */
-    lv_obj_align(b, LV_ALIGN_TOP_MID, 0, y);
-    lv_obj_set_style_radius(b, 12, 0);
-    lv_obj_set_style_bg_color(b, bg, 0);
-    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
-    ui_on(b, cb, LV_EVENT_CLICKED, NULL, "npmenus.cb", UI_CORE);
-    lv_obj_t *l = lv_label_create(b); lv_label_set_text(l, tr(txt));
-    lv_obj_set_style_text_font(l, TF(UI_16), 0);
-    lv_obj_set_style_text_color(l, fg, 0); lv_obj_center(l);
-    return b;
-}
-static void show_dup(long pid){
-    g_dup_pid = pid;
-    dup_close();
-    g_dup_dlg = lv_obj_create(lv_layer_top());
-    lv_obj_remove_style_all(g_dup_dlg);
-    lv_obj_set_size(g_dup_dlg, 248, 184);
-    lv_obj_center(g_dup_dlg);
-    lv_obj_set_style_radius(g_dup_dlg, 16, 0);
-    lv_obj_set_style_bg_color(g_dup_dlg, TC(SURFACE), 0);
-    lv_obj_set_style_bg_opa(g_dup_dlg, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(g_dup_dlg, 1, 0);
-    lv_obj_set_style_border_color(g_dup_dlg, TC(BORDER), 0);
-    lv_obj_clear_flag(g_dup_dlg, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t *t = lv_label_create(g_dup_dlg);
-    lv_label_set_text(t, tr("Already in this playlist"));
-    lv_obj_set_style_text_font(t, TF(UI_16), 0);
-    lv_obj_set_style_text_color(t, TC(TEXT_PRIMARY), 0);
-    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 24);
-    dlg_btn(g_dup_dlg, 70,  "Add anyway", TC(SURFACE_RAISED), TC(TEXT_PRIMARY), dup_add_cb);
-    dlg_btn(g_dup_dlg, 116, "Cancel",     TC(SURFACE_RAISED), TC(TEXT_MUTED), dup_cancel_cb);
-}
-static void pick_add_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    long pid = (long)(intptr_t)lv_event_get_user_data(e);
-    if(!pick_have() || pick_refuse_unsure()) return;
-    if(g_pick_path[0] && pick_has_song(pid)){ show_dup(pid); return; }   /* a group skips its own duplicates */
-    int n = pick_add_to(pid);
-    pick_added_toast(n, "Added to playlist", "Couldn't add");
-}
-static void pick_newname_done(const char *name){
-    if(!name || !name[0]) return;
-    if(pick_refuse_unsure()) return;   /* before creating a playlist that would stay empty */
-    long pid = mdb_playlist_create(name);
-    plpick_reload();
-    if(pid <= 0){ pick_toast("Couldn't create"); return; }
-    if(pick_have()){
-        int n = pick_add_to(pid);
-        pick_added_toast(n, "Created + added", "Created (song not added)");
-    } else
-        pick_toast("Playlist created");
-}
-static void pick_new_cb(lv_event_t *e){
-    if(lv_event_get_code(e)==LV_EVENT_CLICKED) kbinput_open("Playlist name", "", pick_newname_done);
-}
-static void plpick_reload(void){
-    if(!g_pick_list) return;
-    if(g_pick_timer){ lv_timer_delete(g_pick_timer); g_pick_timer = NULL; }
-    if(g_pick_toast) lv_obj_add_flag(g_pick_toast, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clean(g_pick_list);
-    menu_row(g_pick_list, LV_SYMBOL_PLUS "  New Playlist", pick_new_cb, NULL);
-    /* size to the real playlist count (no 64 cap). pick_add_cb takes the id by value, so
-     * names/ids are only needed during this build loop -> malloc + free here. */
-    int num = mdb_playlist_num();
-    int okn = num>0 && (size_t)num <= ((size_t)-1) / MDB_STR;   /* 32-bit multiply overflow guard */
-    char (*names)[MDB_STR] = okn ? malloc((size_t)num*MDB_STR)     : NULL;
-    long  *ids            = okn ? malloc((size_t)num*sizeof(long)) : NULL;
-    int n = (names && ids) ? mdb_playlists(names, ids, num) : 0;
-    for(int i=0;i<n;i++)
-        menu_row(g_pick_list, names[i], pick_add_cb, (void*)(intptr_t)ids[i]);
-    free(names); free(ids);
-}
-void plpick_create(lv_obj_t *root){
-    panel_header(root, "Add to Playlist");
-    g_pick_list = panel_list(root);
-    /* a small confirmation toast */
-    g_pick_toast = lv_obj_create(root);
-    lv_obj_remove_style_all(g_pick_toast);
-    lv_obj_set_size(g_pick_toast, 220, 36);
-    lv_obj_align(g_pick_toast, LV_ALIGN_BOTTOM_MID, 0, -18);
-    lv_obj_set_style_radius(g_pick_toast, 18, 0);
-    lv_obj_set_style_bg_color(g_pick_toast, TC(SURFACE_RAISED), 0);
-    lv_obj_set_style_bg_opa(g_pick_toast, LV_OPA_COVER, 0);
-    lv_obj_t *tl = lv_label_create(g_pick_toast);
-    lv_obj_set_style_text_color(tl, TC(TEXT_PRIMARY), 0);
-    lv_obj_set_style_text_font(tl, TF(UI_14), 0);
-    lv_obj_center(tl);
-    lv_obj_add_flag(g_pick_toast, LV_OBJ_FLAG_HIDDEN);
-    plpick_reload();
-}
-
-/* ---- Now Playing hub (SCR_NPHUB): swipe-right page. Secondary actions for
- * the current track (play-mode & favorite live on the Now Playing screen). - */
+/* ---- Now Playing hub (SCR_NPHUB, "Options"): the page left of Now Playing (a rightward swipe). Secondary
+ * actions for the current track (play-mode & favorite live on the Now Playing screen). - */
 static void hub_eq_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED){ screen_show(SCR_TUNE); } }
 
 static void hub_sleep_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) ui_sleep_popover(); }
 static void hub_chapters_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) chapters_open(); }
+static void hub_settings_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) screen_show(SCR_SETTINGS); }
 
 static lv_obj_t *g_hub_list;
 /* (Re)populate the hub for the current track. Books get Chapters and drop the music-only entries
- * (Lyrics / Go to Album / Go to Artist / Add to Playlist) that make no sense for a single audiobook. */
+ * (Go to Album / Go to Artist / Add to Playlist) that make no sense for a single audiobook. Lyrics is the page
+ * right of Now Playing (a leftward swipe), not a row. */
 static void nphub_populate(void){
     if(!g_hub_list) return;
     lv_obj_clean(g_hub_list);
@@ -329,31 +147,27 @@ static void nphub_populate(void){
         menu_row(g_hub_list, "Book details",    ctx_info_cb,     NULL);   /* Song Info screen, relabelled for books */
         menu_row(g_hub_list, "Sleep Timer",     hub_sleep_cb,    NULL);
         menu_row(g_hub_list, "Equalizer",       hub_eq_cb,       NULL);
+        menu_row(g_hub_list, "Settings",        hub_settings_cb, NULL);
     } else {
         menu_row(g_hub_list, "Equalizer",       hub_eq_cb,     NULL);
         menu_row(g_hub_list, "Song Info",       ctx_info_cb,   NULL);
-        menu_row(g_hub_list, "Lyrics",          ctx_lyrics_cb, NULL);
         menu_row(g_hub_list, "Go to Album",     ctx_album_cb,  NULL);
         menu_row(g_hub_list, "Go to Artist",    ctx_artist_cb, NULL);
         menu_row(g_hub_list, "Add to Playlist", ctx_addpl_cb,  NULL);
+        menu_row(g_hub_list, "Settings",        hub_settings_cb, NULL);
     }
 }
 void nphub_refresh(void){ nphub_populate(); }   /* called on each SCR_NPHUB show (screenmgr) */
 
 void nphub_create(lv_obj_t *root){
-    panel_header(root, "Options");
+    lv_obj_set_style_bg_color(root, TC(CANVAS), 0);
+    lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+    ui_np_backdrop(root, SCR_NPHUB);   /* Now Playing's blurred art, turning (the page left of Now Playing) */
     g_hub_list = panel_list(root);
+    lv_obj_set_pos(g_hub_list, 46, 0); lv_obj_set_size(g_hub_list, 280, 360);   /* the whole page: no header */
+    lv_obj_set_style_pad_top(g_hub_list, 70, 0);   /* rows clear of the round bezel at both ends */
+    lv_obj_set_style_pad_bottom(g_hub_list, 70, 0);
     nphub_populate();
-    /* page dots - the hub is the right page (Now Playing is the left) */
-    for(int i=0;i<2;i++){
-        lv_obj_t *dot = lv_obj_create(root);
-        lv_obj_remove_style_all(dot);
-        lv_obj_set_size(dot, 7, 7);
-        lv_obj_align(dot, LV_ALIGN_BOTTOM_MID, i==0 ? -8 : 8, -10);
-        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(dot, (i==1 ? TC(PAGE_DOT_ACTIVE) : TC(PAGE_DOT_INACTIVE)), 0);
-        lv_obj_set_style_bg_opa(dot, i==1 ? LV_OPA_COVER : LV_OPA_60, 0);
-    }
 }
 
 /* ---- tuning menu (SCR_TUNE): Play Mode + Equalizer cyclers --------------- */

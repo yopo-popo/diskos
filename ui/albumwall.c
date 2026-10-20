@@ -8,6 +8,7 @@
 #include "config.h"
 #include "theme_kit.h"
 #include "i18n.h"
+#include "itemmenu.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -364,13 +365,17 @@ void albumwall_drag_end(void){                           /* release: throw a few
     uint32_t dur = (uint32_t)(dist*120.0f) + 130; if(dur > 700) dur = 700;
     aw_anim_to(target, dur);
 }
-void albumwall_play(void){
+/* Hold the centre cover: the album's menu (itemmenu), as a hold on an album row. */
+void albumwall_hold(void){
     if(g_nalb<=0) return;
-    cfg_set_int("work_mode",0); ui_set_workmode(0);
     const ldb_item *a = &g_alb.v[g_cur];
-    int ok = g_scope < 0 ? library_play_album(a->artist, a->title)
-                         : library_wall_play(g_scope, g_scope_key, a->artist, a->title);   /* an artist's wall: their songs on it */
-    if(ok) screen_show(SCR_NOWPLAYING);
+    im_item it;
+    memset(&it, 0, sizeof it);
+    it.kind = IM_ALBUM; it.where = IM_IN_LIBRARY;
+    snprintf(it.title, sizeof it.title, "%s", a->title ? a->title : "");
+    snprintf(it.album_artist, sizeof it.album_artist, "%s", a->artist ? a->artist : "");
+    snprintf(it.album, sizeof it.album, "%s", a->title ? a->title : "");
+    itemmenu_open(&it);
 }
 void albumwall_open(void){
     if(g_nalb<=0) return;
@@ -515,7 +520,6 @@ void albumwall_poll_sync(int lit){
 }
 
 /* ---- lifecycle ---------------------------------------------------------------------------------- */
-static void aw_back_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) screen_back(); }
 static lv_obj_t *aw_img(void){ lv_obj_t *im = lv_image_create(g_root); lv_obj_add_flag(im, LV_OBJ_FLAG_HIDDEN); return im; }
 
 /* An artist's wall: [ All Songs ] under the counter, the Artists list's "All Songs" row */
@@ -563,6 +567,18 @@ void albumwall_open_all(void){
     g_scope = -1; g_scope_key[0] = 0;
     g_cur = g_cur_all;
 }
+/* A link's saved place (library.c): which wall (every album or an artist's) and the album at its centre. Set: the next
+ * entry shows that wall again, its albums read again if they changed. */
+_Static_assert(sizeof(((albumwall_place *)0)->key) == LDB_NAME, "albumwall_place.key holds an LDB_NAME");
+void albumwall_place_get(albumwall_place *p){
+    p->scope = g_scope; p->cur = g_cur; p->cur_all = g_cur_all;
+    snprintf(p->key, sizeof p->key, "%s", g_scope_key);
+}
+void albumwall_place_set(const albumwall_place *p){
+    if(p->scope != g_scope || strcmp(p->key, g_scope_key)){ ldb_list_free(&g_alb); g_nalb = 0; }
+    g_scope = p->scope; snprintf(g_scope_key, sizeof g_scope_key, "%s", p->key);
+    g_cur = p->cur; g_cur_all = p->cur_all;
+}
 
 void albumwall_create(lv_obj_t *root){
     g_root = root;
@@ -593,7 +609,7 @@ void albumwall_refresh(void){
     for(int c=0;c<AW_CARDS;c++){ g_front[c]=NULL; g_side[c]=NULL; }
     lv_obj_set_style_bg_color(g_root, TC(CANVAS), 0);
     lv_obj_set_style_bg_opa(g_root, LV_OPA_COVER, 0);
-    lv_obj_t *title = ui_header_cb(g_root, "Albums", aw_back_cb);
+    lv_obj_t *title = library_header(g_root, "Albums");   /* back arrow / title: Library's top page */
     if(g_scope >= 0) theme_title_text(title, g_scope_key[0] ? g_scope_key : "Unknown artist");   /* an artist's wall */
 
     /* the album list, read again only when a scan replaced library.db (the sprites were dropped above either way) */

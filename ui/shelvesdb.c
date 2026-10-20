@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 diskOS contributors */
-/* shelvesdb - favourites in shelves.db, and its copy on the SD card (see shelvesdb.h). */
+/* shelvesdb - favourites and playlists in shelves.db, and its copy on the SD card (see shelvesdb.h). */
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <errno.h>
 #include <time.h>
@@ -27,7 +29,26 @@ static const char *SCHEMA =
     " id INTEGER PRIMARY KEY,"
     " track_ref_id INTEGER NOT NULL UNIQUE REFERENCES track_refs (id),"
     " added_at INTEGER NOT NULL);"
-    "PRAGMA user_version = 1;";
+    /* version 2: playlists and their folders (parent / folder NULL = the top). Names compare without case: exported
+     * files named "Rock" and "rock" would be one file on the card. */
+    "CREATE TABLE IF NOT EXISTS playlist_folders ("
+    " id INTEGER PRIMARY KEY, name TEXT NOT NULL,"
+    " parent_id INTEGER REFERENCES playlist_folders (id),"
+    " position INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);"
+    "CREATE TABLE IF NOT EXISTS playlists ("
+    " id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,"
+    " folder_id INTEGER REFERENCES playlist_folders (id),"
+    " position INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);"
+    "CREATE TABLE IF NOT EXISTS playlist_items ("
+    " id INTEGER PRIMARY KEY,"
+    " playlist_id INTEGER NOT NULL REFERENCES playlists (id) ON DELETE CASCADE,"
+    " track_ref_id INTEGER NOT NULL REFERENCES track_refs (id),"
+    " position INTEGER NOT NULL, added_at INTEGER NOT NULL);"
+    "CREATE INDEX IF NOT EXISTS playlist_items_in_order ON playlist_items (playlist_id, position);"
+    "CREATE INDEX IF NOT EXISTS playlist_items_by_song ON playlist_items (track_ref_id);"
+    "CREATE INDEX IF NOT EXISTS playlists_in_folder ON playlists (folder_id);"
+    "CREATE INDEX IF NOT EXISTS playlist_folders_in_folder ON playlist_folders (parent_id);"
+    "PRAGMA user_version = 2;";
 
 /* The card's copy (attached as b) into this file: its songs, then its favourites in its order, older than the ones made
  * here before the card came (those stay newest; one in both moves up to its newer place). */
@@ -41,6 +62,29 @@ static const char *MERGE_SQL =
     " JOIN main.track_refs r ON r.path = br.path AND r.start_ms = br.start_ms ORDER BY f.id;"
     "INSERT OR REPLACE INTO favourites (track_ref_id, added_at) SELECT track_ref_id, added_at FROM merge_local ORDER BY rowid;"
     "DROP TABLE merge_local;";
+/* A version 2 copy's folders and playlists too, after MERGE_SQL brought its songs. They keep their ids shifted past
+ * this file's, and go before the ones made here. A playlist whose name is taken here comes in as "Name (2)". */
+static const char *MERGE_PLAYLISTS_SQL =
+    "CREATE TEMP TABLE merge_off AS SELECT"
+    " (SELECT IFNULL(MAX(id), 0) FROM main.playlist_folders) AS f, (SELECT IFNULL(MAX(id), 0) FROM main.playlists) AS p,"
+    " (SELECT IFNULL(MAX(position), -1) + 1 FROM (SELECT position FROM b.playlist_folders WHERE parent_id IS NULL"
+    "  UNION ALL SELECT position FROM b.playlists WHERE folder_id IS NULL)) AS top;"
+    "UPDATE main.playlist_folders SET position = position + (SELECT top FROM merge_off) WHERE parent_id IS NULL;"
+    "UPDATE main.playlists SET position = position + (SELECT top FROM merge_off) WHERE folder_id IS NULL;"
+    "INSERT INTO playlist_folders (id, name, parent_id, position, created_at)"
+    " SELECT bf.id + o.f, bf.name, bf.parent_id + o.f, bf.position, bf.created_at FROM b.playlist_folders bf CROSS JOIN merge_off o;"
+    "INSERT OR IGNORE INTO playlists (id, name, folder_id, position, created_at, updated_at)"
+    " SELECT bp.id + o.p, CASE WHEN EXISTS (SELECT 1 FROM main.playlists m WHERE m.name = bp.name) THEN bp.name || ' (2)'"
+    " ELSE bp.name END, bp.folder_id + o.f, bp.position, bp.created_at, bp.updated_at FROM b.playlists bp CROSS JOIN merge_off o;"
+    "INSERT INTO playlist_items (playlist_id, track_ref_id, position, added_at)"
+    " SELECT bi.playlist_id + o.p, r.id, bi.position, bi.added_at FROM b.playlist_items bi CROSS JOIN merge_off o"
+    " JOIN b.track_refs br ON br.id = bi.track_ref_id JOIN main.track_refs r ON r.path = br.path AND r.start_ms = br.start_ms"
+    " WHERE bi.playlist_id + o.p IN (SELECT id FROM main.playlists) ORDER BY bi.id;"
+    "DROP TABLE merge_off;";
+/* songs nothing uses any more */
+static const char *PRUNE_REFS =
+    "DELETE FROM track_refs WHERE id NOT IN (SELECT track_ref_id FROM favourites)"
+    " AND id NOT IN (SELECT track_ref_id FROM playlist_items);";
 
 static sqlite3 *g_db;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -95,12 +139,13 @@ static int merge_attached(sqlite3 *d, int attach_rc){
         fprintf(stderr, "shelvesdb: %s is from a newer version (%lld); not copying to the card\n", SHELVES_BACKUP, v);
         return 0;
     }
-    if(v != SHELVESDB_SCHEMA){                               /* unreadable or empty: nothing to take in */
+    if(v < 1){                                               /* unreadable or empty: nothing to take in */
         fprintf(stderr, "shelvesdb: %s can't be read; the next copy replaces it\n", SHELVES_BACKUP);
         return sqlite3_exec(d, "UPDATE meta SET value = 1 WHERE key = 'backup_seen';", 0, 0, 0) == SQLITE_OK;
     }
     if(sqlite3_exec(d, "BEGIN IMMEDIATE;", 0, 0, 0) != SQLITE_OK) return 0;
     if(sqlite3_exec(d, MERGE_SQL, 0, 0, 0) == SQLITE_OK
+       && (v < 2 || sqlite3_exec(d, MERGE_PLAYLISTS_SQL, 0, 0, 0) == SQLITE_OK)
        && sqlite3_exec(d, "UPDATE meta SET value = 1 WHERE key = 'backup_seen';", 0, 0, 0) == SQLITE_OK
        && sqlite3_exec(d, "COMMIT;", 0, 0, 0) == SQLITE_OK){
         fprintf(stderr, "shelvesdb: took in %s\n", SHELVES_BACKUP);
@@ -197,7 +242,8 @@ static sqlite3 *db_locked(void){
     /* a rollback journal (not WAL): written rarely, and the file itself is always the whole state */
     long long v = query_int(d, "PRAGMA user_version;");
     int ok = v == SHELVESDB_SCHEMA;
-    if(v == 0 && sqlite3_exec(d, "BEGIN IMMEDIATE;", 0, 0, 0) == SQLITE_OK){
+    /* new, or from an older build: the schema only adds, so running it again brings an old file up to date */
+    if(v >= 0 && v < SHELVESDB_SCHEMA && sqlite3_exec(d, "BEGIN IMMEDIATE;", 0, 0, 0) == SQLITE_OK){
         ok = sqlite3_exec(d, SCHEMA, 0, 0, 0) == SQLITE_OK && sqlite3_exec(d, "COMMIT;", 0, 0, 0) == SQLITE_OK;
         if(!ok) sqlite3_exec(d, "ROLLBACK;", 0, 0, 0);
     }
@@ -224,65 +270,282 @@ void shdb_close(void){
 }
 unsigned shdb_generation(void){ return atomic_load(&g_gen); }
 
+/* ---- changes ---- */
+/* Every change: begin_change takes g_mu and a write transaction (NULL = can't); end_change commits (ok) or rolls back,
+ * releases g_mu and, when something changed, copies the file to the card. */
+static sqlite3 *begin_change(void){
+    pthread_mutex_lock(&g_mu);
+    sqlite3 *d = db_locked();
+    return d && sqlite3_exec(d, "BEGIN IMMEDIATE;", 0, 0, 0) == SQLITE_OK ? d : NULL;
+}
+static int end_change(sqlite3 *d, int ok){
+    if(d && ok) ok = sqlite3_exec(d, "COMMIT;", 0, 0, 0) == SQLITE_OK;
+    if(d && !ok) sqlite3_exec(d, "ROLLBACK;", 0, 0, 0);
+    ok = d && ok;
+    if(ok) atomic_fetch_add(&g_gen, 1);
+    pthread_mutex_unlock(&g_mu);
+    if(ok) backup_soon();
+    return ok;
+}
+
+/* Prepares sql with its parameters ?1.. from fmt: 'i' a long long, 'n' a long long with 0 bound as NULL (the top
+ * folder), 't' a string (NULL or "" bound as NULL). NULL = can't. */
+static sqlite3_stmt *prep(sqlite3 *d, const char *sql, const char *fmt, va_list ap){
+    sqlite3_stmt *st = NULL;
+    if(!d || sqlite3_prepare_v2(d, sql, -1, &st, NULL) != SQLITE_OK){ sqlite3_finalize(st); return NULL; }
+    for(int i = 0; fmt[i]; i++){
+        if(fmt[i] == 't'){
+            const char *t = va_arg(ap, const char *);
+            if(t && t[0]) sqlite3_bind_text(st, i + 1, t, -1, SQLITE_TRANSIENT); else sqlite3_bind_null(st, i + 1);
+        } else {
+            long long v = va_arg(ap, long long);
+            if(fmt[i] == 'n' && v <= 0) sqlite3_bind_null(st, i + 1); else sqlite3_bind_int64(st, i + 1, v);
+        }
+    }
+    return st;
+}
+/* Runs a statement that returns no rows. 1 = done. */
+static int execf(sqlite3 *d, const char *sql, const char *fmt, ...){
+    va_list ap; va_start(ap, fmt);
+    sqlite3_stmt *st = prep(d, sql, fmt, ap);
+    va_end(ap);
+    int ok = st && sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    return ok;
+}
+/* The first column of a query's first row; dflt when it has no row, -1 when it fails. */
+static long long intf(sqlite3 *d, long long dflt, const char *sql, const char *fmt, ...){
+    va_list ap; va_start(ap, fmt);
+    sqlite3_stmt *st = prep(d, sql, fmt, ap);
+    va_end(ap);
+    long long v = -1;
+    if(st){
+        int rc = sqlite3_step(st);
+        v = rc == SQLITE_ROW ? sqlite3_column_int64(st, 0) : rc == SQLITE_DONE ? dflt : -1;
+    }
+    sqlite3_finalize(st);
+    return v;
+}
+#define NOW "CAST(strftime('%s', 'now') AS INTEGER)"
+/* the song's row; a known snapshot value replaces the old one. ?1 path, ?2 start, ?3.. title, album artist, album */
+#define UPSERT_REF \
+    "INSERT INTO track_refs (path, start_ms, title, album_artist, album_title) VALUES (?1, ?2, ?3, ?4, ?5)" \
+    " ON CONFLICT (path, start_ms) DO UPDATE SET title = COALESCE(excluded.title, title)," \
+    " album_artist = COALESCE(excluded.album_artist, album_artist)," \
+    " album_title = COALESCE(excluded.album_title, album_title);"
+
 /* ---- favourites ---- */
 int shdb_fav_get(const char *path, long long start_ms){
     if(!path || !path[0]) return 0;
     pthread_mutex_lock(&g_mu);
+    long long n = intf(db_locked(), 0, "SELECT 1 FROM favourites f JOIN track_refs r ON r.id=f.track_ref_id"
+                                       " WHERE r.path=?1 AND r.start_ms=?2;", "ti", path, start_ms > 0 ? start_ms : 0);
+    pthread_mutex_unlock(&g_mu);
+    return (int)n;
+}
+int shdb_fav_set(const char *path, long long start_ms, int on, const char *title, const char *album_artist,
+                 const char *album){
+    if(!path || !path[0]) return 0;
+    if(start_ms < 0) start_ms = 0;
+    sqlite3 *d = begin_change();
+    int ok = d != NULL;
+    if(ok && on)   /* the song's row, then the favourite; already one = no change */
+        ok = execf(d, UPSERT_REF, "tittt", path, start_ms, title, album_artist, album)
+          && execf(d, "INSERT OR IGNORE INTO favourites (track_ref_id, added_at)"
+                      " SELECT id, " NOW " FROM track_refs WHERE path=?1 AND start_ms=?2;", "ti", path, start_ms);
+    else if(ok)    /* the favourite, then the song's row when nothing else uses it */
+        ok = execf(d, "DELETE FROM favourites WHERE track_ref_id IN (SELECT id FROM track_refs WHERE path=?1 AND start_ms=?2);",
+                   "ti", path, start_ms)
+          && execf(d, "DELETE FROM track_refs WHERE path=?1 AND start_ms=?2 AND id NOT IN (SELECT track_ref_id FROM favourites)"
+                      " AND id NOT IN (SELECT track_ref_id FROM playlist_items);", "ti", path, start_ms);
+    return end_change(d, ok);
+}
+
+/* ---- playlists and their folders ---- */
+/* the next position at the end of folder ?1 (NULL = the top) */
+#define END_OF_FOLDER \
+    "(SELECT IFNULL(MAX(p), -1) + 1 FROM (SELECT position AS p FROM playlists WHERE folder_id IS ?1" \
+    " UNION ALL SELECT position FROM playlist_folders WHERE parent_id IS ?1))"
+
+int shdb_pl_list(long long folder_id, shdb_entry **out){
+    *out = NULL;
+    pthread_mutex_lock(&g_mu);
+    sqlite3_stmt *st = NULL;
+    int n = -1;
     sqlite3 *d = db_locked();
-    sqlite3_stmt *st = NULL; int r = -1;
-    if(d && sqlite3_prepare_v2(d, "SELECT 1 FROM favourites f JOIN track_refs r ON r.id=f.track_ref_id"
-                                  " WHERE r.path=?1 AND r.start_ms=?2;", -1, &st, NULL) == SQLITE_OK){
-        sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
-        sqlite3_bind_int64(st, 2, start_ms > 0 ? start_ms : 0);
+    if(d && sqlite3_prepare_v2(d,
+        "SELECT 1, f.id, f.name, (SELECT count(*) FROM playlists WHERE folder_id = f.id)"
+        " + (SELECT count(*) FROM playlist_folders c WHERE c.parent_id = f.id), f.position"
+        " FROM playlist_folders f WHERE f.parent_id IS ?1"
+        " UNION ALL SELECT 0, p.id, p.name, (SELECT count(*) FROM playlist_items WHERE playlist_id = p.id), p.position"
+        " FROM playlists p WHERE p.folder_id IS ?1 ORDER BY 5, 1 DESC, 2;", -1, &st, NULL) == SQLITE_OK){
+        if(folder_id > 0) sqlite3_bind_int64(st, 1, folder_id); else sqlite3_bind_null(st, 1);
+        shdb_entry *v = NULL; int cap = 0, rc;
+        n = 0;
+        while((rc = sqlite3_step(st)) == SQLITE_ROW){
+            if(n == cap){
+                int nc = cap ? cap * 2 : 32;
+                shdb_entry *p = realloc(v, (size_t)nc * sizeof *v);
+                if(!p){ rc = SQLITE_NOMEM; break; }
+                v = p; cap = nc;
+            }
+            shdb_entry *e = &v[n++];
+            e->is_folder = sqlite3_column_int(st, 0);
+            e->id = sqlite3_column_int64(st, 1);
+            const unsigned char *name = sqlite3_column_text(st, 2);
+            snprintf(e->name, sizeof e->name, "%s", name ? (const char *)name : "");
+            e->count = sqlite3_column_int(st, 3);
+        }
+        if(rc != SQLITE_DONE){ free(v); v = NULL; n = -1; }
+        *out = v;
+    }
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&g_mu);
+    return n;
+}
+
+long long shdb_pl_create(const char *name, long long folder_id){
+    if(!name || !name[0]) return -1;
+    sqlite3 *d = begin_change();
+    long long taken = intf(d, 0, "SELECT 1 FROM playlists WHERE name = ?1;", "t", name), id = -1;
+    int ok = taken == 0
+          && execf(d, "INSERT INTO playlists (name, folder_id, position, created_at, updated_at)"
+                      " VALUES (?2, ?1, " END_OF_FOLDER ", " NOW ", " NOW ");", "nt", folder_id, name);
+    if(ok) id = sqlite3_last_insert_rowid(d);
+    if(!end_change(d, ok)) return taken == 1 ? 0 : -1;
+    return id;
+}
+long long shdb_pl_find(const char *name){
+    if(!name || !name[0]) return 0;
+    pthread_mutex_lock(&g_mu);
+    long long id = intf(db_locked(), 0, "SELECT id FROM playlists WHERE name = ?1;", "t", name);
+    pthread_mutex_unlock(&g_mu);
+    return id;
+}
+int shdb_name(int is_folder, long long id, char *out, int cap){
+    if(cap > 0) out[0] = 0;
+    pthread_mutex_lock(&g_mu);
+    sqlite3 *d = db_locked();
+    sqlite3_stmt *st = NULL;
+    int r = -1;
+    if(d && sqlite3_prepare_v2(d, is_folder ? "SELECT name FROM playlist_folders WHERE id = ?1;"
+                                            : "SELECT name FROM playlists WHERE id = ?1;", -1, &st, NULL) == SQLITE_OK){
+        sqlite3_bind_int64(st, 1, id);
         int rc = sqlite3_step(st);
-        r = rc == SQLITE_ROW ? 1 : rc == SQLITE_DONE ? 0 : -1;
+        if(rc == SQLITE_ROW){ snprintf(out, (size_t)cap, "%s", (const char *)sqlite3_column_text(st, 0)); r = 1; }
+        else if(rc == SQLITE_DONE) r = 0;
     }
     sqlite3_finalize(st);
     pthread_mutex_unlock(&g_mu);
     return r;
 }
-
-/* Prepares sql, binds the song as ?1/?2 and the text values as ?3.. (NULL or "" = NULL), steps it once. 1 = done. */
-static int run(sqlite3 *d, const char *sql, const char *path, long long start_ms, int ntext, const char *const *text){
-    sqlite3_stmt *st = NULL;
-    if(sqlite3_prepare_v2(d, sql, -1, &st, NULL) != SQLITE_OK) return 0;
-    sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 2, start_ms > 0 ? start_ms : 0);
-    for(int i = 0; i < ntext; i++){
-        if(text[i] && text[i][0]) sqlite3_bind_text(st, 3 + i, text[i], -1, SQLITE_STATIC);
-        else sqlite3_bind_null(st, 3 + i);
-    }
-    int ok = sqlite3_step(st) == SQLITE_DONE;
-    sqlite3_finalize(st);
-    return ok;
+int shdb_pl_rename(long long id, const char *name){
+    if(!name || !name[0]) return -1;
+    sqlite3 *d = begin_change();
+    long long taken = intf(d, 0, "SELECT 1 FROM playlists WHERE name = ?1 AND id <> ?2;", "ti", name, id);
+    int ok = taken == 0 && execf(d, "UPDATE playlists SET name = ?1, updated_at = " NOW " WHERE id = ?2;", "ti", name, id)
+          && sqlite3_changes(d) == 1;
+    if(!end_change(d, ok)) return taken == 1 ? 0 : -1;
+    return 1;
 }
-int shdb_fav_set(const char *path, long long start_ms, int on, const char *title, const char *album_artist,
-                 const char *album){
-    if(!path || !path[0]) return 0;
-    const char *snap[3] = { title, album_artist, album };
-    pthread_mutex_lock(&g_mu);
-    sqlite3 *d = db_locked();
-    int ok = d && sqlite3_exec(d, "BEGIN IMMEDIATE;", 0, 0, 0) == SQLITE_OK;
-    if(ok && on){
-        /* the song's row (a known snapshot value replaces the old one), then the favourite; already one = no change */
-        ok = run(d, "INSERT INTO track_refs (path, start_ms, title, album_artist, album_title) VALUES (?1, ?2, ?3, ?4, ?5)"
-                    " ON CONFLICT (path, start_ms) DO UPDATE SET title = COALESCE(excluded.title, title),"
-                    " album_artist = COALESCE(excluded.album_artist, album_artist),"
-                    " album_title = COALESCE(excluded.album_title, album_title);", path, start_ms, 3, snap)
-          && run(d, "INSERT OR IGNORE INTO favourites (track_ref_id, added_at)"
-                    " SELECT id, CAST(strftime('%s', 'now') AS INTEGER) FROM track_refs WHERE path=?1 AND start_ms=?2;",
-                 path, start_ms, 0, NULL);
-    } else if(ok){
-        /* the favourite, then the song's row when nothing else uses it */
-        ok = run(d, "DELETE FROM favourites WHERE track_ref_id IN (SELECT id FROM track_refs WHERE path=?1 AND start_ms=?2);",
-                 path, start_ms, 0, NULL)
-          && run(d, "DELETE FROM track_refs WHERE path=?1 AND start_ms=?2"
-                    " AND id NOT IN (SELECT track_ref_id FROM favourites);", path, start_ms, 0, NULL);
+int shdb_pl_delete(long long id){
+    sqlite3 *d = begin_change();
+    int ok = execf(d, "DELETE FROM playlists WHERE id = ?1;", "i", id) && sqlite3_changes(d) == 1   /* its songs go too */
+          && execf(d, PRUNE_REFS, "");
+    return end_change(d, ok);
+}
+int shdb_pl_add(long long id, const shdb_song *songs, int n){
+    if(n <= 0) return 0;
+    sqlite3 *d = begin_change();
+    long long pos = intf(d, -1, "SELECT IFNULL(MAX(position), -1) + 1 FROM playlist_items WHERE playlist_id = ?1;", "i", id);
+    int ok = pos >= 0 && execf(d, "UPDATE playlists SET updated_at = " NOW " WHERE id = ?1;", "i", id) && sqlite3_changes(d) == 1;
+    sqlite3_stmt *ref = NULL, *item = NULL;
+    ok = ok && sqlite3_prepare_v2(d, UPSERT_REF, -1, &ref, NULL) == SQLITE_OK
+            && sqlite3_prepare_v2(d, "INSERT INTO playlist_items (playlist_id, track_ref_id, position, added_at)"
+                                     " SELECT ?3, id, ?4, " NOW " FROM track_refs WHERE path = ?1 AND start_ms = ?2;",
+                                  -1, &item, NULL) == SQLITE_OK;
+    for(int i = 0; ok && i < n; i++){
+        const shdb_song *s = &songs[i];
+        long long start = s->start_ms > 0 ? s->start_ms : 0;
+        if(!s->path || !s->path[0]){ ok = 0; break; }
+        const char *snap[3] = { s->title, s->album_artist, s->album };
+        sqlite3_reset(ref); sqlite3_reset(item);
+        sqlite3_bind_text(ref, 1, s->path, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(ref, 2, start);
+        for(int k = 0; k < 3; k++)
+            if(snap[k] && snap[k][0]) sqlite3_bind_text(ref, 3 + k, snap[k], -1, SQLITE_STATIC); else sqlite3_bind_null(ref, 3 + k);
+        sqlite3_bind_text(item, 1, s->path, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(item, 2, start);
+        sqlite3_bind_int64(item, 3, id);
+        sqlite3_bind_int64(item, 4, pos + i);
+        ok = sqlite3_step(ref) == SQLITE_DONE && sqlite3_step(item) == SQLITE_DONE && sqlite3_changes(d) == 1;
     }
-    if(ok) ok = sqlite3_exec(d, "COMMIT;", 0, 0, 0) == SQLITE_OK;
-    if(!ok && d) sqlite3_exec(d, "ROLLBACK;", 0, 0, 0);
-    if(ok) atomic_fetch_add(&g_gen, 1);
+    sqlite3_finalize(ref); sqlite3_finalize(item);
+    return end_change(d, ok) ? n : -1;
+}
+int shdb_pl_has(long long id, const char *path, long long start_ms){
+    if(!path || !path[0]) return 0;
+    pthread_mutex_lock(&g_mu);
+    long long n = intf(db_locked(), 0, "SELECT count(*) FROM playlist_items i JOIN track_refs r ON r.id = i.track_ref_id"
+                                       " WHERE i.playlist_id = ?1 AND r.path = ?2 AND r.start_ms = ?3;",
+                       "iti", id, path, start_ms > 0 ? start_ms : 0);
     pthread_mutex_unlock(&g_mu);
-    if(ok) backup_soon();
-    return ok;
+    return (int)n;
+}
+int shdb_pl_remove(long long item_id){
+    sqlite3 *d = begin_change();
+    long long pid = intf(d, 0, "SELECT playlist_id FROM playlist_items WHERE id = ?1;", "i", item_id);
+    int ok = pid > 0 && execf(d, "DELETE FROM playlist_items WHERE id = ?1;", "i", item_id)
+          && execf(d, "UPDATE playlists SET updated_at = " NOW " WHERE id = ?1;", "i", pid)
+          && execf(d, PRUNE_REFS, "");
+    return end_change(d, ok);
+}
+
+long long shdb_folder_create(const char *name, long long parent_id){
+    if(!name || !name[0]) return -1;
+    sqlite3 *d = begin_change();
+    int ok = execf(d, "INSERT INTO playlist_folders (name, parent_id, position, created_at)"
+                      " VALUES (?2, ?1, " END_OF_FOLDER ", " NOW ");", "nt", parent_id, name);
+    long long id = ok ? sqlite3_last_insert_rowid(d) : -1;
+    return end_change(d, ok) ? id : -1;
+}
+int shdb_folder_rename(long long id, const char *name){
+    if(!name || !name[0]) return 0;
+    sqlite3 *d = begin_change();
+    int ok = execf(d, "UPDATE playlist_folders SET name = ?1 WHERE id = ?2;", "ti", name, id) && sqlite3_changes(d) == 1;
+    return end_change(d, ok);
+}
+int shdb_folder_delete(long long id){
+    sqlite3 *d = begin_change();
+    /* what it holds goes to the end of its parent, in the order it had */
+    long long parent = intf(d, -1, "SELECT IFNULL(parent_id, 0) FROM playlist_folders WHERE id = ?1;", "i", id);
+    long long base = parent < 0 ? -1 : intf(d, -1, "SELECT " END_OF_FOLDER ";", "n", parent);
+    int ok = base >= 0
+          && execf(d, "UPDATE playlists SET folder_id = ?1, position = ?2 + position WHERE folder_id = ?3;", "nii", parent, base, id)
+          && execf(d, "UPDATE playlist_folders SET parent_id = ?1, position = ?2 + position WHERE parent_id = ?3;", "nii", parent, base, id)
+          && execf(d, "DELETE FROM playlist_folders WHERE id = ?1;", "i", id);
+    return end_change(d, ok);
+}
+int shdb_move(int is_folder, long long id, long long folder_id){
+    sqlite3 *d = begin_change();
+    long long here = intf(d, -1, is_folder ? "SELECT IFNULL(parent_id, 0) FROM playlist_folders WHERE id = ?1;"
+                                           : "SELECT IFNULL(folder_id, 0) FROM playlists WHERE id = ?1;", "i", id);
+    /* a folder can't go into itself or anything inside it: walk up from the target */
+    long long loop = !is_folder || folder_id <= 0 ? 0
+        : intf(d, -1, "WITH RECURSIVE up(fid) AS (SELECT ?1 UNION ALL SELECT f.parent_id FROM playlist_folders f JOIN up"
+                      " ON f.id = up.fid WHERE f.parent_id IS NOT NULL) SELECT EXISTS (SELECT 1 FROM up WHERE fid = ?2);",
+               "ii", folder_id, id);
+    if(here < 0 || loop != 0){ end_change(d, 0); return here < 0 || loop < 0 ? -1 : 0; }
+    if(here == (folder_id > 0 ? folder_id : 0)){ end_change(d, 0); return 1; }   /* already there */
+    int ok = execf(d, is_folder ? "UPDATE playlist_folders SET parent_id = ?1, position = " END_OF_FOLDER " WHERE id = ?2;"
+                                : "UPDATE playlists SET folder_id = ?1, position = " END_OF_FOLDER " WHERE id = ?2;",
+                   "ni", folder_id, id);
+    return end_change(d, ok) ? 1 : -1;
+}
+long long shdb_parent(int is_folder, long long id){
+    pthread_mutex_lock(&g_mu);
+    long long p = intf(db_locked(), -1, is_folder ? "SELECT IFNULL(parent_id, 0) FROM playlist_folders WHERE id = ?1;"
+                                                  : "SELECT IFNULL(folder_id, 0) FROM playlists WHERE id = ?1;", "i", id);
+    pthread_mutex_unlock(&g_mu);
+    return p;
 }

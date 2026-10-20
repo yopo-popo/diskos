@@ -22,7 +22,6 @@ static int g_n, g_cap;
 static queue_unit **g_un;
 static int g_nu, g_ucap;
 static int g_cur = -1;
-static int64_t g_next_after;            /* add_next goes after this item while it is still upcoming */
 static unsigned g_ver = 1, g_edit_ver = 1;
 static int g_pos_ms, g_paused, g_saved_pos_ms, g_saved_paused;
 static int g_repeat, g_shuffle;
@@ -433,7 +432,6 @@ static void mem_clear(void){
     for(int i = 0; i < g_nu; i++) unit_free(g_un[i]);
     g_n = g_nu = 0;
     g_cur = -1;
-    g_next_after = 0;
     undo_clear();
 }
 
@@ -661,12 +659,10 @@ static int add_impl(int p, const queue_track *t, int n, const queue_album *album
     return 0;
 }
 
+/* Right after the playing song, so the latest add next always plays first (yopo 2026-10-20). */
 static int add_next_impl(const queue_track *t, int n, const queue_album *album){
-    int a = g_next_after ? queue_find(g_next_after) : -1;
-    int p = a > g_cur ? a + 1 : g_cur + 1;
-    int at, rc = add_impl(p, t, n, album, &at);
-    if(!rc) g_next_after = g_it[at + n - 1]->id;
-    return rc;
+    int at;
+    return add_impl(g_cur + 1, t, n, album, &at);
 }
 
 int queue_add_next(const queue_track *t, int n, const queue_album *unit){

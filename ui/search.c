@@ -4,6 +4,8 @@
 #include "theme.h"
 #include "theme_kit.h"
 #include "musicdb.h"
+#include "librarydb.h"
+#include "itemmenu.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -52,16 +54,40 @@ static char g_query[96];
 
 void search_set_song_click_cb(library_song_click_cb_t cb){ g_song_cb = cb; }
 
+/* The shown results (a copy: song.db's rows can be reloaded under them), for the hold menu. */
+static struct { int id, track; char title[MDB_STR]; } g_hit[MAX_RESULTS];
+static int g_nhit;
+
+/* Hold a result: the song's menu (itemmenu), as a hold on a Library song row. */
+static void result_hold(int i){
+    if(i < 0 || i >= g_nhit) return;
+    im_item it;
+    memset(&it, 0, sizeof it);
+    it.kind = IM_SONG; it.where = IM_IN_LIBRARY;
+    if(!mdb_song_path(g_hit[i].id, it.path, sizeof it.path)){ ui_toast("Couldn't find that song"); return; }
+    snprintf(it.title, sizeof it.title, "%s", g_hit[i].title);
+    long long st = 0;   /* a CUE/ISO track: its start in the file, by title, else by track number */
+    if(!ldb_track_start(it.path, g_hit[i].title, &st) && !(g_hit[i].track > 0 && ldb_track_start_at(it.path, g_hit[i].track, &st))) st = 0;
+    it.start_ms = st;
+    if(!ldb_song_album(it.path, st, it.album_artist, sizeof it.album_artist, it.album, sizeof it.album))
+        it.album_artist[0] = it.album[0] = 0;
+    itemmenu_open(&it);
+}
 static void result_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    int id = (int)(uintptr_t)lv_event_get_user_data(e);
+    lv_event_code_t c = lv_event_get_code(e);
+    if(c != LV_EVENT_SHORT_CLICKED && c != LV_EVENT_LONG_PRESSED) return;   /* not CLICKED: LVGL sends it after a hold too */
+    int i = (int)(uintptr_t)lv_event_get_user_data(e);
+    if(i < 0 || i >= g_nhit) return;
+    if(c == LV_EVENT_LONG_PRESSED){ result_hold(i); return; }
+    int id = g_hit[i].id;
     if(!g_song_cb || !g_song_cb(id)) return;   /* refused / not sent: already toasted, stay on the results */
     screen_show(SCR_NOWPLAYING);
 }
-static void back_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) screen_back(); }
+static void back_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) library_home(); }   /* Library's top page */
 
 static void rebuild(const char *q){
     lv_obj_clean(g_results);
+    g_nhit = 0;
     static const mdb_song_t *buf[MAX_RESULTS + 1];   /* +1 to detect "more than 80" vs "exactly 80" */
     int n = (q && q[0]) ? mdb_search(q, buf, MAX_RESULTS + 1) : 0;
     int shown = n > MAX_RESULTS ? MAX_RESULTS : n;
@@ -83,7 +109,11 @@ static void rebuild(const char *q){
         lv_obj_set_style_bg_opa(row, LV_OPA_70, LV_STATE_PRESSED);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        ui_on(row, result_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)s->id, "search.result", UI_CORE);
+        g_hit[i].id = s->id; g_hit[i].track = s->track;
+        snprintf(g_hit[i].title, sizeof g_hit[i].title, "%s", s->title);
+        g_nhit = i + 1;
+        ui_on(row, result_cb, LV_EVENT_SHORT_CLICKED, (void*)(uintptr_t)i, "search.result", UI_CORE);
+        ui_on(row, result_cb, LV_EVENT_LONG_PRESSED, (void*)(uintptr_t)i, "search.result.long", UI_CORE);
         lv_obj_t *t = lv_label_create(row);
         lv_label_set_text(t, s->title[0]?s->title:"Untitled");
         lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);

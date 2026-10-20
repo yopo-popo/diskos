@@ -514,10 +514,12 @@ static void title_fit(lv_obj_t *t, const char *text, const lv_font_t *f, int cy,
     }
 }
 static const lv_font_t *dot_smaller(const lv_font_t *f){ return f == TF(HEADER) ? TF(DATE) : NULL; }
+static lv_obj_t *g_header_back;   /* the back arrow of the header built last */
+lv_obj_t *ui_header_back(void){ return g_header_back; }
 lv_obj_t *ui_header_cb(lv_obj_t *root, const char *title, lv_event_cb_t back_cb){ return theme_kit()->header(root, tr(title), back_cb); }
 lv_obj_t *kit_default_header(lv_obj_t *root, const char *title, lv_event_cb_t back_cb)
 {
-    lv_obj_t *back = lv_button_create(root);
+    lv_obj_t *back = g_header_back = lv_button_create(root);
     lv_obj_remove_style_all(back);
     lv_obj_set_pos(back, 72, 24); lv_obj_set_size(back, 44, 40);   /* inset from the clipped corner */
     lv_obj_set_ext_click_area(back, 10);                            /* easier near the round bezel */
@@ -575,7 +577,7 @@ int ui_edge_nav(void){   /* 1 = this theme puts Back on the screen's left edge (
  * round screen's left edge at mid-height, raised above the body the screen builds after this call. */
 lv_obj_t *kit_edge_header(lv_obj_t *root, const char *title, lv_event_cb_t back_cb)
 {
-    lv_obj_t *back = lv_button_create(root);
+    lv_obj_t *back = g_header_back = lv_button_create(root);
     lv_obj_remove_style_all(back);
     /* 30 px wide with no extra reach: it stops where the screen's rows and sliders start (x 31), so a tap on a row's
      * left edge never goes Back; 80 px tall keeps the target easy to hit along the rim */
@@ -1112,13 +1114,67 @@ static void np_turn(lv_obj_t *img, const uint32_t *src, uint32_t *out, lv_image_
     lv_image_cache_drop(dsc);
     lv_obj_invalidate(img);
 }
-/* Turns the pictures that show to the current angle. */
+/* Now Playing's side pages (Lyrics, Options) show the same blurred art turning behind them: each page has its own
+ * image of g_np_outb, which np_draw turns while that page is the screen. */
+#define NP_BD_MAX 4
+static struct { lv_obj_t *img; int scr; } g_np_bd[NP_BD_MAX];
+static void np_bd_bind(lv_obj_t *o)
+{
+    int art = g_np_src != NULL;
+    if(art && lv_image_get_src(o) != &g_np_outb_dsc) lv_image_set_src(o, &g_np_outb_dsc);
+    np_vis(o, art);   /* no art: the page's own canvas */
+}
+static int np_bd_shown(void)
+{
+    if(!g_np_src) return 0;
+    int cur = screen_current();
+    for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img && g_np_bd[i].scr == cur) return 1;
+    return 0;
+}
+static void np_bd_invalidate(void)
+{
+    int cur = screen_current();
+    for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img && g_np_bd[i].scr == cur) lv_obj_invalidate(g_np_bd[i].img);
+}
+static void np_bd_deleted(lv_event_t *e)
+{
+    lv_obj_t *o = lv_event_get_target(e);
+    for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img == o) g_np_bd[i].img = NULL;
+}
+/* Turns the pictures that show to the current angle: Now Playing's own while it is the screen, and the blurred one
+ * also for a side page's backdrop. */
 static void np_draw(void)
 {
     if(!g_np_src || !g_np_art) return;
-    if(!lv_obj_has_flag(g_np_art, LV_OBJ_FLAG_HIDDEN)) np_turn(g_np_art, g_np_src, g_np_out, &g_np_out_dsc);
-    if(!lv_obj_has_flag(g_np_blur_img, LV_OBJ_FLAG_HIDDEN)) np_turn(g_np_blur_img, g_np_blur, g_np_outb, &g_np_outb_dsc);
+    int np = screen_current() == SCR_NOWPLAYING, bd = np_bd_shown();
+    if(np && !lv_obj_has_flag(g_np_art, LV_OBJ_FLAG_HIDDEN)) np_turn(g_np_art, g_np_src, g_np_out, &g_np_out_dsc);
+    if(bd || (np && !lv_obj_has_flag(g_np_blur_img, LV_OBJ_FLAG_HIDDEN)))
+        np_turn(g_np_blur_img, g_np_blur, g_np_outb, &g_np_outb_dsc);
+    if(bd) np_bd_invalidate();
 }
+/* A side page's backdrop: the bottom child of its root. */
+void ui_np_backdrop(lv_obj_t *root, int scr)
+{
+    int i = 0;
+    while(i < NP_BD_MAX && g_np_bd[i].img) i++;
+    if(i == NP_BD_MAX) return;
+    lv_obj_t *o = lv_image_create(root);
+    lv_obj_set_pos(o, 0, 0);
+    lv_obj_set_size(o, NP_W, NP_W);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_move_background(o);
+    lv_obj_add_event_cb(o, np_bd_deleted, LV_EVENT_DELETE, NULL);
+    g_np_bd[i].img = o; g_np_bd[i].scr = scr;
+    np_bd_bind(o);
+}
+/* Entering a side page, or the picture changed: bind every backdrop and turn the blurred art to the current angle. */
+void ui_np_backdrop_sync(void)
+{
+    for(int i = 0; i < NP_BD_MAX; i++) if(g_np_bd[i].img) np_bd_bind(g_np_bd[i].img);
+    if(np_bd_shown()) np_draw();
+}
+/* The screens on which the art turns: Now Playing and its side pages. */
+int ui_np_turns_on(int scr){ return scr == SCR_NOWPLAYING || scr == SCR_LYRICS || scr == SCR_NPHUB; }
 /* Shows what fits the state (stopping a fade): the sharp art alone, the blurred art under the controls, or the
  * no-art disc (with the title while the controls are hidden). */
 static void np_show_now(void)
@@ -1245,6 +1301,7 @@ void ui_np_cover_changed(void)
     }
     if(!src) ui_np_spin(0);
     np_show_now();
+    ui_np_backdrop_sync();
 }
 
 static void np_sharp_demand(void)

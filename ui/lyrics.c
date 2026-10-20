@@ -513,12 +513,13 @@ void lyrics_create(lv_obj_t *root)
     lv_obj_set_style_bg_color(root, TC(CANVAS), 0);
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
 
-    ui_header(root, "Lyrics");   /* shared standard header */
+    ui_np_backdrop(root, SCR_LYRICS);   /* Now Playing's blurred art, turning (the page right of Now Playing) */
 
     g_scroll = lv_obj_create(root);
     lv_obj_remove_style_all(g_scroll);
-    lv_obj_set_pos(g_scroll, 40, 76); lv_obj_set_size(g_scroll, 280, 250);
-    lv_obj_set_style_pad_bottom(g_scroll, 44, 0);   /* last lyric lines scroll clear of the round bezel */
+    lv_obj_set_pos(g_scroll, 40, 0); lv_obj_set_size(g_scroll, 280, 360);   /* the whole page: no header */
+    lv_obj_set_style_pad_top(g_scroll, 70, 0);      /* text clear of the round bezel at both ends */
+    lv_obj_set_style_pad_bottom(g_scroll, 70, 0);
     lv_obj_set_style_bg_opa(g_scroll, LV_OPA_TRANSP, 0);
     lv_obj_set_scroll_dir(g_scroll, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(g_scroll, LV_SCROLLBAR_MODE_OFF);

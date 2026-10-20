@@ -7,6 +7,8 @@
 #include "folderbrowser.h"
 #include "musicdb.h"
 #include "scanner.h"
+#include "librarydb.h"   /* a held file's album */
+#include "itemmenu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +74,13 @@ static lv_obj_t   *g_list;
 static lv_obj_t   *g_title;
 static lv_timer_t *g_fb_fill;              /* incremental row builder (avoids a long open stall) */
 static int         g_fb_i;                 /* next entry index to render */
+/* Back (the left-edge swipe) goes up one folder, to where that folder's list was: each level's scroll when one of its
+ * folders was opened. */
+#define FB_DEPTH     32
+#define FB_ROW_PITCH 52                    /* a 46 px row + the list's pad_row */
+static int32_t     g_fb_y[FB_DEPTH];
+static int         g_fb_depth;
+static int32_t     g_fb_restore_y = -1;    /* the scroll to show once the parent folder's rows are in */
 
 /* audio files diskOS can play - mirror scanner.c is_audio() exactly. */
 static int fb_has_ext(const char *name, const char *ext){
@@ -141,7 +150,7 @@ static void fb_scan_leased(const char *dir, fb_result_t *res){
     for(int pass = 0; pass < 2; pass++){
         for(errno = 0; fb_current(res->gen) && (e = readdir(d)); errno = 0){
             const char *nm = e->d_name;
-            if(nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;  /* skip . and .. */
+            if(nm[0] == '.') continue;   /* . and .., and hidden files and folders (macOS "._" copies, .Trashes, .diskos), as the scanner skips them */
             if(res->nent >= FB_MAX_ENTRIES) break;
             if(res->nent >= res->cap){                          /* grow the entry array as needed */
                 int nc = res->cap ? res->cap * 2 : 128;
@@ -323,7 +332,9 @@ static void fb_add_row(int i){
         lv_obj_set_style_bg_opa(r, LV_OPA_70, LV_STATE_PRESSED);
         lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_ext_click_area(r, 2);
-        ui_on(r, fb_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i, "folderbrowser.fb_row", UI_CORE);
+        ui_on(r, fb_row_cb, LV_EVENT_SHORT_CLICKED, (void *)(intptr_t)i, "folderbrowser.fb_row", UI_CORE);
+        if(!en->is_dir && en->kind == FB_K_AUDIO)   /* a song file: hold for its menu */
+            ui_on(r, fb_row_cb, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)i, "folderbrowser.fb_row.long", UI_CORE);
         kit_row_layout(r, KIT_ROW_ICON);
 
         lv_obj_t *ic = lv_label_create(r);
@@ -385,31 +396,42 @@ static void fb_rebuild(void){
      * thousands of files doesn't stall the UI on open (mirrors the Library song list). */
     g_fb_i = 0;
     int first = g_nent < 20 ? g_nent : 20;
+    if(g_fb_restore_y > 0){                       /* back up a level: the rows down to where the list was, at once */
+        int need = (g_fb_restore_y + 272) / FB_ROW_PITCH + 2;
+        if(need > first) first = need < g_nent ? need : g_nent;
+    }
     for(; g_fb_i < first; g_fb_i++) fb_add_row(g_fb_i);
     if(g_fb_i < g_nent) g_fb_fill = lv_timer_create(fb_fill_cb, 16, NULL);
     lv_obj_scroll_to_y(g_list, 0, LV_ANIM_OFF);
+    if(g_fb_restore_y > 0){ lv_obj_update_layout(g_list); lv_obj_scroll_to_y(g_list, g_fb_restore_y, LV_ANIM_OFF); }
+    g_fb_restore_y = -1;
 }
 
 static void fb_descend(const char *name){
     char next[FB_MAXPATH];
     int n = snprintf(next, sizeof next, "%s/%s", g_dir, name);
     if(n <= 0 || n >= (int)sizeof next){ ui_toast("Path too long"); return; }
+    if(g_fb_depth < FB_DEPTH) g_fb_y[g_fb_depth] = g_list ? lv_obj_get_scroll_y(g_list) : 0;   /* Back returns here */
+    g_fb_depth++;
+    g_fb_restore_y = -1;
     snprintf(g_dir, sizeof g_dir, "%s", next);
     fb_scan();
 }
 
-/* Go up one level. At the SD root, leave the screen (the header chevron is the
- * screen's back affordance there). We only ever descend from FB_ROOT, so the
- * parent is always a valid ancestor >= FB_ROOT. */
-static void fb_ascend(void){
-    if(strcmp(g_dir, FB_ROOT) == 0){ screen_back(); return; }
+/* Go up one level, to where that folder's list was. Returns 0 at the SD root (the caller leaves Files). We only ever
+ * descend from FB_ROOT, so the parent is always a valid ancestor >= FB_ROOT. */
+int folderbrowser_back(void){
+    if(strcmp(g_dir, FB_ROOT) == 0) return 0;
     char *slash = strrchr(g_dir, '/');
     if(!slash || slash == g_dir || (size_t)(slash - g_dir) < strlen(FB_ROOT)){
         snprintf(g_dir, sizeof g_dir, "%s", FB_ROOT);
     } else {
         *slash = 0;
     }
+    if(g_fb_depth > 0) g_fb_depth--;
+    g_fb_restore_y = g_fb_depth < FB_DEPTH ? g_fb_y[g_fb_depth] : 0;
     fb_scan();
+    return 1;
 }
 
 static void fb_play(const char *name){
@@ -451,26 +473,37 @@ static void fb_play_iso(const char *name){
     fb_play_tracks(paths, 1);
 }
 
+/* A song file's hold menu (itemmenu), as a song row in Library: any file can go to a playlist, and one in the library
+ * also knows its album and artist. */
+static void fb_hold(const fb_entry_t *en){
+    im_item it;
+    memset(&it, 0, sizeof it);
+    it.kind = IM_SONG; it.where = IM_IN_LIBRARY;
+    int n = snprintf(it.path, sizeof it.path, "%s/%s", g_dir, en->name);
+    if(n <= 0 || n >= (int)sizeof it.path){ ui_toast("Path too long"); return; }
+    snprintf(it.title, sizeof it.title, "%s", en->name);
+    if(!ldb_song_album(it.path, -1, it.album_artist, sizeof it.album_artist, it.album, sizeof it.album))
+        it.album_artist[0] = it.album[0] = 0;
+    itemmenu_open(&it);
+}
 static void fb_row_cb(lv_event_t *e){
-    if(lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    lv_event_code_t c = lv_event_get_code(e);
+    if(c != LV_EVENT_SHORT_CLICKED && c != LV_EVENT_LONG_PRESSED) return;   /* not CLICKED: LVGL sends it after a hold too */
     int i = (int)(intptr_t)lv_event_get_user_data(e);
     if(i < 0 || i >= g_nent) return;
     fb_entry_t *en = &g_ent[i];
+    if(c == LV_EVENT_LONG_PRESSED){ fb_hold(en); return; }
     if(en->is_dir) fb_descend(en->name);
     else if(en->kind == FB_K_ISO) fb_play_iso(en->name);
     else if(en->kind == FB_K_CUE) fb_play_sheet(en->name);
     else           fb_play(en->name);
 }
 
-static void fb_header_back_cb(lv_event_t *e){
-    if(lv_event_get_code(e) == LV_EVENT_CLICKED) fb_ascend();
-}
-
 void folderbrowser_create(lv_obj_t *root){
     lv_obj_set_style_bg_color(root, TC(CANVAS), 0);
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
 
-    g_title = ui_header_cb(root, "Files", fb_header_back_cb);   /* back-chevron ascends a level */
+    g_title = library_header(root, "Files");   /* back arrow / title: Library's top page (the swipe goes up a folder) */
 
     g_list = lv_obj_create(root);
     lv_obj_remove_style_all(g_list);
@@ -490,6 +523,7 @@ void folderbrowser_create(lv_obj_t *root){
 
 void folderbrowser_open(void){
     snprintf(g_dir, sizeof g_dir, "%s", FB_ROOT);   /* always (re)enter at the SD root */
+    g_fb_depth = 0; g_fb_restore_y = -1;
     fb_scan();
     screen_show(SCR_FOLDER);
 }

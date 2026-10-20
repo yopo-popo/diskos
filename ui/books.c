@@ -176,7 +176,7 @@ static void books_rebuild(void){
 void books_create(lv_obj_t *root){
     lv_obj_set_style_bg_color(root, TC(CANVAS), 0);
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
-    ui_header(root, "Books");
+    library_header(root, "Books");   /* back arrow / title: Library's top page */
 
     g_list = lv_obj_create(root);
     lv_obj_remove_style_all(g_list);

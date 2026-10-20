@@ -17,6 +17,12 @@ void screen_section_step(int dir);               /* edge pull: -1 = the section 
 void screen_section_jump(int root, int animate);  /* switch to a section's root screen, keeping its place */
 int  screen_pull_ok(int which);                   /* can an edge pull switch sections from this screen? */
 int  screen_section_top(int root);                /* the screen the section with this root shows (its stack top) */
+void screen_section_home(void);                  /* unwind the current section to its root (back slide) */
+/* A link's place in a section: its back stack, read before the link and put back after it. set is quiet (the next
+ * screen_show opens on top of it); back_to also shows its top with a back slide when the section is showing. */
+void screen_section_get(int root, int *sp, int *top);
+void screen_section_set(int root, int sp, int top);
+void screen_section_back_to(int root, int sp, int top);
 void ui_toast(const char *msg);
 void splash_start(void);
 /* the "something" block-matrix clock (home.c): handle 0 = Home */
@@ -41,7 +47,7 @@ void songinfo_create(lv_obj_t *root);
 void songinfo_set(const track_state_t *st);
 /* Now Playing side menus (npmenus.c) + custom EQ (eqcustom.c) */
 void npmenu_create(lv_obj_t *root);
-void nphub_create(lv_obj_t *root);   /* right-swipe hub: Playback + Options buttons */
+void nphub_create(lv_obj_t *root);   /* Options: Now Playing's left-hand page (a rightward swipe) */
 void nphub_refresh(void);            /* rebuild the hub for the current track (book-aware) */
 void upnext_create(lv_obj_t *root);   /* SCR_UPNEXT: the player queue from the current song on (upnext.c) */
 void upnext_open(void);                /* show SCR_UPNEXT */
@@ -61,6 +67,9 @@ int  sharp_spin_due(uint32_t *last);                                     /* in i
 void sharp_cover_invalidate(void);
 void ui_np_cover_changed(void);        /* rebind before shared pixels are freed */
 void ui_np_enter(void);                /* refresh on forward and back entry */
+void ui_np_backdrop(lv_obj_t *root, int scr);   /* a side page (Lyrics, Options): Now Playing's blurred, turning art behind it */
+void ui_np_backdrop_sync(void);       /* on entering a side page: its backdrop at the current angle */
+int  ui_np_turns_on(int scr);         /* 1 = the art turns while this screen shows (Now Playing and its side pages) */
 void ui_status_clock(const char *hm);          /* the clock and battery line: the clock */
 void ui_status_batt(int batt, int charging);    /* the clock and battery line: battery %, -1 = unknown */
 lv_obj_t *ui_status_line(lv_obj_t *parent);     /* that line, at the top of parent (the Library root) */
@@ -85,9 +94,6 @@ void npmenu_close_transients(void);   /* dismiss lv_layer_top popups on navigati
 void ui_set_favorite(int on);   /* love/unlove the current song (0104) */
 /* add-to-playlist picker (npmenus.c) */
 void plpick_create(lv_obj_t *root);
-void plpick_set_song(const char *path, int pos_id, const char *title);   /* song to add when a playlist is tapped; pos_id (a2 pos_id, 0 = unknown) picks a CUE/ISO sub-track */
-void plpick_set_ids(const int *ids, int n);   /* instead: add exactly these SONG.IDs (a list as shown); then screen_show(SCR_PLPICK) */
-void plpick_set_group(const char *col, const char *val);   /* instead: add every song of an ALBUM/ARTIST/GENRE (col) equal to val; then screen_show(SCR_PLPICK) */
 /* playlist detail (playlistview.c) */
 void plview_create(lv_obj_t *root);
 void plview_open(long pid, const char *name);
@@ -122,14 +128,17 @@ void bt_notify_player_restart(void);   /* player restarted: forget stale auto-ro
 int  ui_player_settling(void);         /* 1 while the player is still in its post-restart late-init settle window */
 void library_open_album(const char *album_artist, const char *album);   /* an album by its library.db key */
 int  library_play_album(const char *album_artist, const char *album);   /* play it from the start; 1 = sent */
-void library_open_artist(const char *name);
+void library_open_artist(const char *name);   /* their albums (a cover flow with Album View = cover flow) with All Songs */
+int  library_link_back(void);   /* Back on a cover flow: 1 = it was a link's artist wall, Library's place before it is shown */
 void library_wall_open(int kind, const char *artist, const char *album_artist, const char *album);   /* from an artist's cover flow (its LDB_SCOPE_*): their songs on the album (NULL = all); Back returns to it */
-int  library_wall_play(int kind, const char *artist, const char *album_artist, const char *album);   /* play the artist's songs on that album; 1 = sent */
 void library_wall_open_album(const char *album_artist, const char *album);   /* from the cover flow of every album: its songs; Back returns to it */
 void albumwall_create(lv_obj_t *root);     /* SCR_ALBUMWALL: cover-flow album browser */
 void albumwall_refresh(void);              /* rebuilt per entry from the album list */
 int  albumwall_open_artist(int kind, const char *key);   /* next entry shows an artist's albums (LDB_SCOPE_ARTIST/GROUP); their count, wall unchanged if <= 0 */
 void albumwall_open_all(void);             /* next entry shows every album again, at the full wall's own centre album */
+typedef struct { int scope, cur, cur_all; char key[256]; } albumwall_place;   /* key: an LDB_NAME */
+void albumwall_place_get(albumwall_place *p);         /* the wall shown (every album or an artist's) and its centre album */
+void albumwall_place_set(const albumwall_place *p);   /* next entry shows that wall again */
 void albumwall_prewarm_seed(void);         /* MAIN thread: (re)start the incremental album-cover prewarm enqueue */
 void albumwall_step(int dir);              /* +1 next / -1 prev album (discrete: keys / demo) */
 void albumwall_drag_begin(int px);         /* finger down: start a continuous drag from press x */
@@ -138,8 +147,8 @@ void albumwall_drag_end(void);             /* finger up: inertial fling + snap t
 void albumwall_drag_cancel(void);          /* abandon a drag without a fling (tap path) */
 void albumwall_scroll_rel(float d_alb);    /* rim scroll: nudge the flow by d_alb albums (continuous) */
 void albumwall_settle(void);               /* rim release: snap to the nearest album */
-void albumwall_play(void);                 /* play the centred album (cover tap) */
-void albumwall_open(void);                 /* open the centred album's track list (cover long-press) */
+void albumwall_hold(void);                 /* hold the centred cover (long-press): the album's menu */
+void albumwall_open(void);                 /* open the centred album's track list (cover tap) */
 const lv_font_t *ui_text_font(int px);     /* fallback-chained user-text font (14/16/18/20) */
 /* apps launcher (apps.c) + launch hook (main.c) */
 void apps_create(lv_obj_t *root);
@@ -161,6 +170,7 @@ lv_color_t ui_current_accent(void);
  * consistent header instead of per-screen copies. */
 lv_obj_t *ui_header(lv_obj_t *root, const char *title);
 lv_obj_t *ui_header_cb(lv_obj_t *root, const char *title, lv_event_cb_t back_cb);  /* header with custom back */
+lv_obj_t *ui_header_back(void);   /* the back arrow of the header built last: a section's root page hides it (its Back leads nowhere) */
 void home_set_accent(lv_color_t accent);
 int  ui_run_bounded(char *const argv[], int timeout_ms);  /* external cmd as a killable child w/ hard timeout */
 void ui_decode_lock(void);    /* serialize an ffmpeg artwork decode against the other decoders (OOM guard) */
@@ -305,4 +315,10 @@ void search_set_song_click_cb(library_song_click_cb_t cb);  /* tap a search resu
 int  library_drill_context(int *list_type, char *name, int cap);
 /* step one level back within the library; 0 if already at the top menu */
 int  library_back(void);
+/* Library's top page from any Library screen: resets Library to its root view, then screen_section_home() */
+void library_home(void);
+/* Library pages' header: back arrow and title both go to Library's top (library_home) */
+lv_obj_t *library_header(lv_obj_t *root, const char *title);
+/* Files: up one folder at the place it was; 1 = handled, 0 = already at the card root */
+int  folderbrowser_back(void);
 #endif

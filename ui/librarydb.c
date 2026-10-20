@@ -907,15 +907,21 @@ static const char *READ_GENRE_ALBUMS = SCOPE_ALBUMS("SELECT t.album_artist AS aa
 static const char *const READ_HISTORY[2] = {
     "SELECT " SONG_COLS " " HISTORY_FROM " ORDER BY h.play_count DESC, h.last_play_seq DESC;",
     "SELECT " SONG_COLS " " HISTORY_FROM " ORDER BY h.last_play_seq DESC;" };
-/* Favourites, newest first, from shelves.db (attached as sh). A song not in the library comes from its snapshot (its
- * title, else its file name; no artist) with count 1. */
-static const char *READ_FAVOURITES =
-    "SELECT COALESCE(t.title, r.title, replace(r.path, rtrim(r.path, replace(r.path, '/', '')), '')),"
-    " CASE WHEN t.id IS NULL THEN NULL ELSE " TRACK_ARTISTS " END,"
-    " r.path, COALESCE(t.album_title, r.album_title), CASE WHEN t.id IS NULL THEN IFNULL(r.album_artist, '') ELSE t.album_artist END,"
+/* A shelves.db song (track_refs r, attached as sh) with its library row t. A song not in the library comes from its
+ * snapshot (its title, else its file name; no artist) with count 1. */
+#define SHELF_SONG_COLS \
+    "COALESCE(t.title, r.title, replace(r.path, rtrim(r.path, replace(r.path, '/', '')), ''))," \
+    " CASE WHEN t.id IS NULL THEN NULL ELSE " TRACK_ARTISTS " END," \
+    " r.path, COALESCE(t.album_title, r.album_title), CASE WHEN t.id IS NULL THEN IFNULL(r.album_artist, '') ELSE t.album_artist END," \
     " r.start_ms, IFNULL(t.source, 0), IFNULL(t.disc, 0), IFNULL(t.track, 0), IFNULL(t.duration_ms, 0), t.id IS NULL, NULL"
-    " FROM sh.favourites f JOIN sh.track_refs r ON r.id=f.track_ref_id"
-    " LEFT JOIN tracks t ON t.path=r.path AND t.start_ms=r.start_ms ORDER BY f.id DESC;";
+#define SHELF_SONG_JOIN "JOIN sh.track_refs r ON r.id=x.track_ref_id LEFT JOIN tracks t ON t.path=r.path AND t.start_ms=r.start_ms"
+/* Favourites, newest first */
+static const char *READ_FAVOURITES =
+    "SELECT " SHELF_SONG_COLS " FROM sh.favourites x " SHELF_SONG_JOIN " ORDER BY x.id DESC;";
+/* A playlist's songs in order (?1 = its id), each with its entry's id */
+static const char *READ_PLAYLIST =
+    "SELECT " SHELF_SONG_COLS ", NULL, x.id FROM sh.playlist_items x " SHELF_SONG_JOIN
+    " WHERE x.playlist_id=?1 ORDER BY x.position, x.id;";
 static const char *scope_cond(int kind, const char *key){
     switch(kind){
     case LDB_SCOPE_GENRE: return "t.id IN (SELECT g.track_id FROM track_file_genres g WHERE g.genre=?1)";
@@ -993,6 +999,7 @@ static int read_list(sqlite3_stmt *st, ldb_list *out){
         r->it.count = sqlite3_column_int(st, 10);
         r->it.letter = ldb_key_letter((const char *)sqlite3_column_text(st, 11));
         r->it.year = sqlite3_column_count(st) > 12 ? sqlite3_column_int(st, 12) : 0;   /* album lists: their year */
+        r->it.row_id = sqlite3_column_count(st) > 13 ? sqlite3_column_int64(st, 13) : 0;   /* playlists: the entry */
         n++;
     }
     if(ok && rc != SQLITE_DONE) ok = 0;
@@ -1152,9 +1159,25 @@ int ldb_track_start(const char *path, const char *title, long long *start_ms){
     sqlite3_close(db);
     return found;
 }
+int ldb_track_start_at(const char *path, int track, long long *start_ms){
+    *start_ms = 0;
+    if(!path) return 0;
+    sqlite3 *db = reader_open();
+    if(!db) return 0;
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    if(sqlite3_prepare_v2(db, "SELECT start_ms FROM tracks WHERE path=?1 AND track=?2 AND source<>0 LIMIT 1;", -1, &st, NULL) == SQLITE_OK){
+        sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
+        sqlite3_bind_int(st, 2, track);
+        if(sqlite3_step(st) == SQLITE_ROW){ *start_ms = sqlite3_column_int64(st, 0); found = 1; }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return found;
+}
 /* A list of library.db's songs joined with the user file at file (attached by attach_sql): 0 rows when file doesn't
- * exist yet. */
-static int read_with(const char *file, const char *attach_sql, const char *sql, ldb_list *out){
+ * exist yet. arg is ?1, when sql has it. */
+static int read_with(const char *file, const char *attach_sql, const char *sql, long long arg, ldb_list *out){
     memset(out, 0, sizeof *out);
     if(access(file, F_OK) != 0) return errno == ENOENT ? 0 : -1;
     long long stamp[4];
@@ -1168,8 +1191,10 @@ static int read_with(const char *file, const char *attach_sql, const char *sql, 
         int rc = sqlite3_step(st);
         sqlite3_finalize(st);
         st = NULL;
-        if(rc == SQLITE_DONE && sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK)
+        if(rc == SQLITE_DONE && sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK){
+            if(sqlite3_bind_parameter_count(st) > 0) sqlite3_bind_int64(st, 1, arg);
             n = read_list(st, out);
+        }
     }
     sqlite3_finalize(st);
     sqlite3_close(db);
@@ -1178,8 +1203,11 @@ static int read_with(const char *file, const char *attach_sql, const char *sql, 
     return n;
 }
 int ldb_read_history(int by_recent, ldb_list *out){
-    return read_with(LISTENINGDB_PATH, "ATTACH DATABASE ?1 AS ls;", READ_HISTORY[by_recent != 0], out);
+    return read_with(LISTENINGDB_PATH, "ATTACH DATABASE ?1 AS ls;", READ_HISTORY[by_recent != 0], 0, out);
 }
 int ldb_read_favourites(ldb_list *out){
-    return read_with(SHELVESDB_PATH, "ATTACH DATABASE ?1 AS sh;", READ_FAVOURITES, out);
+    return read_with(SHELVESDB_PATH, "ATTACH DATABASE ?1 AS sh;", READ_FAVOURITES, 0, out);
+}
+int ldb_read_playlist(long long id, ldb_list *out){
+    return read_with(SHELVESDB_PATH, "ATTACH DATABASE ?1 AS sh;", READ_PLAYLIST, id, out);
 }

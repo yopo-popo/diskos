@@ -134,6 +134,7 @@ typedef struct {
     int count;                  /* album: its songs */
     int year;                   /* album: its year (the one most of its songs carry), 0 = none; songs: 0 */
     int letter;                 /* the jump-bar letter of its sort key (ldb_key_letter) */
+    long long row_id;           /* a playlist's song: its entry in the playlist (shdb_pl_remove), else 0 */
 } ldb_item;
 typedef struct {
     ldb_item *v; int n;
@@ -169,11 +170,16 @@ int  ldb_song_artist(const char *path, long long start_ms, int by_album_artist, 
 int  ldb_song_album(const char *path, long long start_ms, char *album_artist, int aacap, char *album, int acap);
 /* The start in its file of the song playing as path + title (a CUE/ISO track; 0 for a plain file). 1 = in the library. */
 int  ldb_track_start(const char *path, const char *title, long long *start_ms);
+/* The start in its CUE/ISO file of the song with that track number there. 1 = in the library. */
+int  ldb_track_start_at(const char *path, int track, long long *start_ms);
 /* Most Played (by_recent 0: most plays first) or Recent (1: last played first): the songs listening.db counted that
  * are in the library. The caller opens listening.db first (lsdb_ready). 0 = nothing played yet, -1 = can't read. */
 int  ldb_read_history(int by_recent, ldb_list *out);
 /* Favourites, newest first. A song that isn't in the library is listed from shelves.db's snapshot of it, with count 1
  * and no artist. The caller opens shelves.db first (shdb_ready). 0 = none, -1 = can't read. */
 int  ldb_read_favourites(ldb_list *out);
+/* A playlist's songs in its order, each with its entry as row_id; a song not in the library as in Favourites. The
+ * caller opens shelves.db first. 0 = empty, -1 = can't read. */
+int  ldb_read_playlist(long long id, ldb_list *out);
 
 #endif

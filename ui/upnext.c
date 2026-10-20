@@ -29,7 +29,7 @@ static unsigned    g_un_seq;           /* its path_seq then: a track change sinc
 static void un_rebuild(void);
 
 static void un_fmt_dur(int ms, char *out, size_t n){
-    if(ms <= 0){ out[0] = 0; return; }
+    if(ms <= 0 || ms >= 86400000){ out[0] = 0; return; }   /* 24 h = the length written for a song of unknown length */
     long long t = ((long long)ms + 500) / 1000; snprintf(out, n, "%lld:%02lld", t / 60, t % 60);   /* no int overflow near INT32_MAX */
 }
 
@@ -200,6 +200,7 @@ void upnext_create(lv_obj_t *root){
     lv_obj_set_style_bg_color(root, TC(CANVAS), 0);
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
     ui_header(root, "Up Next");
+    { lv_obj_t *b = ui_header_back(); if(b) lv_obj_add_flag(b, LV_OBJ_FLAG_HIDDEN); }   /* the Queue section's root: Back leads nowhere */
 
     g_un_list = lv_obj_create(root);
     lv_obj_remove_style_all(g_un_list);

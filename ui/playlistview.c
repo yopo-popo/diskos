@@ -4,28 +4,24 @@
 #include "i18n.h"
 #include "theme.h"
 #include "theme_kit.h"
-#include "musicdb.h"
+#include "player_mq.h"     /* play the playlist as our queue */
+#include "shelvesdb.h"
+#include "playlists.h"
+#include "itemmenu.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
-/* Playlist detail (SCR_PLVIEW): opened by tapping a playlist in the Library.
- * Header name + Play / Shuffle + a horizontal 3-dot menu (Edit name / Delete).
- * Deleting removes only the playlist + its membership rows; the SONG table and
- * the files are never touched. */
+/* Playlist detail (SCR_PLVIEW): opened by tapping a playlist in the Library. Header name + Play / Shuffle + a 3-dot
+ * button that opens the playlist's hold menu (Rename, Save to the card, Delete...). The songs come from shelves.db;
+ * holding one opens its hold menu, with Remove from playlist. */
 
-static long g_pid;
-static char g_name[160];
+static long long g_pid;
+static char g_name[LDB_NAME];
 static lv_obj_t *g_title_lbl, *g_song_list;
 static lv_obj_t *g_play_btn, *g_shuffle_btn;   /* LV_STATE_DISABLED when the playlist is empty */
-static lv_obj_t *g_menu, *g_dialog;   /* transient popups on lv_layer_top */
-
-/* Deletes async: callers run inside LV_EVENT_CLICKED handlers on descendants of *p, so a
- * synchronous lv_obj_del here would free the very button whose click is still being
- * dispatched (UAF once the event returns). *p is cleared immediately so no path can
- * double-close while the async delete is pending. */
-static void close_pop(lv_obj_t **p){ if(*p){ lv_obj_delete_async(*p); *p = NULL; } }
+static ldb_list g_pl;                          /* its songs, kept while the rows use them */
 
 /* Enable/disable the transport buttons for an empty playlist: at 0 songs Play/Shuffle would only
  * toast, so show them disabled. LV_STATE_DISABLED (not clearing CLICKABLE) so the theme kit still
@@ -41,23 +37,58 @@ static void pl_set_transport_enabled(int on){
     }
 }
 
+/* ---- playing ------------------------------------------------------------ */
+/* Play the playlist from song i (-1 = the first that can play, -2 = a random one) as the new queue: loose songs in the
+ * playlist's order, by their files, so songs outside the library play too. Songs whose file is gone are left out.
+ * 1 = sent; every failure toasts once (here or in player_play). */
+static int plv_play(int i){
+    int n = g_pl.n;
+    if(n <= 0){ ui_toast("Playlist is empty"); return 0; }
+    if(i >= n) return 0;
+    if(i >= 0 && g_pl.v[i].count == 2){ ui_toast("This song's file is gone"); return 0; }   /* never start another song */
+    if(i == -2) i = rand() % n;
+    else if(i < 0) i = 0;
+    for(int k = 0; g_pl.v[i].count == 2 && k < n; k++) i = (i + 1) % n;   /* Play / Shuffle: the next song that can play */
+    if(g_pl.v[i].count == 2){ ui_toast("These songs' files are gone"); return 0; }
+    queue_track *t = malloc((size_t)n * sizeof *t);
+    if(!t){ ui_toast("Couldn't play this playlist"); return 0; }
+    int m = 0, start = 0;
+    for(int k = 0; k < n; k++){
+        const ldb_item *s = &g_pl.v[k];
+        if(s->count == 2) continue;
+        if(k == i) start = m;
+        int sub = s->source == LDB_SRC_CUE || s->source == LDB_SRC_ISO;   /* a track inside a bigger file */
+        t[m++] = (queue_track){ .path = s->path, .start_ms = (int)s->start_ms,
+                                .end_ms = sub && s->duration_ms > 0 ? (int)s->start_ms + s->duration_ms : 0,
+                                .duration_ms = s->duration_ms, .title = s->title, .artist = s->artist, .album = s->album };
+    }
+    int ok = player_play(t, m, NULL, start);
+    free(t);
+    return ok;
+}
+
 /* ---- song list ---------------------------------------------------------- */
 static void plv_reload(void);   /* fwd */
-/* Long-press a song row -> remove it from the playlist (L32). Uses the 1-based display ordinal
- * bound to the row, matching mdb_playlist_songs()'s order. */
-static void plv_remove_cb(lv_event_t *e){
+/* Hold a song: its hold menu, with Remove from playlist. user data = the 1-based row. */
+static void plv_hold_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_LONG_PRESSED) return;
-    int pos = (int)(intptr_t)lv_event_get_user_data(e);
-    if(mdb_playlist_remove_at(g_pid, pos)){
-        ui_toast("Removed from playlist");
-        plv_reload();                 /* rebuild so ordinals stay correct */
-        library_refresh();            /* playlist row count / Now-Playing add-state */
-    }
+    int i = (int)(intptr_t)lv_event_get_user_data(e) - 1;
+    if(i < 0 || i >= g_pl.n) return;
+    const ldb_item *s = &g_pl.v[i];
+    im_item it;
+    memset(&it, 0, sizeof it);
+    it.kind = IM_SONG;
+    snprintf(it.title, sizeof it.title, "%s", s->title);
+    snprintf(it.path, sizeof it.path, "%s", s->path);
+    it.start_ms = s->start_ms;
+    snprintf(it.album_artist, sizeof it.album_artist, "%s", s->album_artist ? s->album_artist : "");
+    snprintf(it.album, sizeof it.album, "%s", s->album ? s->album : "");
+    it.where = IM_IN_PLAYLIST; it.where_id = g_pid; it.row_id = s->row_id;
+    itemmenu_open(&it);
 }
 static void plv_song_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_SHORT_CLICKED) return;   /* SHORT_CLICKED so a long-press-to-remove never also plays */
-    int pos = (int)(intptr_t)lv_event_get_user_data(e);   /* 1-based */
-    if(ui_play_playlist(g_pid, pos)) screen_show(SCR_NOWPLAYING);   /* refused / not sent: stay (toasted) */
+    if(lv_event_get_code(e)!=LV_EVENT_SHORT_CLICKED) return;   /* SHORT_CLICKED so a hold never also plays */
+    if(plv_play((int)(intptr_t)lv_event_get_user_data(e) - 1)) screen_show(SCR_NOWPLAYING);   /* refused: stay (toasted) */
 }
 /* Gaps preserve scroll extent and row-index decoration while rows stream.
  * Theme row marks repeat every three children, so a gap keeps that phase. */
@@ -67,7 +98,6 @@ typedef struct plv_gap {
     struct plv_gap *next;
 } plv_gap_t;
 static plv_gap_t *g_gaps;
-static mdb_song_t *g_songs;
 static unsigned char g_built[8192];
 static int g_fill_i, g_fill_n, g_loading;
 static int g_two_line;   /* some snapshot row has both a title and an artist line */
@@ -84,7 +114,6 @@ int playlistview_row_pos(lv_obj_t *row, int *rows, int *two_line){
 
 static void plv_fill_stop(void){
     if(g_fill_timer){ lv_timer_del(g_fill_timer); g_fill_timer = NULL; }
-    free(g_songs); g_songs = NULL;
 }
 static void plv_gaps_free(void){
     while(g_gaps){ plv_gap_t *next = g_gaps->next; free(g_gaps); g_gaps = next; }
@@ -105,7 +134,7 @@ static int plv_gap_size(plv_gap_t *g){
     return pads;
 }
 static void plv_add_row(int i){
-    if(!g_songs || g_built[i]) return;
+    if(i < 0 || i >= g_fill_n || g_built[i]) return;
     plv_gap_t **link = &g_gaps;
     while(*link && (*link)->hi <= i) link = &(*link)->next;
     plv_gap_t *gap = *link;
@@ -126,21 +155,23 @@ static void plv_add_row(int i){
     lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_user_data(r, (void*)(intptr_t)(i+1));   /* playlistview_row_pos */
     ui_on(r, plv_song_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)(i+1), "playlistview.plv_song", UI_CORE);
-    ui_on(r, plv_remove_cb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)(i+1), "playlistview.plv_remove.long", UI_CORE);  /* L32: hold to remove */
+    ui_on(r, plv_hold_cb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)(i+1), "playlistview.plv_hold.long", UI_CORE);
+    const ldb_item *s = &g_pl.v[i];
     lv_obj_t *t = lv_label_create(r);
-    lv_label_set_text(t, g_songs[i].title);
+    lv_label_set_text(t, s->title);
     lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
     lv_obj_set_pos(t, 12, 5); lv_obj_set_size(t, 244, 19);
     lv_obj_set_style_text_font(t, TF(USER_16), 0);   /* CJK titles like Library/Search */
     lv_obj_set_style_text_color(t, TC(TEXT_PRIMARY), 0);
     lv_obj_t *a = lv_label_create(r);
-    lv_label_set_text(a, g_songs[i].artist);
+    /* a song not in the library says so: "Missing" when its file is gone too */
+    lv_label_set_text(a, s->count == 2 ? tr("Missing") : s->count == 1 ? tr("Not in the library") : s->artist ? s->artist : "");
     lv_label_set_long_mode(a, LV_LABEL_LONG_DOT);
     lv_obj_set_pos(a, 12, 25); lv_obj_set_size(a, 244, 16);
     lv_obj_set_style_text_font(a, TF(USER_14), 0);
     lv_obj_set_style_text_color(a, TC(TEXT_SECONDARY), 0);
-    if(!strcmp(theme_kit()->id, "terminal") && g_songs[i].dur_ms > 0){
-        long long sec = ((long long)g_songs[i].dur_ms + 500) / 1000;
+    if(!strcmp(theme_kit()->id, "terminal") && s->duration_ms > 0){
+        long long sec = ((long long)s->duration_ms + 500) / 1000;
         char dur[16]; snprintf(dur, sizeof dur, "%lld:%02lld", sec / 60, sec % 60);
         lv_obj_t *d = lv_label_create(r);
         lv_label_set_text(d, dur);
@@ -170,7 +201,7 @@ static void plv_add_row(int i){
     else { *link = right ? right : gap->next; free(gap); }
 }
 static void plv_visible(void){
-    if(g_loading || !g_songs) return;
+    if(g_loading || g_fill_n <= 0) return;
     g_loading = 1;
     int first = lv_obj_get_scroll_y(g_song_list) / 52;
     if(first < 0) first = 0;
@@ -193,6 +224,7 @@ static void plv_fill_cb(lv_timer_t *t){
     if(g_fill_i >= g_fill_n) plv_fill_stop();
 }
 static void plv_reload(void){
+    if(shdb_name(0, g_pid, g_name, sizeof g_name) != 1 && !g_name[0]) snprintf(g_name, sizeof g_name, "%s", tr("Playlist"));
     theme_title_text(g_title_lbl, g_name);
     if(!g_song_list) return;
     g_loading = 1;
@@ -201,18 +233,18 @@ static void plv_reload(void){
     lv_obj_clean(g_song_list);   /* existing entry/removal scroll reset */
     memset(g_built, 0, sizeof g_built);
     g_fill_i = g_fill_n = g_two_line = 0;
-    int cnt = mdb_playlist_count(g_pid);
-    /* Display cap only; playback and Shuffle still use the full playlist. */
-    if(cnt > 8192) cnt = 8192;
-    g_songs = cnt > 0 ? malloc((size_t)cnt * sizeof *g_songs) : NULL;
-    int n = g_songs ? mdb_playlist_songs(g_pid, g_songs, cnt) : 0;
+    ldb_list_free(&g_pl);
+    int got = shdb_ready() ? ldb_read_playlist(g_pid, &g_pl) : -1;
+    playlists_mark_missing(&g_pl);
+    int n = got;
+    if(n > 8192) n = 8192;   /* display cap only; playback and Shuffle still use the full playlist */
     if(n > 0) g_gaps = calloc(1, sizeof *g_gaps);
     if(n > 0 && !g_gaps) n = 0;
     pl_set_transport_enabled(n > 0);
     if(n<=0){
         plv_fill_stop();
         lv_obj_t *l = lv_label_create(g_song_list);
-        lv_label_set_text(l, "Empty playlist\nAdd songs from Now Playing");
+        lv_label_set_text(l, got < 0 ? tr("Can't read this playlist") : tr("Empty playlist\nHold a song, then Add to playlist"));
         lv_obj_set_style_text_color(l, TC(TEXT_MUTED), 0);
         lv_obj_set_style_text_font(l, TF(UI_14), 0);
         lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
@@ -220,7 +252,7 @@ static void plv_reload(void){
         return;
     }
     g_fill_n = n;
-    for(int i=0;i<n && !g_two_line;i++) g_two_line = g_songs[i].title[0] && g_songs[i].artist[0];
+    g_two_line = 1;   /* every row has a second line: the artist, or why it can't play */
     g_gaps->hi = n;
     plv_gap_size(g_gaps);
     int first = n < 18 ? n : 18;
@@ -228,165 +260,51 @@ static void plv_reload(void){
     g_loading = 0;
     if(g_fill_i < n) g_fill_timer = lv_timer_create(plv_fill_cb, 16, NULL);
     else plv_fill_stop();
-    { static int hinted = 0; if(!hinted) hinted = ui_toast_hint("Hold a song to remove it"); }
+    { static int hinted = 0; if(!hinted) hinted = ui_toast_hint("Hold a song for more"); }
 }
 /* Public: rebuild the list from the DB. Called by the screen manager on EVERY entry
  * to SCR_PLVIEW (incl. back-nav), so tap positions can't go stale after the playlist's
  * membership changes elsewhere (e.g. add-to-playlist from Now Playing). */
 void plview_refresh(void){ plv_reload(); }
+long long plview_current(void){ return g_pid; }
+/* A song removed or the playlist renamed while it shows: read it again where it was. */
+void plview_changed(void){
+    if(screen_current() != SCR_PLVIEW) return;
+    int32_t y = g_song_list ? lv_obj_get_scroll_y(g_song_list) : 0;
+    plv_reload();
+    if(g_song_list && y > 0) lv_obj_scroll_to_y(g_song_list, y, LV_ANIM_OFF);
+}
 
 void plview_open(long pid, const char *name){
     g_pid = pid;
-    snprintf(g_name, sizeof g_name, "%s", name ? name : "Playlist");
+    snprintf(g_name, sizeof g_name, "%s", name ? name : "");
     screen_show(SCR_PLVIEW);   /* transition() calls plview_refresh() -> plv_reload() */
 }
 
 /* ---- play / shuffle ----------------------------------------------------- */
 static void play_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    if(mdb_playlist_count(g_pid) < 1){ ui_toast("Playlist is empty"); return; }
+    if(g_pl.n < 1){ ui_toast("Playlist is empty"); return; }
     ui_set_workmode(0);
-    if(ui_play_playlist(g_pid, 1)) screen_show(SCR_NOWPLAYING);
+    if(plv_play(-1)) screen_show(SCR_NOWPLAYING);
 }
 static void shuffle_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    int c = mdb_playlist_count(g_pid);
-    if(c < 1){ ui_toast("Playlist is empty"); return; }
+    if(g_pl.n < 1){ ui_toast("Playlist is empty"); return; }
     srand(lv_tick_get());
     ui_set_workmode(1);                       /* shuffle play-mode */
-    if(ui_play_playlist(g_pid, rand()%c + 1)) screen_show(SCR_NOWPLAYING);   /* + random start track */
+    if(plv_play(-2)) screen_show(SCR_NOWPLAYING);   /* + random start track */
 }
 
-/* ---- delete confirm ----------------------------------------------------- */
-static void del_yes_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    close_pop(&g_dialog);
-    int ok = mdb_playlist_delete(g_pid);
-    if(ok){
-        ui_toast("Playlist deleted");
-        screen_back();                        /* back to the Playlists list */
-        library_refresh();                    /* rebuild it so the deleted playlist is gone */
-    } else {
-        ui_toast("Delete failed");            /* stay put on failure */
-    }
-}
-static void del_no_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) close_pop(&g_dialog); }
-
-static lv_obj_t *card(int w, int h){
-    /* full-screen modal backdrop on the top layer: CATCHES taps so they can't reach the playlist
-     * controls beneath (this confirm was a bare floating card before). Stored as g_dialog so
-     * close_pop removes the backdrop AND the card child together. No dismiss-on-tap - use the buttons. */
-    lv_obj_t *bg = lv_obj_create(lv_layer_top());
-    lv_obj_remove_style_all(bg);
-    lv_obj_set_size(bg, 360, 360);
-    lv_obj_center(bg);
-    lv_obj_set_style_bg_color(bg, TC(SCRIM), 0);
-    lv_obj_set_style_bg_opa(bg, LV_OPA_50, 0);
-    lv_obj_clear_flag(bg, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(bg, LV_OBJ_FLAG_CLICKABLE);
-    g_dialog = bg;
-    lv_obj_t *c = lv_obj_create(bg);
-    lv_obj_remove_style_all(c);
-    lv_obj_set_size(c, w, h);
-    lv_obj_center(c);
-    lv_obj_set_style_radius(c, 16, 0);
-    lv_obj_set_style_bg_color(c, TC(SURFACE), 0);
-    lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(c, 1, 0);
-    lv_obj_set_style_border_color(c, TC(BORDER), 0);
-    lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
-    return c;
-}
-static lv_obj_t *card_btn(lv_obj_t *p, int y, int w, const char *txt, lv_color_t bg, lv_color_t fg, lv_event_cb_t cb){
-    lv_obj_t *b = lv_button_create(p);
-    lv_obj_remove_style_all(b);
-    lv_obj_set_size(b, w, 40);
-    lv_obj_set_ext_click_area(b, 4);   /* 40px pill -> ~48px touch target on the capacitive panel */
-    lv_obj_align(b, LV_ALIGN_TOP_MID, 0, y);
-    lv_obj_set_style_radius(b, 12, 0);
-    lv_obj_set_style_bg_color(b, bg, 0);
-    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
-    ui_on(b, cb, LV_EVENT_CLICKED, NULL, "playlistview.cb", UI_CORE);
-    lv_obj_t *l = lv_label_create(b);
-    lv_label_set_text(l, txt);
-    lv_obj_set_style_text_font(l, TF(UI_16), 0);
-    lv_obj_set_style_text_color(l, fg, 0);
-    lv_obj_center(l);
-    return b;
-}
-static void show_delete_confirm(void){
-    close_pop(&g_menu);
-    lv_obj_t *dc = card(264, 200);   /* card() sets g_dialog = the full-screen backdrop; content goes on dc */
-    lv_obj_t *t = lv_label_create(dc);
-    lv_label_set_text(t, "Delete playlist?");
-    lv_obj_set_style_text_font(t, TF(UI_20), 0);
-    lv_obj_set_style_text_color(t, TC(TEXT_PRIMARY), 0);
-    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 26);
-    lv_obj_t *s = lv_label_create(dc);
-    lv_label_set_text(s, "The songs are kept.");
-    lv_obj_set_style_text_font(s, TF(UI_14), 0);
-    lv_obj_set_style_text_color(s, TC(TEXT_MUTED), 0);
-    lv_obj_align(s, LV_ALIGN_TOP_MID, 0, 54);
-    card_btn(dc, 88,  200, "Delete", TC(DANGER_BUTTON_SURFACE), TC(STATUS_DANGER), del_yes_cb);
-    card_btn(dc, 134, 200, "Cancel", TC(SURFACE_RAISED), TC(TEXT_PRIMARY), del_no_cb);
-}
-
-/* ---- rename ------------------------------------------------------------- */
-static void rename_done(const char *name){
-    if(!name || !name[0]) return;
-    if(mdb_playlist_rename(g_pid, name)){
-        snprintf(g_name, sizeof g_name, "%s", name);
-        theme_title_text(g_title_lbl, g_name);
-        library_refresh();   /* rebuild the Playlists list so its row shows the new name (delete already does this) */
-        ui_toast("Renamed");
-    } else {
-        ui_toast("Rename failed");
-    }
-}
-static void rename_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    close_pop(&g_menu);
-    kbinput_open("Playlist name", g_name, rename_done);
-}
-
-/* ---- 3-dot menu --------------------------------------------------------- */
-static void menu_dismiss_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) close_pop(&g_menu); }
-static void del_menu_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) show_delete_confirm(); }
-static void export_cb(lv_event_t *e){   /* L37: write the playlist to /tmp/sdcard/<name>.m3u */
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    close_pop(&g_menu);
-    char fn[112];
-    if(mdb_playlist_export(g_pid, g_name, fn, sizeof fn)){
-        char msg[160]; snprintf(msg, sizeof msg, "Exported to %s", fn);
-        ui_toast(msg);
-    } else ui_toast("Couldn't export playlist");
-}
+/* ---- 3-dot: the playlist's hold menu ------------------------------------ */
 static void open_menu_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    close_pop(&g_menu);
-    /* full-screen catcher so a tap outside dismisses */
-    g_menu = lv_obj_create(lv_layer_top());
-    lv_obj_remove_style_all(g_menu);
-    lv_obj_set_size(g_menu, 360, 360);
-    lv_obj_center(g_menu);
-    lv_obj_set_style_bg_color(g_menu, TC(SCRIM), 0);
-    lv_obj_set_style_bg_opa(g_menu, LV_OPA_50, 0);
-    lv_obj_add_flag(g_menu, LV_OBJ_FLAG_CLICKABLE);
-    ui_on(g_menu, menu_dismiss_cb, LV_EVENT_CLICKED, NULL, "playlistview.menu_dismiss", UI_CORE);
-    lv_obj_t *c = lv_obj_create(g_menu);
-    lv_obj_remove_style_all(c);
-    lv_obj_set_size(c, 240, 176);
-    lv_obj_center(c);
-    lv_obj_set_style_radius(c, 16, 0);
-    lv_obj_set_style_bg_color(c, TC(SURFACE), 0);
-    lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
-    card_btn(c, 12,  216, "Edit Name",       TC(SURFACE_RAISED), TC(TEXT_PRIMARY), rename_cb);
-    card_btn(c, 64,  216, "Export to SD",    TC(SURFACE_RAISED), TC(STATUS_INFO), export_cb);
-    card_btn(c, 116, 216, "Delete Playlist", TC(SURFACE_RAISED), TC(STATUS_DANGER), del_menu_cb);
+    im_item it;
+    memset(&it, 0, sizeof it);
+    it.kind = IM_PLAYLIST; it.id = g_pid; it.where = IM_IN_PLAYLISTS;
+    snprintf(it.title, sizeof it.title, "%s", g_name);
+    itemmenu_open(&it);
 }
-
-static void back_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) screen_back(); }
 
 /* ---- screen ------------------------------------------------------------- */
 static lv_obj_t *icon_btn(lv_obj_t *root, int x, int y, int w, const char *sym,
@@ -414,7 +332,7 @@ void plview_create(lv_obj_t *root){
     lv_obj_set_style_bg_color(root, TC(CANVAS), 0);
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
 
-    g_title_lbl = ui_header_cb(root, "Playlist", back_cb);   /* shared header; dynamic title = playlist name */
+    g_title_lbl = library_header(root, "Playlist");   /* back arrow / title: Library's top page; dynamic title = playlist name */
     lv_obj_set_style_text_align(g_title_lbl, LV_TEXT_ALIGN_CENTER, 0);
     if(!ui_edge_nav()) lv_obj_align(g_title_lbl, LV_ALIGN_TOP_MID, 0, 30);   /* edge-nav themes place their own */
 
