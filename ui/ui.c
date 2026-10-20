@@ -2519,7 +2519,7 @@ static void vol_arc_cb(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     if(g_vol_suppress) return;                       /* programmatic update, ignore */
     int v = lv_arc_get_value(g_vol_arc);
-    char b[12]; snprintf(b, sizeof b, "%d/%d", v, VOL_MAX); lv_label_set_text(g_vol_num, b);
+    char b[12]; snprintf(b, sizeof b, "%d/%d", v, ui_volume_cap()); lv_label_set_text(g_vol_num, b);
     if(code == LV_EVENT_VALUE_CHANGED){
         if(lv_tick_elaps(g_vol_last_send) >= 120){
             ui_set_volume(v); g_vol_last_send = lv_tick_get(); g_vol_pending = 0;
@@ -2554,7 +2554,6 @@ void ui_show_volume(int vol)
         lv_obj_center(g_vol_arc);
         lv_arc_set_rotation(g_vol_arc, 135);
         lv_arc_set_bg_angles(g_vol_arc, 0, 270);
-        lv_arc_set_range(g_vol_arc, 0, VOL_MAX);
         lv_obj_set_style_arc_width(g_vol_arc, 10, LV_PART_MAIN);
         lv_obj_set_style_arc_width(g_vol_arc, 10, LV_PART_INDICATOR);
         lv_obj_set_style_arc_color(g_vol_arc, TC(CONTROL_TRACK_STRONG), LV_PART_MAIN);
@@ -2583,10 +2582,12 @@ void ui_show_volume(int vol)
      * pressed, vol_arc_cb already tracks the live value, and a lagging a714 echo
      * would jump it back. Skip the programmatic value/number set in that case. */
     if(!(lv_obj_get_state(g_vol_arc) & LV_STATE_PRESSED)){
+        int cap = ui_volume_cap();               /* the full dial is Max Volume, so a drag can't pass it */
         g_vol_suppress = 1;
+        lv_arc_set_range(g_vol_arc, 0, cap);
         lv_arc_set_value(g_vol_arc, vol);
         g_vol_suppress = 0;
-        char b[12]; snprintf(b, sizeof b, "%d/%d", vol, VOL_MAX); lv_label_set_text(g_vol_num, b);
+        char b[12]; snprintf(b, sizeof b, "%d/%d", vol, cap); lv_label_set_text(g_vol_num, b);
     }
     lv_obj_remove_flag(g_vol_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(g_vol_panel);

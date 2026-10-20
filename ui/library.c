@@ -13,6 +13,7 @@
 #include "itemmenu.h"
 #include "rowdrag.h"      /* Playlists: Reorder */
 #include "player_mq.h"     /* play a list as our queue */
+#include "queuemenu.h"     /* the album page: play next, add to queue */
 #include "sdio.h"
 #include "artcache.h"
 #include "fonts_hebrew.h"
@@ -952,20 +953,50 @@ static void add_play_header(int centered){
     g_has_header = 1;
 }
 
-/* "Playlist" button under Play All / Shuffle on an album, artist or genre song list: opens the add-to-playlist picker with
- * exactly the songs this list shows, so each CUE/ISO track is added as its own row. */
-static void add_plist_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    if(!g_lcur || g_lcur->n <= 0){ ui_toast("Nothing to add"); return; }
-    playlists_add_songs(g_lcur->v, g_lcur->n);
+/* The buttons of an album's, an artist's or a genre's song list, icons in one row (yopo 2026-10-20): play all, play
+ * next, add to queue, shuffle. Next and last add the songs shown as the hold menu's entries do: an album as one unit,
+ * an artist's or a genre's songs loose. */
+static int g_btn_album;   /* the list is an album (its page, under the cover) */
+static void list_queue_cb(lv_event_t *e){
+    if(lv_event_get_code(e)!=LV_EVENT_CLICKED || !g_lcur || g_lcur->n <= 0) return;
+    if(!player_owns() || queue_current() < 0){ ui_toast("Works while your queue plays"); return; }   /* as the hold menu hides them */
+    queue_album u = { g_drill_kind==1 ? g_alb_artist : g_scope_album_artist, g_drill_kind==1 ? g_alb_title : g_scope_album };
+    queuemenu_songs(g_lcur->v, g_lcur->n, g_btn_album ? &u : NULL, (int)(uintptr_t)lv_event_get_user_data(e));
 }
-static void add_plist_row(int centered){
+/* sym in the middle; badge (NULL = none) small at its top right (up) or bottom right (down) */
+static void icon_btn(lv_obj_t *row, int x, const char *sym, const char *badge, int up, lv_event_cb_t cb, void *ud){
+    lv_obj_t *b = lv_button_create(row);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_size(b, 56, 44); lv_obj_set_pos(b, x, 4);
+    lv_obj_set_style_radius(b, 12, 0);
+    lv_obj_set_style_bg_color(b, TC(SURFACE), 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(b, TC(SURFACE_PRESSED), LV_STATE_PRESSED);
+    ui_on(b, cb, LV_EVENT_CLICKED, ud, "library.album_btn", UI_CORE);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, sym);
+    lv_obj_set_style_text_font(l, TF(UI_18), 0);
+    lv_obj_set_style_text_color(l, TC(TEXT_PRIMARY), 0);
+    lv_obj_align(l, LV_ALIGN_CENTER, badge ? -4 : 0, 0);
+    if(!badge) return;
+    lv_obj_t *k = lv_label_create(b);
+    lv_label_set_text(k, badge);
+    lv_obj_set_style_text_font(k, TF(UI_12), 0);
+    lv_obj_set_style_text_color(k, TC(TEXT_PRIMARY), 0);
+    lv_obj_align(k, LV_ALIGN_CENTER, 11, up ? -9 : 9);
+}
+static void add_list_buttons(int album){
+    g_btn_album = album;
     lv_obj_t *r = lv_obj_create(g_list);
     lv_obj_remove_style_all(r);
-    lv_obj_set_size(r, centered ? 286 : 268, ROW_H);
+    lv_obj_set_size(r, 286, ROW_H);
     lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
-    hdr_btn(r, (centered ? 16 : 0) + 70, tr_sym(LV_SYMBOL_PLUS, "Playlist"), add_plist_cb);   /* centred under the pair above */
-    g_has_header = 2;                            /* Play All / Shuffle + this row */
+    const int x = 20, step = 68;                 /* 4 x 56 + 3 x 12, centred on the screen (r-local 150), like an album's cover */
+    icon_btn(r, x,            LV_SYMBOL_PLAY, NULL, 0, play_all_cb, NULL);
+    icon_btn(r, x + step,     LV_SYMBOL_LIST, LV_SYMBOL_UP, 1, list_queue_cb, (void*)(uintptr_t)QM_NEXT);     /* to the top: next */
+    icon_btn(r, x + 2 * step, LV_SYMBOL_LIST, LV_SYMBOL_PLUS, 0, list_queue_cb, (void*)(uintptr_t)QM_LAST);   /* onto the end */
+    icon_btn(r, x + 3 * step, LV_SYMBOL_SHUFFLE, NULL, 0, shuffle_all_cb, NULL);
+    g_has_header = 1;
 }
 
 static const char *VIEW_TITLE[] = { "Library","Songs","Albums","Artists","Playlists","Favourites","Genres","","Most Played","Recently Played","History" };
@@ -1090,8 +1121,8 @@ static void library_reload(void){
             if(g_drill_kind==1) add_ldb_album_cover_header(l, g_alb_title, g_alb_artist);
             else add_ldb_album_cover_header(l, g_scope_album, g_scope_album_artist);
         }
-        add_play_header(is_album);                                      /* centre the pair under the album cover */
-        if(g_view==VIEW_GROUP) add_plist_row(is_album);                 /* add these songs to a playlist */
+        if(g_view==VIEW_GROUP) add_list_buttons(is_album);              /* one row of icons (an album's under its cover) */
+        else add_play_header(0);
         for(int i=0;i<n;i++) g_first[i]=az_code(l->v[i].letter);
         g_count=n; fill_start(n);
         if(g_view==VIEW_SONGS) az_show(1);

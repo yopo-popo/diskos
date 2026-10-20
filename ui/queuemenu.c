@@ -17,8 +17,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { QM_NOW, QM_NEXT, QM_LAST };
-
 static int playable(const im_item *it){
     switch(it->kind){
     case IM_SONG:     return it->path[0] != 0;
@@ -55,12 +53,7 @@ static int item_songs(const im_item *it, ldb_list *l, ldb_item *one, char *artis
     }
 }
 
-static void run(const im_item *it, int how){
-    ldb_list l;
-    ldb_item one;
-    char artist[LDB_NAME];
-    int n = item_songs(it, &l, &one, artist, sizeof artist);
-    const ldb_item *v = it->kind == IM_SONG ? &one : l.v;
+void queuemenu_songs(const ldb_item *v, int n, const queue_album *unit, int how){
     queue_track *t = n > 0 ? malloc((size_t)n * sizeof *t) : NULL;
     int m = 0;
     for(int i = 0; t && i < n; i++){
@@ -71,8 +64,6 @@ static void run(const im_item *it, int how){
                                 .end_ms = sub && s->duration_ms > 0 ? (int)s->start_ms + s->duration_ms : 0,
                                 .duration_ms = s->duration_ms, .title = s->title, .artist = s->artist, .album = s->album };
     }
-    queue_album u = { it->album_artist, it->album };
-    const queue_album *unit = it->kind == IM_ALBUM ? &u : NULL;
     if(n < 0) ui_toast("Couldn't read the songs");
     else if(n > 0 && !t) ui_toast("Couldn't play that");
     else if(!m) ui_toast("Nothing to play");
@@ -84,6 +75,14 @@ static void run(const im_item *it, int how){
         else if(player_owns()) ui_toast(how == QM_NEXT ? "Playing next" : "Added to queue");   /* else the adapter said why */
     }
     free(t);
+}
+static void run(const im_item *it, int how){
+    ldb_list l;
+    ldb_item one;
+    char artist[LDB_NAME];
+    int n = item_songs(it, &l, &one, artist, sizeof artist);
+    queue_album u = { it->album_artist, it->album };
+    queuemenu_songs(it->kind == IM_SONG ? &one : l.v, n, it->kind == IM_ALBUM ? &u : NULL, how);
     ldb_list_free(&l);
 }
 

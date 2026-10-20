@@ -1154,6 +1154,29 @@ int ldb_song_album(const char *path, long long start_ms, char *album_artist, int
     sqlite3_close(db);
     return ok;
 }
+int ldb_song_tempo(const char *path, long long start_ms, char *key, int kcap, double *bpm){
+    if(kcap > 0) key[0] = 0;
+    *bpm = 0;
+    if(!path || kcap <= 0) return 0;
+    sqlite3 *db = reader_open();
+    if(!db) return 0;
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if(sqlite3_prepare_v2(db, "SELECT initial_key, bpm FROM tracks WHERE path=?1 AND (?2 < 0 OR start_ms=?2) ORDER BY start_ms LIMIT 1;",
+                          -1, &st, NULL) == SQLITE_OK){
+        sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 2, start_ms);
+        if(sqlite3_step(st) == SQLITE_ROW){
+            const char *k = (const char *)sqlite3_column_text(st, 0);
+            snprintf(key, (size_t)kcap, "%s", k ? k : "");
+            if(sqlite3_column_type(st, 1) != SQLITE_NULL) *bpm = sqlite3_column_double(st, 1);
+            ok = 1;
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return ok;
+}
 int ldb_track_start(const char *path, const char *title, long long *start_ms){
     *start_ms = 0;
     if(!path) return 0;

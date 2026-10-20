@@ -4,6 +4,7 @@
 #include "theme.h"
 #include "musicdb.h"   /* mdb_is_book_path: this page doubles as "Book details" for an audiobook */
 #include "scanner.h"   /* scan_read_narrator */
+#include "librarydb.h" /* ldb_song_tempo: the Key and BPM rows */
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -17,7 +18,7 @@
 int ui_label_input_changed(lv_obj_t *obj, const char *txt);   /* ui.c: a label's text only when its input changes */
 int ui_label_set_changed(lv_obj_t *obj, const char *txt);
 
-/* Song Info: a metadata detail page (title/artist/album/genre/format/rate/depth/bitrate/channels/duration/size/folder/
+/* Song Info: a metadata detail page (title/artist/album/key/bpm/genre/format/rate/depth/bitrate/channels/duration/size/folder/
  * file). Opened by tapping the Now Playing album art; back-swipe / back returns. Populated from the live track_state_t
  * via songinfo_set(). Stock's page (V2.57 mq_ui icons nowplaying/name, artist, album, genre, sample, bit_depth, time,
  * file_byte) carries the same facts; its value wording is UNVERIFIED so the text here follows diskOS style. The rate
@@ -25,8 +26,8 @@ int ui_label_set_changed(lv_obj_t *obj, const char *txt);
  * one DB lookup) so the UI thread never waits on the SD card; a row shows only once its value is known.
  * For an audiobook the page relabels to "Book details" and shows reading progress. */
 
-enum { F_TITLE, F_ARTIST, F_NARRATOR, F_ALBUM, F_GENRE, F_FORMAT, F_RATE, F_DEPTH, F_BITRATE, F_CHANNELS, F_DURATION, F_SIZE, F_FOLDER, F_FILE, F_COUNT };
-static const char *KEYS[F_COUNT] = { "Title","Artist","Narrated by","Album","Genre","Format","Sample Rate","Bit Depth","Bit Rate","Channels","Duration","File Size","Folder","File" };
+enum { F_TITLE, F_ARTIST, F_NARRATOR, F_ALBUM, F_KEY, F_BPM, F_GENRE, F_FORMAT, F_RATE, F_DEPTH, F_BITRATE, F_CHANNELS, F_DURATION, F_SIZE, F_FOLDER, F_FILE, F_COUNT };
+static const char *KEYS[F_COUNT] = { "Title","Artist","Narrated by","Album","Key","BPM","Genre","Format","Sample Rate","Bit Depth","Bit Rate","Channels","Duration","File Size","Folder","File" };
 static lv_obj_t *g_val[F_COUNT];
 static lv_obj_t *g_key[F_COUNT];
 static lv_obj_t *g_cell[F_COUNT];   /* whole rows, so a not-applicable one (e.g. Narrated by for music) can be hidden */
@@ -41,6 +42,8 @@ typedef struct {
     int  dsd_hz;         /* DSD sampling rate read from the file (0 = unknown) */
     long long size;      /* file size in bytes (0 = unknown) */
     char genre[64];
+    char key[32];        /* the key and BPM tags, from library.db ("" / 0 = none) */
+    double bpm;
 } si_tech_t;
 
 /* "44.1 kHz" / "96 kHz"; "-" when unknown */
@@ -51,6 +54,13 @@ static void si_fmt_rate(char *o, size_t n, int hz){
 }
 static void si_fmt_bits(char *o, size_t n, int bits){
     if(bits > 0) snprintf(o, n, "%d-bit", bits); else snprintf(o, n, "-");
+}
+/* "128" / "127.5" */
+static void si_fmt_bpm(char *o, size_t n, double bpm){
+    int t = (int)(bpm * 10 + 0.5);
+    if(t <= 0) snprintf(o, n, "-");
+    else if(t % 10) snprintf(o, n, "%d.%d", t / 10, t % 10);
+    else snprintf(o, n, "%d", t / 10);
 }
 static void si_fmt_kbps(char *o, size_t n, int kbps){
     if(kbps > 0) snprintf(o, n, "%d kbps", kbps); else snprintf(o, n, "-");
@@ -197,6 +207,9 @@ static void si_probe(const char *path, int track, si_tech_t *t){
         close(fd);
     }
     mdb_song_genre(path, track, t->genre, (int)sizeof t->genre);
+    long long start = -1;   /* a CUE/ISO track's own row; a plain file's only one */
+    if(track > 0 && !ldb_track_start_at(path, track, &start)) start = -1;
+    ldb_song_tempo(path, start, t->key, (int)sizeof t->key, &t->bpm);
     t->ok = 1;
 }
 
@@ -296,7 +309,7 @@ void songinfo_set(const track_state_t *st)
     if(!st || !st->have_track){
         for(int i=0;i<F_COUNT;i++) if(g_val[i]) ui_label_set_changed(g_val[i], "-");
         si_show(g_cell[F_NARRATOR], 0);
-        static const int optional[] = { F_GENRE, F_DEPTH, F_BITRATE, F_CHANNELS, F_SIZE, F_FOLDER };
+        static const int optional[] = { F_KEY, F_BPM, F_GENRE, F_DEPTH, F_BITRATE, F_CHANNELS, F_SIZE, F_FOLDER };
         for(size_t i=0;i<sizeof optional/sizeof *optional;i++) si_show(g_cell[optional[i]], 0);
         return;
     }
@@ -373,6 +386,10 @@ void songinfo_set(const track_state_t *st)
     } else {
         ui_label_set_changed(g_val[F_ALBUM], st->album[0]?st->album:"-");   /* restore album for music */
     }
+    /* Key and BPM under the album: music only, and only when its tags name them */
+    if(!book && cur.key[0]){ ui_label_set_changed(g_val[F_KEY], cur.key); si_show(g_cell[F_KEY], 1); } else si_show(g_cell[F_KEY], 0);
+    si_fmt_bpm(vb, sizeof vb, cur.bpm);
+    if(!book && cur.bpm > 0){ ui_label_set_changed(g_val[F_BPM], vb); si_show(g_cell[F_BPM], 1); } else si_show(g_cell[F_BPM], 0);
 
     /* Narrated by: only for a book that actually names a narrator (composer tag); load once per book. */
     if(book){

@@ -5,6 +5,7 @@
 #include "theme.h"
 #include "theme_kit.h"
 #include "player_mq.h"     /* play the playlist as our queue */
+#include "queuemenu.h"
 #include "shelvesdb.h"
 #include "playlists.h"
 #include "itemmenu.h"
@@ -14,17 +15,17 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* Playlist detail (SCR_PLVIEW): opened by tapping a playlist in the Library. Header name + Play / Shuffle + a 3-dot
+/* Playlist detail (SCR_PLVIEW): opened by tapping a playlist in the Library. Header name + Play / Play next / Add to queue / Shuffle icons + a 3-dot
  * button that opens the playlist's hold menu (Rename, Save to the card, Delete...). The songs come from shelves.db;
  * holding one opens its hold menu, with Remove from playlist. */
 
 static long long g_pid;
 static char g_name[LDB_NAME];
 static lv_obj_t *g_title_lbl, *g_song_list;
-static lv_obj_t *g_play_btn, *g_shuffle_btn;   /* LV_STATE_DISABLED when the playlist is empty */
+static lv_obj_t *g_play_btn, *g_next_btn, *g_last_btn, *g_shuffle_btn;   /* LV_STATE_DISABLED when the playlist is empty */
 static ldb_list g_pl;                          /* its songs, kept while the rows use them */
 static lv_obj_t *g_menu_btn, *g_done_btn;
-static int g_reorder;                          /* Reorder: a handle on each row, and Done in place of Play / Shuffle */
+static int g_reorder;                          /* Reorder: a handle on each row, and Done in place of the buttons */
 static lv_obj_t **g_rowobj;                    /* Reorder: the rows built, by song */
 static int g_dropped;
 static rowdrag_list g_drag;                    /* set up in plview_create */
@@ -33,22 +34,24 @@ static rowdrag_list g_drag;                    /* set up in plview_create */
  * toast, so show them disabled. LV_STATE_DISABLED (not clearing CLICKABLE) so the theme kit still
  * classifies and styles them like a populated playlist's, and LVGL sends no press/click to them.
  * The disabled look (one neutral colour for both labels, faded button) is set up in plview_create. */
-/* Play / Shuffle / the menu, or Done while reordering */
+/* Play / Play next / Add to queue / Shuffle / the menu, or Done while reordering */
 static void plv_show_mode(void){
-    lv_obj_t *b[4] = { g_play_btn, g_shuffle_btn, g_menu_btn, g_done_btn };
-    for(int i = 0; i < 4; i++){
+    lv_obj_t *b[6] = { g_play_btn, g_next_btn, g_last_btn, g_shuffle_btn, g_menu_btn, g_done_btn };
+    for(int i = 0; i < 6; i++){
         if(!b[i]) continue;
-        if((i == 3) == (g_reorder != 0)) lv_obj_remove_flag(b[i], LV_OBJ_FLAG_HIDDEN);
+        if((i == 5) == (g_reorder != 0)) lv_obj_remove_flag(b[i], LV_OBJ_FLAG_HIDDEN);
         else lv_obj_add_flag(b[i], LV_OBJ_FLAG_HIDDEN);
     }
 }
 static void pl_set_transport_enabled(int on){
-    lv_obj_t *btns[2] = { g_play_btn, g_shuffle_btn };
-    for(int i=0;i<2;i++){
+    lv_obj_t *btns[4] = { g_play_btn, g_next_btn, g_last_btn, g_shuffle_btn };
+    for(int i=0;i<4;i++){
         if(!btns[i]) continue;
-        lv_obj_t *l = lv_obj_get_child(btns[i], 0);
-        if(on){ lv_obj_remove_state(btns[i], LV_STATE_DISABLED); if(l) lv_obj_remove_state(l, LV_STATE_DISABLED); }
-        else  { lv_obj_add_state(btns[i], LV_STATE_DISABLED);    if(l) lv_obj_add_state(l, LV_STATE_DISABLED); }
+        if(on) lv_obj_remove_state(btns[i], LV_STATE_DISABLED); else lv_obj_add_state(btns[i], LV_STATE_DISABLED);
+        for(uint32_t c = 0; c < lv_obj_get_child_count(btns[i]); c++){   /* the icon and its small mark */
+            lv_obj_t *l = lv_obj_get_child(btns[i], (int32_t)c);
+            if(on) lv_obj_remove_state(l, LV_STATE_DISABLED); else lv_obj_add_state(l, LV_STATE_DISABLED);
+        }
     }
 }
 
@@ -347,6 +350,14 @@ static void shuffle_cb(lv_event_t *e){
     ui_set_workmode(1);                       /* shuffle play-mode */
     if(plv_play(-2)) screen_show(SCR_NOWPLAYING);   /* + random start track */
 }
+/* Play next / Add to queue: the playlist's songs, loose, into our queue (as the hold menu's entries) */
+static void plv_queue(int how){
+    if(g_pl.n < 1){ ui_toast("Playlist is empty"); return; }
+    if(!player_owns() || queue_current() < 0){ ui_toast("Works while your queue plays"); return; }
+    queuemenu_songs(g_pl.v, g_pl.n, NULL, how);
+}
+static void next_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) plv_queue(QM_NEXT); }
+static void last_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) plv_queue(QM_LAST); }
 
 /* ---- 3-dot: the playlist's hold menu ------------------------------------ */
 static void open_menu_cb(lv_event_t *e){
@@ -380,6 +391,25 @@ static lv_obj_t *icon_btn(lv_obj_t *root, int x, int y, int w, const char *sym,
     lv_obj_center(l);
     return b;
 }
+/* An icon-only button, as on an album's page; badge = the small mark (up: Play next, plus: Add to queue) */
+static lv_obj_t *icon_only(lv_obj_t *root, int x, const char *sym, const char *badge, int up, lv_event_cb_t cb){
+    lv_obj_t *b = icon_btn(root, x, 68, 52, sym, TC(TEXT_PRIMARY), cb);
+    lv_obj_t *l = lv_obj_get_child(b, 0);
+    lv_obj_set_width(l, LV_SIZE_CONTENT);
+    lv_obj_set_style_text_font(l, TF(UI_18), 0);
+    lv_obj_align(l, LV_ALIGN_CENTER, badge ? -4 : 0, 0);
+    if(badge){
+        lv_obj_t *k = lv_label_create(b);
+        lv_label_set_text(k, badge);
+        lv_obj_set_style_text_font(k, TF(UI_12), 0);
+        lv_obj_set_style_text_color(k, TC(TEXT_PRIMARY), 0);
+        lv_obj_align(k, LV_ALIGN_CENTER, 11, up ? -9 : 9);
+    }
+    lv_obj_set_style_opa(b, LV_OPA_60, LV_STATE_DISABLED);   /* empty playlist: faded, one neutral colour */
+    for(uint32_t c = 0; c < lv_obj_get_child_count(b); c++)
+        lv_obj_set_style_text_color(lv_obj_get_child(b, (int32_t)c), TC(TEXT_DISABLED), LV_STATE_DISABLED);
+    return b;
+}
 void plview_create(lv_obj_t *root){
     lv_obj_set_style_bg_color(root, TC(CANVAS), 0);
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
@@ -388,21 +418,15 @@ void plview_create(lv_obj_t *root){
     lv_obj_set_style_text_align(g_title_lbl, LV_TEXT_ALIGN_CENTER, 0);
     if(!ui_edge_nav()) lv_obj_align(g_title_lbl, LV_ALIGN_TOP_MID, 0, 30);   /* edge-nav themes place their own */
 
-    /* Play / Shuffle / 3-dots row */
-    /* 84 + 6 + 108 + 6 + 36 = 240, centred (60..300): Shuffle is the longer word, and holds it in a monospace face */
-    /* Play is the go colour: Default's green, a unique theme's own accent */
-    g_play_btn    = icon_btn(root, 60,  68, 84,  tr_sym(LV_SYMBOL_PLAY, "Play"),   theme_def() ? TC(ACCENT_PRIMARY) : TC(STATUS_SUCCESS), play_cb);
-    g_shuffle_btn = icon_btn(root, 150, 68, 108, tr_sym(LV_SYMBOL_SHUFFLE, "Shuffle"), TC(TEXT_PRIMARY), shuffle_cb);
-    /* disabled (empty playlist): one neutral colour for both - 40% of a dark accent read as dead while
-     * 40% of white still read as live, so the pair looked mismatched */
-    lv_obj_t *tb[2] = { g_play_btn, g_shuffle_btn };
-    for(int i=0;i<2;i++){
-        lv_obj_set_style_opa(tb[i], LV_OPA_60, LV_STATE_DISABLED);
-        lv_obj_set_style_text_color(lv_obj_get_child(tb[i], 0), TC(TEXT_DISABLED), LV_STATE_DISABLED);
-    }
+    /* Play / Play next / Add to queue / Shuffle / 3-dots row, icons only as on an album's page:
+     * 4 x 52 + 36 + 4 x 6 = 268, centred (46..314) */
+    g_play_btn    = icon_only(root, 46,  LV_SYMBOL_PLAY, NULL, 0, play_cb);
+    g_next_btn    = icon_only(root, 104, LV_SYMBOL_LIST, LV_SYMBOL_UP, 1, next_cb);
+    g_last_btn    = icon_only(root, 162, LV_SYMBOL_LIST, LV_SYMBOL_PLUS, 0, last_cb);
+    g_shuffle_btn = icon_only(root, 220, LV_SYMBOL_SHUFFLE, NULL, 0, shuffle_cb);
     /* "more/options" (edit/rename/delete). Drawn "three dots" - Apple-Music-style More - because the
      * bullet glyph isn't in this tree's montserrat; LV_SYMBOL_LIST misread as a track list. */
-    lv_obj_t *menu_btn = g_menu_btn = icon_btn(root, 264, 68, 36, "", TC(TEXT_SECONDARY), open_menu_cb);
+    lv_obj_t *menu_btn = g_menu_btn = icon_btn(root, 278, 68, 36, "", TC(TEXT_SECONDARY), open_menu_cb);
     for(int i=0;i<3;i++){
         lv_obj_t *d = lv_obj_create(menu_btn);
         lv_obj_remove_style_all(d);
@@ -428,7 +452,7 @@ void plview_create(lv_obj_t *root){
     lv_obj_add_flag(g_song_list, LV_OBJ_FLAG_SCROLL_MOMENTUM);
     lv_obj_add_event_cb(g_song_list, plv_scroll_cb, LV_EVENT_SCROLL, NULL);
 
-    /* Reorder: Done takes the place of Play / Shuffle / the menu */
+    /* Reorder: Done takes the place of the buttons */
     g_done_btn = icon_btn(root, 60, 68, 240, tr_sym(LV_SYMBOL_OK, "Done"), TC(ACCENT_PRIMARY), done_cb);
     lv_obj_add_flag(g_done_btn, LV_OBJ_FLAG_HIDDEN);
     g_drag = (rowdrag_list){ .list = g_song_list, .count = plv_drag_count, .row = plv_drag_row,

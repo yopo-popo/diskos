@@ -233,7 +233,8 @@ int ui_seek_to(long ms);   /* returns 0 if the seek frame was queued, -1 if the 
 int  ui_play_book(const char *path, long resume_ms);  /* 1 = sent */   /* play an audiobook file + resume at resume_ms (0 = start) */
 void ui_cancel_book_resume(void);                      /* end the book session (call on any explicit track change) */
 void ui_book_user_seeked(long target_ms);              /* manual seek in a book: drop pending resume, persist target_ms to the bookmark now, keep session */
-int  ui_set_volume(int vol);   /* set absolute volume 0..VOL_MAX; returns 0=queued, -1=failed */
+int  ui_set_volume(int vol);   /* set absolute volume 0..ui_volume_cap(); returns 0=queued, -1=failed */
+int  ui_volume_cap(void);      /* Max Volume (Settings > Audio), 0..VOL_MAX: nothing diskOS sends goes above it */
 void ui_set_workmode(int mode);
 int ui_apply_eq(int preset);
 int ui_eq_select(int preset);    /* central EQ apply+persist (eq_preset + eq_last); 0 ok, -1 send failed */

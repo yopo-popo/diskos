@@ -527,6 +527,7 @@ static lv_obj_t *aw_img(void){ lv_obj_t *im = lv_image_create(g_root); lv_obj_ad
 /* An artist's wall: [ All Songs ] under the counter, the Artists list's "All Songs" row */
 static void aw_all_songs_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED || g_scope < 0) return;
+    if(ui_press_travel() > 18) return;   /* a swipe of the covers that began on the pill isn't a tap */
     library_wall_open(g_scope, g_scope_key, NULL, NULL);
     screen_show(SCR_LIBRARY);
 }
@@ -537,6 +538,7 @@ static void aw_all_songs_pill(void){
     lv_obj_t *b = lv_button_create(g_root);
     lv_obj_remove_style_all(b);
     lv_obj_set_size(b, w, 24); lv_obj_align(b, LV_ALIGN_TOP_MID, 0, 323);
+    lv_obj_set_ext_click_area(b, 12);   /* only 24 px tall, by the bottom edge where touches land off: as Library's title */
     lv_obj_set_style_radius(b, 12, 0);
     lv_obj_set_style_bg_color(b, TC(SURFACE), 0);
     lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);

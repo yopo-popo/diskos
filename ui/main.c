@@ -406,7 +406,15 @@ int ui_set_folder_jump(int on){
 /* Track Numbers: diskOS draws them itself; 064d only keeps the player's saved TRACK_DISPLAY in step with it. */
 void ui_set_track_display(int on){ if(fw_track_display_settable()) ipc_send_cmd(on ? "064d000C0001" : "064d000C0000"); }
 void ui_set_memory(int mode){  if(mode<0||mode>2) return; char f[16]; snprintf(f,sizeof f,"0684000C%04X",mode); ipc_send_cmd(f); }
-void ui_set_maxvol(int v){     if(v<0) v=0; if(v>120) v=120; char f[16]; snprintf(f,sizeof f,"0711000C%04X",v); ipc_send_cmd(f); }
+/* Max Volume: the player holds only its own volume keys to it (0711), so every level diskOS sends is held to
+ * ui_volume_cap() too. g_maxvol = the cap last sent this run (it follows the Settings slider live); -1 = not sent. */
+static int g_maxvol = -1;
+void ui_set_maxvol(int v){     if(v<0) v=0; if(v>120) v=120; g_maxvol = v; char f[16]; snprintf(f,sizeof f,"0711000C%04X",v); ipc_send_cmd(f); }
+int ui_volume_cap(void){
+    int v = g_maxvol >= 0 ? g_maxvol : cfg_get_int("max_vol", VOL_MAX);
+    if(v < 0) v = 0; if(v > VOL_MAX) v = VOL_MAX;
+    return v;
+}
 /* balance: v in -N..+N; 0=center, v>0 -> 0x00NN (one side), v<0 -> 0x01NN (other side). */
 void ui_set_balance(int v){ if(v < -10 || v > 10) return;   /* enforce UI range; avoids -INT_MIN UB */
                             int fv = (v>0) ? (v & 0xFF) : (v<0) ? (0x0100 | ((-v) & 0xFF)) : 0;
@@ -582,7 +590,7 @@ int ui_route_bt(const char *mac){
     char f[48];
     if(ui_bt_codec_frame(norm, f, sizeof f) < 0) return -1;   /* 06b3 with SBC (VALUE1 0) + MAC payload, as always */
     if(ipc_send_cmd(f) < 0) return -1;
-    if(st.volume_seq){ char v[16]; snprintf(v, sizeof v, "0715000C%04X", st.volume); ipc_send_cmd(v); }
+    if(st.volume_seq) ui_set_volume(st.volume);        /* re-send the last level, held to Max Volume */
     /* Safe minimal resume; deterministic load/play remains a future improvement. */
     if(st.have_track && st.position_ms > 0) ui_seek_to(st.position_ms);  /* resume position, not restart */
     if(was_playing) ipc_send_cmd("0201000C0000");       /* play */
@@ -1453,11 +1461,12 @@ int ui_pp_icon_playing(int real_playing){
     }
     return real_playing;
 }
-/* set absolute volume 0..120 via the decoded 0715 command (class-2:
+/* set absolute volume 0..Max Volume via the decoded 0715 command (class-2:
  * 0715 + LEN(000C) + <level 4hex>).  The player maps this through the same
- * cs43131 gain path as the hardware vol keys. */
+ * cs43131 gain path as the hardware vol keys, but does not hold it to its Max Volume: we do. */
 int ui_set_volume(int vol){
-    if(vol < 0) vol = 0; if(vol > VOL_MAX) vol = VOL_MAX;
+    int cap = ui_volume_cap();
+    if(vol < 0) vol = 0; if(vol > cap) vol = cap;
     char f[16]; snprintf(f, sizeof f, "0715000C%04X", vol);
     int rc = ipc_send_cmd(f);
     fprintf(stderr,"set volume %d -> %s (rc=%d)\n", vol, f, rc); fflush(stderr);
@@ -3499,6 +3508,9 @@ int main(int argc, char **argv){
          * seq so it can't re-fire. */
         if(st.volume_seq != last_vol_seq){
             last_vol_seq = st.volume_seq;
+            /* a level above Max Volume (restored at boot, or set before the cap came down) is pulled down to the
+             * cap at once, screen on or off. It only ever lowers the level the player has just reported. */
+            if(st.volume > ui_volume_cap()) ui_set_volume(ui_volume_cap());
             power_note_input();   /* a volume key press counts as input for idle power-off (last_activity only moves when the panel is off) */
             if(bl_state == 0){
                 last_activity = lv_tick_get();

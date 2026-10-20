@@ -168,6 +168,8 @@ int  ldb_album_paths(const char *album_artist, const char *album, char (*paths)[
 int  ldb_song_artist(const char *path, long long start_ms, int by_album_artist, char *out, int cap);
 /* The album of the song at path (start_ms < 0 = its first song in the file). 1 = found. */
 int  ldb_song_album(const char *path, long long start_ms, char *album_artist, int aacap, char *album, int acap);
+/* The song's key and BPM tags (start_ms < 0 = its first song in the file): key "" and bpm 0 when it has none. 1 = found. */
+int  ldb_song_tempo(const char *path, long long start_ms, char *key, int kcap, double *bpm);
 /* The start in its file of the song playing as path + title (a CUE/ISO track; 0 for a plain file). 1 = in the library. */
 int  ldb_track_start(const char *path, const char *title, long long *start_ms);
 /* The start in its CUE/ISO file of the song with that track number there. 1 = in the library. */
